@@ -170,7 +170,6 @@ def export(
         raise ValueError(
             f"Expected `mod` to be an instance of `torch.nn.Module`, got {type(mod)}."
         )
-
     return _export(
         mod,
         args,
@@ -178,6 +177,7 @@ def export(
         dynamic_shapes,
         strict=strict,
         preserve_module_call_signature=preserve_module_call_signature,
+        pre_dispatch=True,
     )
 
 

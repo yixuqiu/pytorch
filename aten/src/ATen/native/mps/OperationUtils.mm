@@ -368,9 +368,8 @@ Placeholder::Placeholder(MPSGraphTensor* mpsGraphTensor,
   TORCH_CHECK(src.is_mps(), "Placeholder storage has not been allocated on MPS device!");
   // extract the pointer to MTLBuffer from the Tensor's storage
   id<MTLBuffer> srcBuf = getMTLBufferStorage(src);
-  bool sliceViewTensor = canSliceViewTensor(src, mpsShape);
   // a view tensor could be contiguous (e.g., slice ops) or non-contiguous (e.g., transpose())
-  if ((!src.is_contiguous() || (src.storage_offset() && !sliceViewTensor)) && gatherTensorData) {
+  if (needsGather(src) && gatherTensorData) {
     Tensor emptyShell = Tensor();
     // use "_tensor" from Placeholder to retain view's output during its usage in other ops
     _tensor = gatherViewTensor(src, emptyShell);
@@ -390,13 +389,9 @@ Placeholder::Placeholder(MPSGraphTensor* mpsGraphTensor,
     const auto scalar_type = _tensor.scalar_type();
     dataType = _tensor.dim() == 0 ? getMPSScalarType(scalar_type) : getMPSDataType(scalar_type);
   }
-  if (src.is_contiguous() && src.storage_offset() && sliceViewTensor) {
-    _value = getMPSGraphTensorDataForView(src, mpsShape, dataType);
-  } else {
-    _value = [[[MPSGraphTensorData alloc] initWithMTLBuffer:srcBuf
-                                                      shape:mpsShape ? mpsShape : getMPSShape(_tensor)
-                                                   dataType:dataType] autorelease];
-  }
+  _value = [[[MPSGraphTensorData alloc] initWithMTLBuffer:srcBuf
+                                                    shape:mpsShape ? mpsShape : getMPSShape(_tensor)
+                                                 dataType:dataType] autorelease];
 
   TORCH_INTERNAL_ASSERT(_value);
   _placeholder = mpsGraphTensor;
@@ -660,31 +655,40 @@ id<MTLLibrary> MetalShaderLibrary::getLibrary(const std::initializer_list<std::s
 }
 
 id<MTLLibrary> MetalShaderLibrary::compileLibrary(const std::string& src) {
+  static const char* fast_math = std::getenv("PYTORCH_MPS_FAST_MATH");
   NSError* error = nil;
-  MTLCompileOptions* options = [[MTLCompileOptions new] autorelease];
-  [options setLanguageVersion:is_macos_13_or_newer(MacOSVersion::MACOS_VER_14_0_PLUS) ? MTLLanguageVersion3_1
-                                                                                      : MTLLanguageVersion2_3];
-  auto str = [NSString stringWithCString:src.c_str() encoding:NSASCIIStringEncoding];
+  MTLCompileOptions* options = compile_options;
+  if (!options) {
+    options = [[MTLCompileOptions new] autorelease];
+    [options setLanguageVersion:is_macos_13_or_newer(MacOSVersion::MACOS_VER_14_0_PLUS) ? MTLLanguageVersion3_1
+                                                                                        : MTLLanguageVersion2_3];
+    [options setFastMathEnabled:(!fast_math || std::stoi(fast_math) == 0) ? NO : YES];
+  }
+
+  const auto str = [NSString stringWithCString:src.c_str() encoding:NSASCIIStringEncoding];
   auto device = MPSDevice::getInstance()->device();
   library = [device newLibraryWithSource:str options:options error:&error];
   TORCH_CHECK(library, "Failed to create metal library, error: ", [[error description] UTF8String]);
   return library;
 }
 
-id<MTLComputePipelineState> MetalShaderLibrary::getLibraryPipelineState(id<MTLLibrary> lib, const std::string& fname) {
-  auto key = fmt::format("{}:{}", reinterpret_cast<void*>(lib), fname);
-  auto cpl = cplMap[key];
-  if (cpl) {
-    return cpl;
+std::pair<id<MTLComputePipelineState>, id<MTLFunction>> MetalShaderLibrary::getLibraryPipelineState(
+    id<MTLLibrary> lib,
+    const std::string& fname) {
+  const auto key = fmt::format("{}:{}", reinterpret_cast<void*>(lib), fname);
+  auto found_cpl = cplMap.find(key);
+  if (found_cpl != cplMap.end()) {
+    return found_cpl->second;
   }
 
   NSError* error = nil;
   id<MTLFunction> func = [lib newFunctionWithName:[NSString stringWithUTF8String:fname.c_str()]];
   TORCH_CHECK(func, "Failed to create function state object for: ", fname);
-  cpl = [[lib device] newComputePipelineStateWithFunction:func error:&error];
+  auto cpl = [[lib device] newComputePipelineStateWithFunction:func error:&error];
   TORCH_CHECK(cpl, "Failed to created pipeline state object, error: ", [[error description] UTF8String]);
 
-  return cplMap[key] = cpl;
+  cplMap[key] = std::make_pair(cpl, func);
+  return cplMap[key];
 }
 
 } // namespace at::native::mps

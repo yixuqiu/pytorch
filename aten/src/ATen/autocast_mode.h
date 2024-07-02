@@ -145,6 +145,8 @@ inline bool is_autocast_eligible(
       return tensor.is_xla() && tensor.is_floating_point();
     case c10::DeviceType::PrivateUse1:
       return tensor.is_privateuseone() && tensor.is_floating_point();
+    case c10::DeviceType::MPS:
+      return tensor.is_mps() && tensor.is_floating_point();
     default:
       return false;
   }
@@ -168,6 +170,8 @@ inline DispatchKey get_autocast_dispatch_key_from_device_type(
       return DispatchKey::AutocastXLA;
     case c10::DeviceType::PrivateUse1:
       return DispatchKey::AutocastPrivateUse1;
+    case c10::DeviceType::MPS:
+      return DispatchKey::AutocastMPS;
     default:
       throw std::runtime_error(
           "unknown device type for autocast in get_autocast_dispatch_key_from_device_type");
@@ -178,7 +182,7 @@ inline bool is_autocast_available(c10::DeviceType device_type) {
   if (device_type == at::kCPU || device_type == at::kCUDA ||
       device_type == at::kXPU || device_type == at::kIPU ||
       device_type == at::kHPU || device_type == at::kXLA ||
-      device_type == at::kPrivateUse1) {
+      device_type == at::kPrivateUse1 || device_type == at::kMPS) {
     return true;
   } else {
     return false;
@@ -297,9 +301,9 @@ TORCH_API Tensor cached_cast(
     c10::DeviceType device_type = c10::DeviceType::CUDA);
 
 // Overload to process optional<Tensor>
-inline c10::optional<Tensor> cached_cast(
+inline std::optional<Tensor> cached_cast(
     at::ScalarType to_type,
-    const c10::optional<Tensor>& arg,
+    const std::optional<Tensor>& arg,
     c10::DeviceType device_type = c10::DeviceType::CUDA) {
   if (arg.has_value()) {
     return cached_cast(to_type, *arg, device_type);
@@ -353,9 +357,9 @@ Otherwise, set it to the autocast type.
 ********************************************************/
 
 // Overload to catch dtype flags
-c10::optional<ScalarType> inline set_opt_dtype(
+std::optional<ScalarType> inline set_opt_dtype(
     at::ScalarType to_type,
-    const c10::optional<ScalarType>& dtype) {
+    const std::optional<ScalarType>& dtype) {
   return dtype.has_value() ? dtype : to_type;
 }
 
@@ -392,7 +396,7 @@ enum class CastPolicy : uint8_t {
   fp32, // Cast all inputs to at::kFloat before running the op.
   fp32_set_opt_dtype, // Treats functions (like softmax) that
                       //  1. we'd like to run in fp32 and
-                      //  2. have a c10::optional<ScalarType> arg that controls
+                      //  2. have a std::optional<ScalarType> arg that controls
                       //  the output type.
                       // fp32_set_opt_dtype wrappers' policy is: if the output
                       // type is already set, don't touch it, otherwise, set
@@ -745,6 +749,27 @@ copy pasted in from VariableTypeEverything.cpp with appropriate substitutions.
       REDISPATCH_SIGNATURE,                                  \
       POLICY)
 
+// KERNEL_MPS registration for AutocastMPS
+#define KERNEL_MPS(OP, POLICY)            \
+  m.impl(                                 \
+      TORCH_SELECTIVE_NAME("aten::" #OP), \
+      &WrapFunction<                      \
+          CastPolicy::POLICY,             \
+          DeviceType::MPS,                \
+          decltype(ATEN_FN(OP)),          \
+          decltype(ATEN_FN(OP)),          \
+          &ATEN_FN(OP)>::type::call);
+
+#define KERNEL_MPS2(OP, OVERLOAD, POLICY)               \
+  m.impl(                                               \
+      TORCH_SELECTIVE_NAME("aten::" #OP "." #OVERLOAD), \
+      &WrapFunction<                                    \
+          CastPolicy::POLICY,                           \
+          DeviceType::MPS,                              \
+          decltype(ATEN_FN2(OP, OVERLOAD)),             \
+          decltype(ATEN_FN2(OP, OVERLOAD)),             \
+          &ATEN_FN2(OP, OVERLOAD)>::type::call);
+
 // Op lists for different policies.
 // To make sure other backends can reuse the policy op list.
 #define AT_FORALL_LOWER_PRECISION_FP(_)  \
@@ -865,24 +890,24 @@ copy pasted in from VariableTypeEverything.cpp with appropriate substitutions.
   _(ADD_NS(norm),                                                           \
     "norm.Scalar",                                                          \
     Tensor(const Tensor&, const Scalar&),                                   \
-    Tensor(const Tensor&, const c10::optional<Scalar>&, ScalarType),        \
+    Tensor(const Tensor&, const std::optional<Scalar>&, ScalarType),        \
     fp32_append_dtype)                                                      \
   _(ADD_NS(norm),                                                           \
     "norm.ScalarOpt_dim",                                                   \
-    Tensor(const Tensor&, const c10::optional<Scalar>&, IntArrayRef, bool), \
+    Tensor(const Tensor&, const std::optional<Scalar>&, IntArrayRef, bool), \
     Tensor(                                                                 \
         const Tensor&,                                                      \
-        const c10::optional<Scalar>&,                                       \
+        const std::optional<Scalar>&,                                       \
         IntArrayRef,                                                        \
         bool,                                                               \
         ScalarType),                                                        \
     fp32_append_dtype)                                                      \
   _(ADD_NS(norm),                                                           \
     "norm.names_ScalarOpt_dim",                                             \
-    Tensor(const Tensor&, const c10::optional<Scalar>&, DimnameList, bool), \
+    Tensor(const Tensor&, const std::optional<Scalar>&, DimnameList, bool), \
     Tensor(                                                                 \
         const Tensor&,                                                      \
-        const c10::optional<Scalar>&,                                       \
+        const std::optional<Scalar>&,                                       \
         DimnameList,                                                        \
         bool,                                                               \
         ScalarType),                                                        \
@@ -895,6 +920,7 @@ copy pasted in from VariableTypeEverything.cpp with appropriate substitutions.
   _(bilinear)                \
   _(cross)                   \
   _(dot)                     \
+  _(vdot)                    \
   _(grid_sampler)            \
   _(index_put)               \
   _(tensordot)               \
