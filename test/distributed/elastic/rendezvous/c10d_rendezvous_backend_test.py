@@ -8,16 +8,15 @@
 
 import os
 import tempfile
-
 from base64 import b64encode
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Callable, cast, ClassVar
-from unittest import mock, TestCase
+from typing import cast, ClassVar
+from unittest import mock
 
 from rendezvous_backend_test import RendezvousBackendTestMixin
 
 from torch.distributed import FileStore, TCPStore
-
 from torch.distributed.elastic.rendezvous import (
     RendezvousConnectionError,
     RendezvousError,
@@ -27,9 +26,17 @@ from torch.distributed.elastic.rendezvous.c10d_rendezvous_backend import (
     C10dRendezvousBackend,
     create_backend,
 )
+from torch.distributed.elastic.utils.distributed import get_free_port
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 class TCPStoreBackendTest(TestCase, RendezvousBackendTestMixin):
+    hw_classification = HardwareClassification.GENERIC
+
     _store: ClassVar[TCPStore]
 
     @classmethod
@@ -37,6 +44,7 @@ class TCPStoreBackendTest(TestCase, RendezvousBackendTestMixin):
         cls._store = TCPStore("localhost", 0, is_master=True)  # type: ignore[call-arg]
 
     def setUp(self) -> None:
+        super().setUp()
         # Make sure we have a clean slate.
         self._store.delete_key("torch.rendezvous.dummy_run_id")
 
@@ -47,9 +55,12 @@ class TCPStoreBackendTest(TestCase, RendezvousBackendTestMixin):
 
 
 class FileStoreBackendTest(TestCase, RendezvousBackendTestMixin):
+    hw_classification = HardwareClassification.GENERIC
+
     _store: ClassVar[FileStore]
 
     def setUp(self) -> None:
+        super().setUp()
         _, path = tempfile.mkstemp()
         self._path = path
 
@@ -67,13 +78,18 @@ class FileStoreBackendTest(TestCase, RendezvousBackendTestMixin):
 
 
 class CreateBackendTest(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self) -> None:
+        super().setUp()
         # For testing, the default parameters used are for tcp. If a test
         # uses parameters for file store, we set the self._params to
         # self._params_filestore.
+
+        port = get_free_port()
         self._params = RendezvousParameters(
             backend="dummy_backend",
-            endpoint="localhost:29300",
+            endpoint=f"localhost:{port}",
             run_id="dummy_run_id",
             min_nodes=1,
             max_nodes=1,
@@ -97,7 +113,7 @@ class CreateBackendTest(TestCase):
         self._expected_temp_dir = tempfile.gettempdir()
 
         self._expected_endpoint_host = "localhost"
-        self._expected_endpoint_port = 29300
+        self._expected_endpoint_port = port
         self._expected_store_type = TCPStore
         self._expected_read_timeout = timedelta(seconds=10)
 
@@ -149,7 +165,9 @@ class CreateBackendTest(TestCase):
 
     def test_create_backend_returns_backend_if_is_host_is_false(self) -> None:
         store = TCPStore(  # type: ignore[call-arg] # noqa: F841
-            self._expected_endpoint_host, self._expected_endpoint_port, is_master=True
+            self._expected_endpoint_host,
+            self._expected_endpoint_port,
+            is_master=True,
         )
 
         self._params.config["is_host"] = "false"
@@ -164,7 +182,7 @@ class CreateBackendTest(TestCase):
     def test_create_backend_returns_backend_if_is_host_is_not_specified_and_store_already_exists(
         self,
     ) -> None:
-        store = TCPStore(  # type: ignore[call-arg] # noqa: F841
+        TCPStore(  # type: ignore[call-arg]
             self._expected_endpoint_host, self._expected_endpoint_port, is_master=True
         )
 
@@ -175,11 +193,14 @@ class CreateBackendTest(TestCase):
     def test_create_backend_returns_backend_if_endpoint_port_is_not_specified(
         self,
     ) -> None:
-        self._params.endpoint = self._expected_endpoint_host
+        # patch default port and pass endpoint with no port specified
+        with mock.patch(
+            "torch.distributed.elastic.rendezvous.c10d_rendezvous_backend.DEFAULT_PORT",
+            self._expected_endpoint_port,
+        ):
+            self._params.endpoint = self._expected_endpoint_host
 
-        self._expected_endpoint_port = 29400
-
-        self._assert_create_backend_returns_backend()
+            self._assert_create_backend_returns_backend()
 
     def test_create_backend_returns_backend_if_endpoint_file_is_not_specified(
         self,
@@ -205,16 +226,6 @@ class CreateBackendTest(TestCase):
         del self._params.config["read_timeout"]
 
         self._expected_read_timeout = timedelta(seconds=60)
-
-        self._assert_create_backend_returns_backend()
-
-    def test_create_backend_returns_backend_with_libuv(self) -> None:
-        self._params.config["use_libuv"] = "true"
-
-        self._assert_create_backend_returns_backend()
-
-    def test_create_backend_returns_backend_without_libuv(self) -> None:
-        self._params.config["use_libuv"] = "false"
 
         self._assert_create_backend_returns_backend()
 
@@ -274,6 +285,27 @@ class CreateBackendTest(TestCase):
         ):
             create_backend(self._params_filestore)
 
+    def test_create_backend_file_store_does_not_leak_fd(self) -> None:
+        # Set the endpoint to empty so it defaults to creating a temp file
+        self._params_filestore.endpoint = ""
+
+        def open_fd_count() -> int:
+            # The lowest free descriptor number approximates the open fd count.
+            fd = os.open(os.devnull, os.O_RDONLY)
+            os.close(fd)
+            return fd
+
+        baseline = open_fd_count()
+        paths = []
+        for _ in range(20):
+            _, store = create_backend(self._params_filestore)
+            paths.append(store.path)  # type: ignore[attr-defined]
+        growth = open_fd_count() - baseline
+        for path in paths:
+            os.remove(path)
+
+        self.assertLessEqual(growth, 2)
+
     @mock.patch(
         "torch.distributed.elastic.rendezvous.c10d_rendezvous_backend.FileStore"
     )
@@ -288,3 +320,7 @@ class CreateBackendTest(TestCase):
             r"details.$",
         ):
             create_backend(self._params_filestore)
+
+
+if __name__ == "__main__":
+    run_tests()

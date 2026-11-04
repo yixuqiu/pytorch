@@ -1,11 +1,13 @@
-from .module import Module
-from .. import functional as F
+# mypy: allow-untyped-defs
 
+import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional
-from ..common_types import _size_2_t, _ratio_2_t, _size_any_t, _ratio_any_t
+from torch.nn.common_types import _ratio_2_t, _ratio_any_t, _size_2_t, _size_any_t
 
-__all__ = ['Upsample', 'UpsamplingNearest2d', 'UpsamplingBilinear2d']
+from .module import Module
+
+
+__all__ = ["Upsample", "UpsamplingNearest2d", "UpsamplingBilinear2d"]
 
 
 class Upsample(Module):
@@ -111,7 +113,7 @@ class Upsample(Module):
 
         >>> # xdoctest: +IGNORE_WANT("seems to fail when other tests are run in the same session")
         >>> m = nn.Upsample(scale_factor=2, mode='bilinear')  # align_corners=False
-        >>> # Notice that values in top left corner are the same with the small input (except at boundary)
+        >>> # Notice that values in top left corner are the same as the small input (except at boundary)
         >>> m(input_3x3)
         tensor([[[[1.0000, 1.2500, 1.7500, 1.5000, 0.5000, 0.0000],
                   [1.5000, 1.7500, 2.2500, 1.8750, 0.6250, 0.0000],
@@ -131,17 +133,29 @@ class Upsample(Module):
                   [0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000]]]])
     """
 
-    __constants__ = ['size', 'scale_factor', 'mode', 'align_corners', 'name', 'recompute_scale_factor']
+    __constants__ = [
+        "size",
+        "scale_factor",
+        "mode",
+        "align_corners",
+        "name",
+        "recompute_scale_factor",
+    ]
     name: str
-    size: Optional[_size_any_t]
-    scale_factor: Optional[_ratio_any_t]
+    size: _size_any_t | None
+    scale_factor: _ratio_any_t | None
     mode: str
-    align_corners: Optional[bool]
-    recompute_scale_factor: Optional[bool]
+    align_corners: bool | None
+    recompute_scale_factor: bool | None
 
-    def __init__(self, size: Optional[_size_any_t] = None, scale_factor: Optional[_ratio_any_t] = None,
-                 mode: str = 'nearest', align_corners: Optional[bool] = None,
-                 recompute_scale_factor: Optional[bool] = None) -> None:
+    def __init__(
+        self,
+        size: _size_any_t | None = None,
+        scale_factor: _ratio_any_t | None = None,
+        mode: str = "nearest",
+        align_corners: bool | None = None,
+        recompute_scale_factor: bool | None = None,
+    ) -> None:
         super().__init__()
         self.name = type(self).__name__
         self.size = size
@@ -154,21 +168,33 @@ class Upsample(Module):
         self.recompute_scale_factor = recompute_scale_factor
 
     def forward(self, input: Tensor) -> Tensor:
-        return F.interpolate(input, self.size, self.scale_factor, self.mode, self.align_corners,
-                             recompute_scale_factor=self.recompute_scale_factor)
+        """
+        Runs the forward pass.
+        """
+        return F.interpolate(
+            input,
+            self.size,
+            self.scale_factor,
+            self.mode,
+            self.align_corners,
+            recompute_scale_factor=self.recompute_scale_factor,
+        )
 
     def __setstate__(self, state):
-        if 'recompute_scale_factor' not in state:
-            state['recompute_scale_factor'] = True
+        if "recompute_scale_factor" not in state:
+            state["recompute_scale_factor"] = True
 
         super().__setstate__(state)
 
     def extra_repr(self) -> str:
+        """
+        Return the extra representation of the module.
+        """
         if self.scale_factor is not None:
-            info = 'scale_factor=' + repr(self.scale_factor)
+            info = "scale_factor=" + repr(self.scale_factor)
         else:
-            info = 'size=' + repr(self.size)
-        info += ', mode=' + repr(self.mode)
+            info = "size=" + repr(self.size)
+        info += ", mode=" + repr(self.mode)
         return info
 
 
@@ -176,7 +202,7 @@ class UpsamplingNearest2d(Upsample):
     r"""Applies a 2D nearest neighbor upsampling to an input signal composed of several input channels.
 
     To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
-    as it's constructor argument.
+    as its constructor argument.
 
     When :attr:`size` is given, it is the output size of the image `(h, w)`.
 
@@ -213,15 +239,19 @@ class UpsamplingNearest2d(Upsample):
                   [3., 3., 4., 4.]]]])
     """
 
-    def __init__(self, size: Optional[_size_2_t] = None, scale_factor: Optional[_ratio_2_t] = None) -> None:
-        super().__init__(size, scale_factor, mode='nearest')
+    def __init__(
+        self,
+        size: _size_2_t | None = None,
+        scale_factor: _ratio_2_t | None = None,
+    ) -> None:
+        super().__init__(size, scale_factor, mode="nearest")
 
 
 class UpsamplingBilinear2d(Upsample):
     r"""Applies a 2D bilinear upsampling to an input signal composed of several input channels.
 
     To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
-    as it's constructor argument.
+    as its constructor argument.
 
     When :attr:`size` is given, it is the output size of the image `(h, w)`.
 
@@ -260,5 +290,9 @@ class UpsamplingBilinear2d(Upsample):
                   [3.0000, 3.3333, 3.6667, 4.0000]]]])
     """
 
-    def __init__(self, size: Optional[_size_2_t] = None, scale_factor: Optional[_ratio_2_t] = None) -> None:
-        super().__init__(size, scale_factor, mode='bilinear', align_corners=True)
+    def __init__(
+        self,
+        size: _size_2_t | None = None,
+        scale_factor: _ratio_2_t | None = None,
+    ) -> None:
+        super().__init__(size, scale_factor, mode="bilinear", align_corners=True)

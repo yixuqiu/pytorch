@@ -13,10 +13,10 @@
 #include <memory>
 #include <vector>
 
-namespace torch {
-namespace autograd {
+namespace torch::autograd {
 
-using function_constructor = std::function<std::shared_ptr<Node>(edge_list&&)>;
+using function_constructor =
+    std::function<c10::intrusive_ptr<Node>(edge_list&&)>;
 
 /**
  * Wraps the tensor outputs in variables and creates the grad_fn and sets the
@@ -46,7 +46,7 @@ struct ComputeRequiresGrad : IterArgs<ComputeRequiresGrad> {
       out = true;
     }
   }
-  void operator()(const c10::optional<at::Tensor>& tensor) {
+  void operator()(const std::optional<at::Tensor>& tensor) {
     if (tensor.has_value()) {
       (*this)(*tensor);
     }
@@ -66,13 +66,16 @@ inline bool compute_requires_grad(Args&&... args) {
 
 inline void set_history(
     const at::Tensor& variable,
-    const std::shared_ptr<Node>& grad_fn) {
+    const c10::intrusive_ptr<Node>& grad_fn) {
   TORCH_CHECK(grad_fn != nullptr);
   if (variable.defined()) {
     // If the codegen triggers this, you most likely want to add your newly
     // added function to the DONT_REQUIRE_DERIVATIVE list in
     // tools/autograd/gen_variable_type.py
-    TORCH_INTERNAL_ASSERT(isDifferentiableType(variable.scalar_type()));
+    TORCH_CHECK(
+        isDifferentiableType(variable.scalar_type()),
+        "Autograd not support dtype: ",
+        variable.scalar_type());
     auto output_nr = grad_fn->add_input_metadata(variable);
     impl::set_gradient_edge(variable, {grad_fn, output_nr});
   } else {
@@ -82,14 +85,18 @@ inline void set_history(
 
 inline void set_history(
     const std::vector<Variable>& variables,
-    const std::shared_ptr<Node>& grad_fn) {
+    const c10::intrusive_ptr<Node>& grad_fn) {
   for (auto& variable : variables) {
     set_history(variable, grad_fn);
   }
 }
 
-inline bool isFwGradDefined(const c10::optional<at::Tensor>& t) {
-  return t.has_value() && t->defined() && t->_fw_grad(/*level */ 0).defined();
+inline bool isFwGradDefined(const at::Tensor& t) {
+  return t.defined() && t._fw_grad(/*level */ 0).defined();
+}
+
+inline bool isFwGradDefined(const std::optional<at::Tensor>& t) {
+  return t.has_value() && isFwGradDefined(t.value());
 }
 
 inline bool isFwGradDefinedTensorList(const at::ITensorListRef& variables) {
@@ -101,14 +108,13 @@ inline bool isFwGradDefinedTensorList(const at::ITensorListRef& variables) {
 }
 
 inline bool isFwGradDefinedTensorList(
-    const c10::List<c10::optional<at::Tensor>>& li) {
+    const c10::List<std::optional<at::Tensor>>& li) {
   bool ret = false;
   for (auto i : c10::irange(li.size())) {
     auto t = li.get(i);
-    ret |= (t.has_value() && isFwGradDefined(t.value()));
+    ret |= isFwGradDefined(t);
   }
   return ret;
 }
 
-} // namespace autograd
-} // namespace torch
+} // namespace torch::autograd

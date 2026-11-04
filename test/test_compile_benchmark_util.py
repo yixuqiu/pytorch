@@ -4,10 +4,18 @@ import unittest
 
 import torch
 import torch._dynamo as torchdynamo
-from torch.testing._internal.common_utils import run_tests, TEST_CUDA, TestCase
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    recover_orig_fp32_precision,
+    run_tests,
+    TestCase,
+)
+
 
 try:
     import tabulate  # noqa: F401  # type: ignore[import]
+
     from torch.utils.benchmark.utils.compile import bench_all
 
     HAS_TABULATE = True
@@ -15,12 +23,17 @@ except ImportError:
     HAS_TABULATE = False
 
 
-@unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
 @unittest.skipIf(not HAS_TABULATE, "tabulate not available")
 class TestCompileBenchmarkUtil(TestCase):
-    def test_training_and_inference(self):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    # bench_all's _enable/_disable_tensor_cores restore via the legacy
+    # set_float32_matmul_precision, which can't reproduce the "none" default
+    # of the per-backend matmul flags.
+    @recover_orig_fp32_precision
+    def test_training_and_inference(self, device):
         class ToyModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.Tensor(2, 2))
 
@@ -28,9 +41,9 @@ class TestCompileBenchmarkUtil(TestCase):
                 return x * self.weight
 
         torchdynamo.reset()
-        model = ToyModel().cuda()
+        model = ToyModel().to(device)
 
-        inference_table = bench_all(model, torch.ones(1024, 2, 2).cuda(), 5)
+        inference_table = bench_all(model, torch.ones(1024, 2, 2, device=device), 5)
         self.assertTrue(
             "Inference" in inference_table
             and "Eager" in inference_table
@@ -39,7 +52,7 @@ class TestCompileBenchmarkUtil(TestCase):
 
         training_table = bench_all(
             model,
-            torch.ones(1024, 2, 2).cuda(),
+            torch.ones(1024, 2, 2, device=device),
             5,
             optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
         )
@@ -49,6 +62,8 @@ class TestCompileBenchmarkUtil(TestCase):
             and "-" in training_table
         )
 
+
+instantiate_device_type_tests(TestCompileBenchmarkUtil, globals(), except_for="cpu")
 
 if __name__ == "__main__":
     run_tests()

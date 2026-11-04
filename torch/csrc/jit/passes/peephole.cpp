@@ -3,7 +3,6 @@
 #include <ATen/core/jit_type.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/ir/alias_analysis.h>
-#include <torch/csrc/jit/ir/ir_views.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/concat_opt.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
@@ -11,32 +10,56 @@
 #include <torch/csrc/jit/passes/peephole_dict_idioms.h>
 #include <torch/csrc/jit/passes/peephole_list_idioms.h>
 #include <torch/csrc/jit/passes/peephole_non_tensor.h>
-#include <torch/csrc/jit/runtime/graph_executor.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // Conservatively compare two optionals. If both are undefined, assume
 // they aren't equal
 template <typename T>
-static bool mustBeEqual(const c10::optional<T>& a, const c10::optional<T>& b) {
+static bool mustBeEqual(const std::optional<T>& a, const std::optional<T>& b) {
   return a == b && a.has_value();
 }
 
 struct PeepholeOptimizeImpl {
   PeepholeOptimizeImpl(
-      // NOLINTNEXTLINE(modernize-pass-by-value)
-      const std::shared_ptr<Graph>& graph,
+      std::shared_ptr<Graph> graph,
       bool disable_shape_peepholes)
-      : graph_(graph), shape_peepholes_(!disable_shape_peepholes) {}
+      : graph_(std::move(graph)), shape_peepholes_(!disable_shape_peepholes) {}
 
   bool run() {
     bool changed = optimizeBlock(graph_->block());
-    changed |= PeepholeOptimizeListIdioms(graph_);
-    changed |= PeepholeOptimizeDictIdioms(graph_);
-    changed |= PeepholeOptimizeAliasSensitive(graph_, shape_peepholes_);
-    changed |= PeepholeOptimizeNonTensor(graph_);
-    changed |= CombineConcats(graph_);
+
+    std::optional<AliasDb> alias_db;
+    auto invalidate_alias_db = [&] { alias_db.reset(); };
+    auto get_alias_db = [&]() -> AliasDb& {
+      if (!alias_db) {
+        alias_db.emplace(graph_);
+      }
+      return *alias_db;
+    };
+
+    if (PeepholeOptimizeListIdioms(
+            graph_, /*refine_list_len=*/false, get_alias_db())) {
+      changed = true;
+      invalidate_alias_db();
+    }
+    if (PeepholeOptimizeDictIdioms(graph_, get_alias_db())) {
+      changed = true;
+      invalidate_alias_db();
+    }
+    if (PeepholeOptimizeAliasSensitive(
+            graph_, shape_peepholes_, get_alias_db())) {
+      changed = true;
+      invalidate_alias_db();
+    }
+    if (PeepholeOptimizeNonTensor(graph_)) {
+      changed = true;
+      invalidate_alias_db();
+    }
+    if (CombineConcats(graph_, get_alias_db())) {
+      changed = true;
+      invalidate_alias_db();
+    }
     return changed;
   }
 
@@ -185,14 +208,14 @@ struct PeepholeOptimizeImpl {
           shape_peepholes_) {
         if (auto ptt = node->inputs().at(0)->type()->cast<TensorType>()) {
           if (auto maybe_ndim = ptt->sizes().size()) {
-            auto ndim = *maybe_ndim;
+            auto ndim = static_cast<int64_t>(*maybe_ndim);
             auto maybe_index = toIValue(node->inputs().at(1));
             if (!maybe_index) {
               continue;
             }
             int64_t index = maybe_index->toInt();
             int64_t norm_index = index < 0 ? ndim + index : index;
-            if (norm_index >= 0 && norm_index < static_cast<int64_t>(ndim) &&
+            if (norm_index >= 0 && norm_index < ndim &&
                 ptt->sizes()[norm_index]) {
               WithInsertPoint guard(node);
               IValue ival(*ptt->sizes()[norm_index]);
@@ -271,16 +294,12 @@ struct PeepholeOptimizeImpl {
       } else if (
           node->matches("aten::device(str type, int index) -> Device") &&
           shape_peepholes_) {
-        auto string_type = node->inputs().at(0)->type()->expect<StringType>();
-        if (string_type) {
+        auto type = toIValue(node->inputs().at(0));
+        auto index = toIValue(node->inputs().at(1));
+        if (type && index) {
           WithInsertPoint guard(node);
-          std::string type_str = node->inputs().at(0)->node()->s(attr::value);
-          auto maybe_index = toIValue(node->inputs().at(1));
-          int64_t index = 0;
-          if (maybe_index) {
-            index = maybe_index->toInt();
-          }
-          auto device = c10::Device(type_str + ":" + std::to_string(index));
+          auto device = c10::Device(
+              type->toStringRef() + ":" + std::to_string(index->toInt()));
           auto output = node->owningGraph()->insertConstant(device);
           GRAPH_UPDATE(
               "Replacing ",
@@ -468,5 +487,4 @@ bool PeepholeOptimize(
   return changed;
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

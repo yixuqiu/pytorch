@@ -15,8 +15,7 @@
 #include <ATen/ops/int_repr_native.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 // When input Tensor is non-dense, i.e. the allocated memory
 // is larger than the memory used by all the elements, we'll
@@ -44,7 +43,7 @@ Tensor int_repr_quantized_cpu(const Tensor& self) {
       auto iter = TensorIteratorConfig()
         .check_all_same_dtype(false)
         .add_output(dst)
-        .add_input(self)
+        .add_const_input(self)
         .build();
       cpu_kernel(iter, [](scalar_t value) -> underlying_t { return value.val_; });
       }
@@ -52,5 +51,4 @@ Tensor int_repr_quantized_cpu(const Tensor& self) {
   return dst;
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

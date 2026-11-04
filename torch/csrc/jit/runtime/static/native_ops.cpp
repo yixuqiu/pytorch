@@ -3,16 +3,10 @@
 #include <torch/csrc/jit/runtime/static/ops.h>
 
 #include <ATen/CPUFunctions.h>
-#include <ATen/NativeFunctions.h>
-#include <ATen/ScalarOps.h>
-#include <ATen/TensorUtils.h>
 #include <ATen/native/IndexingUtils.h>
 #include <ATen/native/NonSymbolicBC.h>
-#include <ATen/native/Resize.h>
-#include <ATen/native/TensorAdvancedIndexing.h>
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/irange.h>
-#include <c10/util/ssize.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/mobile/promoted_prim_ops.h>
 #include <torch/csrc/jit/runtime/register_ops_utils.h>
@@ -36,7 +30,7 @@ std::vector<IValue> boxInputs(const ProcessedNode& pnode) {
 
 } // namespace
 
-C10_DEFINE_REGISTRY(SRNativeOperatorRegistry, SROperatorFunctor);
+C10_DEFINE_REGISTRY(SRNativeOperatorRegistry, SROperatorFunctor)
 
 bool nativeOpIsRegistered(const c10::Symbol& op_name) {
   const std::string name(op_name.toQualString());
@@ -72,7 +66,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         // put output back
         p_node->Output(0) = std::move(stack[0]);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::TupleUnpack,
@@ -91,7 +85,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           p_node->Output(i) = elems[i];
         }
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::DictConstruct,
@@ -116,7 +110,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         }
         p_node->Output(0) = result;
       };
-    });
+    })
 
 // See [Borrowed IValue Outputs]
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
@@ -139,7 +133,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           p_node->Output(i - 1) = createBorrowedIValue(value->value());
         }
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::__getitem__, aten_getitem, [](Node* n) -> SROperator {
   if (!sr_schema_check(
@@ -177,7 +171,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::__getitem__, aten_getitem, [](Node* n) ->
 
   // TODO(T98581096): make __getitem__ work for other container types
   return nullptr;
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::ListConstruct,
@@ -197,7 +191,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         // put output back
         p_node->Output(0) = std::move(stack[0]);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::ListUnpack,
@@ -219,7 +213,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           p_node->Output(i) = list[i];
         }
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::append,
@@ -233,7 +227,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         auto list = p_node->Input(0).toList();
         list.push_back(p_node->Input(1));
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::list,
@@ -260,7 +254,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
 
       LogAndDumpSchema(n);
       return nullptr;
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::numel,
@@ -273,7 +267,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& arg = p_node->Input(0).toTensor();
         p_node->Output(0) = arg.numel();
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::cpu,
@@ -286,7 +280,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& arg = p_node->Input(0).toTensor();
         p_node->Output(0) = arg.cpu();
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::__range_length,
@@ -301,9 +295,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         auto hi = p_node->Input(1).toInt();
         auto step = p_node->Input(2).toInt();
         // error handling when step_val == 0 during runtime
-        if (step == 0) {
-          throw std::runtime_error("range() arg 3 must not be zero");
-        }
+        TORCH_CHECK(step != 0, "range() arg 3 must not be zero");
         if (step > 0 && lo < hi) {
           p_node->Output(0) = 1 + (hi - 1 - lo) / step;
         } else if (step < 0 && lo > hi) {
@@ -312,7 +304,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           p_node->Output(0) = 0;
         }
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::index_put, aten_index_put, [](Node* n) -> SROperator {
   if (n->matches(torch::schema(
@@ -332,7 +324,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::index_put, aten_index_put, [](Node* n) ->
 
   LogAndDumpSchema(n);
   return nullptr;
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::item,
@@ -345,7 +337,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& self = p_node->Input(0).toTensor();
         p_node->Output(0) = at::native::item(self);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::GetAttr,
@@ -362,7 +354,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto slot = type.getAttributeSlot(field);
         p_node->Output(0) = module.getSlot(slot);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::SetAttr,
@@ -379,7 +371,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto slot = type.getAttributeSlot(field);
         module.setSlot(slot, p_node->Input(1));
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::transpose,
@@ -396,7 +388,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto in2_i = p_node->Input(2).toInt();
         p_node->Output(0) = at::native::transpose(in0_t, in1_i, in2_i);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::flatten, aten_flatten, [](Node* n) -> SROperator {
   if (!n->matches(torch::schema(
@@ -410,7 +402,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::flatten, aten_flatten, [](Node* n) -> SRO
     const auto in2_i = p_node->Input(2).toInt();
     p_node->Output(0) = at::native::flatten(in0_t, in1_i, in2_i);
   };
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::permute,
@@ -426,7 +418,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto in1_iv = p_node->Input(1).toDimVector();
         p_node->Output(0) = at::native::permute(in0_t, in1_iv);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::reshape,
@@ -442,7 +434,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto in1_iv = p_node->Input(1).toDimVector();
         p_node->Output(0) = at::native::reshape(in0_t, in1_iv);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::slice, aten_slice, [](Node* n) -> SROperator {
   if (!n->matches(torch::schema(
@@ -458,7 +450,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::slice, aten_slice, [](Node* n) -> SROpera
     const auto in4_i = p_node->Input(4).toInt();
     p_node->Output(0) = at::native::slice(in0_t, in1_i, in2_i, in3_i, in4_i);
   };
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::narrow, aten_narrow, [](Node* n) -> SROperator {
   if (!n->matches(torch::schema(
@@ -470,7 +462,6 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::narrow, aten_narrow, [](Node* n) -> SROpe
   }
   return [](ProcessedNode* p_node) {
     const auto& self = p_node->Input(0).toTensor(); // self
-    const auto dim = p_node->Input(1).toInt(); // dim
     int64_t start = 0;
     if (p_node->Input(2).isScalar()) {
       start = p_node->Input(2).toInt();
@@ -481,6 +472,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::narrow, aten_narrow, [](Node* n) -> SROpe
     const auto length = p_node->Input(3).toInt(); // length
     TORCH_CHECK(
         self.dim() > 0, "narrow() cannot be applied to a 0-dim tensor.");
+    const auto dim = at::maybe_wrap_dim(p_node->Input(1).toInt(), self.dim());
     auto cur_size = self.sizes()[dim];
     if (start != cur_size && start < 0) { // start being the end is valid, but
                                           // not a valid dim specification.
@@ -497,7 +489,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::narrow, aten_narrow, [](Node* n) -> SROpe
         ").");
     p_node->Output(0) = at::native::slice(self, dim, start, start + length, 1);
   };
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::to, aten_to, [](Node* n) -> SROperator {
   if (n->matches(torch::schema(
@@ -529,7 +521,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::to, aten_to, [](Node* n) -> SROperator {
       const auto in1_i = p_node->Input(1).toOptional<at::ScalarType>();
       const auto in2_i = p_node->Input(2).toBool();
       const auto in3_i = p_node->Input(3).toBool();
-      // To mimick the behavior of the JIT interpreter, if both dtype
+      // To mimic the behavior of the JIT interpreter, if both dtype
       // and copy are not set, we return self. Otherwise, we assume
       // that dtype is set.
       if (!in1_i && !in3_i) {
@@ -537,14 +529,14 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::to, aten_to, [](Node* n) -> SROperator {
       } else {
         TORCH_CHECK(
             in1_i,
-            "dytpe cannot be None when copy is True for aten::to.prim_dtype");
+            "dtype cannot be None when copy is True for aten::to.prim_dtype");
         p_node->Output(0) = at::native::to(in0_t, *in1_i, in2_i, in3_i);
       }
     };
   }
   LogAndDumpSchema(n);
   return nullptr;
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::detach,
@@ -559,7 +551,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& in0_t = p_node->Input(0).toTensor();
         p_node->Output(0) = at::native::alias(in0_t);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::expand_as,
@@ -575,7 +567,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& other = p_node->Input(1).toTensor();
         p_node->Output(0) = self.expand(other.sizes());
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::isinstance,
@@ -600,7 +592,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
 
         p_node->Output(0) = false;
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::TypeCheck,
@@ -633,7 +625,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
 
         p_node->Output(num_inputs) = true;
       };
-    });
+    })
 
 // See [Borrowed IValue Outputs]
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
@@ -653,7 +645,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           }
         }
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::view,
@@ -669,7 +661,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto size = p_node->Input(1).toIntList();
         p_node->Output(0) = at::native::view(input, size.vec());
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::size,
@@ -696,7 +688,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       }
       LogAndDumpSchema(n);
       return nullptr;
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::squeeze,
@@ -713,7 +705,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto dim = p_node->Input(1).toInt();
         p_node->Output(0) = at::native::squeeze(self, dim);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::split, aten_split, [](Node* n) -> SROperator {
   if (n->matches(torch::schema(
@@ -739,7 +731,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::split, aten_split, [](Node* n) -> SROpera
 
   LogAndDumpSchema(n);
   return nullptr;
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::split_with_sizes,
@@ -759,7 +751,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         p_node->Output(0) =
             at::native::split_with_sizes(self, split_sizes.vec(), dim);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     static_runtime::select_tensor,
@@ -788,7 +780,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
             IValue(c10::MaybeOwnedTraits<at::TensorBase>::createBorrow(
                 assignFrom.toTensor()));
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::mul,
@@ -814,7 +806,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         }
         pnode->Output(0) = ret;
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::sub,
@@ -829,7 +821,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto b = pnode->Input(1).toInt();
         pnode->Output(0) = a - b;
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::add,
@@ -855,7 +847,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
 
       LogAndDumpSchema(n);
       return nullptr;
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::tensor_split, aten_tensor_split, [](Node* n) -> SROperator {
   if (n->matches(torch::schema(
@@ -889,7 +881,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::tensor_split, aten_tensor_split, [](Node*
   }
   LogAndDumpSchema(n);
   return nullptr;
-});
+})
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::Int,
@@ -903,7 +895,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& input = pnode->Input(0).toTensor();
         pnode->Output(0) = at::native::item(input).toInt();
       };
-    });
+    })
 
 // See [Create owned refs for special values]
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
@@ -915,7 +907,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       }
       return
           [](ProcessedNode* p_node) { p_node->Output(0) = p_node->Input(0); };
-    });
+    })
 
 namespace {
 bool outputsEmpty(const Block* block) {
@@ -1020,7 +1012,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           return [](ProcessedNode*) {};
       }
       return [](ProcessedNode*) {};
-    });
+    })
 
 namespace {
 
@@ -1054,7 +1046,7 @@ namespace {
   execution is completed, future is marked as complete to
   indicate aten::wait() to proceed
 */
-class TORCH_API ForkedSubgraphSRLauncher {
+class ForkedSubgraphSRLauncher {
  public:
   ForkedSubgraphSRLauncher(
       std::shared_ptr<StaticModule> smodule,
@@ -1092,7 +1084,7 @@ class TORCH_API ForkedSubgraphSRLauncher {
   execution of subgraphs
 */
 c10::intrusive_ptr<Future> createFutureTypeFromGraphOutput(
-    std::shared_ptr<torch::jit::Graph> graph) {
+    const std::shared_ptr<torch::jit::Graph>& graph) {
   TypePtr return_type_;
   if (graph->outputs().size() == 1) {
     return_type_ = graph->outputs().at(0)->type();
@@ -1108,7 +1100,7 @@ c10::intrusive_ptr<Future> createFutureTypeFromGraphOutput(
 /*
   prim::fork forks the execution of a subgraph. It returns a future on which
   the corresponding aten::wait op waits until future is marked complete
-  Current implementation creates a instance of StaticModule uses it to
+  Current implementation creates an instance of StaticModule uses it to
   create StaticRuntime instances on the fly during runtime to handle the
   execution of forked subgraph. Async execution is handled by
   aten::ParallelThreadPoolNative threadpool.
@@ -1147,7 +1139,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
             smodule, args, future, *launcher);
         (*launcher)(std::move(runtime_launcher));
       };
-    });
+    })
 /*
   aten::wait waits on the future (present in corresponding fork)
   to be executed. Once the execution is complete, the future is marked
@@ -1181,7 +1173,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           p_node->Output(i) = elems[i];
         }
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::Loop,
@@ -1225,7 +1217,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
           p_node->Output(i) = std::move(args[i + 1]);
         }
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::CreateObject,
@@ -1240,7 +1232,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
             c10::StrongTypePtr(class_type->compilation_unit(), class_type),
             class_type->numAttributes());
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::TupleIndex,
@@ -1251,18 +1243,14 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       }
       return [](ProcessedNode* pnode) {
         const auto& elems = pnode->Input(0).toTupleRef().elements();
-        using c10::ssize;
-        const auto num_elems = ssize(elems);
+        const auto num_elems = std::ssize(elems);
         const auto idx = pnode->Input(1).toInt();
         const auto norm_idx = normalizeIndex(idx, num_elems);
-        if (norm_idx < 0 || norm_idx >= num_elems) {
-          // Use std::runtime_error instead of c10::Error to be consistent with
-          // JIT
-          throw std::out_of_range("Tuple index out of range");
-        }
+        TORCH_CHECK_INDEX(
+            norm_idx >= 0 && norm_idx < num_elems, "Tuple index out of range");
         pnode->Output(0) = elems[norm_idx];
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::RaiseException,
@@ -1273,9 +1261,15 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       }
       return [](ProcessedNode* pnode) {
         const auto& message = pnode->Input(0).toStringRef();
+        // prim::RaiseException surfaces the message the scripted `raise` was
+        // given. test_static_runtime.cc catches this by name as
+        // std::runtime_error, which c10::Error does not derive from, and then
+        // asserts what() equals the message exactly - c10::Error::what()
+        // appends its backtrace.
+        // @allow-raw-throw: caught by name, and what() must equal the message
         throw std::runtime_error(message);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::Uninitialized,
@@ -1287,7 +1281,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       return [](ProcessedNode* pnode) {
         pnode->Output(0) = IValue::uninitialized();
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::format,
@@ -1304,7 +1298,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         TORCH_DCHECK_EQ(stack.size(), 1);
         pnode->Output(0) = std::move(stack[0]);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::device,
@@ -1317,7 +1311,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& input = pnode->Input(0).toTensor();
         pnode->Output(0) = input.device();
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::dtype,
@@ -1330,7 +1324,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& input = pnode->Input(0).toTensor();
         pnode->Output(0) = static_cast<int64_t>(input.scalar_type());
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::dim,
@@ -1343,7 +1337,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& input = pnode->Input(0).toTensor();
         pnode->Output(0) = input.dim();
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::__not__,
@@ -1356,7 +1350,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         auto input = pnode->Input(0).toBool();
         pnode->Output(0) = !input;
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::Bool,
@@ -1382,7 +1376,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       }
       LogAndDumpSchema(n);
       return nullptr;
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::is_cuda,
@@ -1395,7 +1389,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& input = pnode->Input(0).toTensor();
         pnode->Output(0) = input.is_cuda();
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     prim::tolist,
@@ -1413,7 +1407,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         TORCH_DCHECK_EQ(stack.size(), 1);
         pnode->Output(0) = std::move(stack[0]);
       };
-    });
+    })
 
 // See [Borrowed IValue Outputs]
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
@@ -1428,7 +1422,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         pnode->Output(0) = condition ? createBorrowedIValue(pnode->Input(1))
                                      : createBorrowedIValue(pnode->Input(2));
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::len,
@@ -1474,7 +1468,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       }
       LogAndDumpSchema(n);
       return nullptr;
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::IntImplicit,
@@ -1488,19 +1482,18 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& tensor = pnode->Input(0).toTensor();
         // JIT does a check for requires_grad, but we skip it here since SR is
         // inference only
-        if (!tensor.sizes().empty()) {
-          throw std::runtime_error(
-              "Cannot convert a tensor of dimension > 0 to scalar");
-        }
+        TORCH_CHECK(
+            tensor.sizes().empty(),
+            "Cannot convert a tensor of dimension > 0 to scalar");
         if (!isIntegralType(tensor.scalar_type(), /*includeBool=*/false)) {
           std::stringstream ss;
           ss << "Cannot input a tensor of type " << tensor.scalar_type()
              << " as an integral argument";
-          throw std::runtime_error(ss.str());
+          TORCH_CHECK(false, std::move(ss).str());
         }
         pnode->Output(0) = at::native::item(tensor).toInt();
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::select,
@@ -1517,7 +1510,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto index = pnode->Input(2).toInt();
         pnode->Output(0) = at::native::select(self, dim, index);
       };
-    });
+    })
 
 REGISTER_NATIVE_OPERATOR_FUNCTOR(
     aten::reshape_as,
@@ -1533,6 +1526,6 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         const auto& other = pnode->Input(1).toTensor();
         pnode->Output(0) = at::native::reshape(self, other.sizes());
       };
-    });
+    })
 
 } // namespace torch::jit

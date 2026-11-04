@@ -2,19 +2,18 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/native/DispatchStub.h>
 #include <ATen/native/FusedAdam.h>
+#include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
-#include <ATen/ops/_fused_adam.h>
 #include <ATen/ops/_fused_adam_native.h>
-#include <ATen/ops/_fused_adamw.h>
 #include <ATen/ops/_fused_adamw_native.h>
 #endif
-namespace at {
 
-namespace native {
+
+namespace at::native {
 
 void _fused_adam_kernel_cpu_(
     at::TensorList params,
@@ -30,8 +29,8 @@ void _fused_adam_kernel_cpu_(
     const double eps,
     const bool amsgrad,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
   const float* grad_scale_ptr =
       grad_scale.has_value() ? grad_scale->data_ptr<float>() : nullptr;
   const float* found_inf_ptr =
@@ -46,11 +45,11 @@ void _fused_adam_kernel_cpu_(
   if (amsgrad) {
     TORCH_CHECK(max_exp_avg_sqs.size() == n_tensors);
   } else {
-    TORCH_CHECK(max_exp_avg_sqs.size() == 0);
+    TORCH_CHECK(max_exp_avg_sqs.empty());
   }
   TORCH_CHECK(state_steps.size() == n_tensors);
   at::Tensor max_exp_avg_sq = at::Tensor();
-  for (size_t i = 0; i < n_tensors; i++){
+  for (const auto i : c10::irange(n_tensors)){
     if (amsgrad) max_exp_avg_sq = max_exp_avg_sqs[i];
     fused_adam_stub(
       kCPU,
@@ -87,8 +86,8 @@ void _fused_adam_kernel_cpu_(
     const double eps,
     const bool amsgrad,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
   _fused_adam_kernel_cpu_(params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps, lr.item<double>(), beta1, beta2, weight_decay, eps, amsgrad, maximize, grad_scale, found_inf);
 }
 
@@ -106,8 +105,8 @@ void _fused_adamw_kernel_cpu_(
     const double eps,
     const bool amsgrad,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
   const float* grad_scale_ptr =
       grad_scale.has_value() ? grad_scale->data_ptr<float>() : nullptr;
   const float* found_inf_ptr =
@@ -122,11 +121,11 @@ void _fused_adamw_kernel_cpu_(
   if (amsgrad) {
     TORCH_CHECK(max_exp_avg_sqs.size() == n_tensors);
   } else {
-    TORCH_CHECK(max_exp_avg_sqs.size() == 0);
+    TORCH_CHECK(max_exp_avg_sqs.empty());
   }
   TORCH_CHECK(state_steps.size() == n_tensors);
   at::Tensor max_exp_avg_sq = at::Tensor();
-  for (size_t i = 0; i < n_tensors; i++){
+  for (const auto i : c10::irange(n_tensors)){
     if (amsgrad) max_exp_avg_sq = max_exp_avg_sqs[i];
     fused_adam_stub(
       kCPU,
@@ -163,13 +162,12 @@ void _fused_adamw_kernel_cpu_(
     const double eps,
     const bool amsgrad,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
   _fused_adamw_kernel_cpu_(params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps, lr.item<double>(), beta1, beta2, weight_decay, eps, amsgrad, maximize, grad_scale, found_inf);
 }
 
 
 DEFINE_DISPATCH(fused_adam_stub);
 
-}
 }

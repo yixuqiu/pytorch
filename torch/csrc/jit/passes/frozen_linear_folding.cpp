@@ -12,8 +12,7 @@
 #include <ATen/ops/zeros_like.h>
 #endif
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 namespace {
 
@@ -104,13 +103,13 @@ bool FoldFrozenLinearBatchnorm(Block* b) {
       }
 
       LinearBNParameters params;
-      params.linear_w = linear_w;
-      params.linear_b = linear_b;
-      params.bn_rm = bn_rm;
-      params.bn_rv = bn_rv;
+      params.linear_w = std::move(linear_w);
+      params.linear_b = std::move(linear_b);
+      params.bn_rm = std::move(bn_rm);
+      params.bn_rv = std::move(bn_rv);
       params.bn_eps = bn_eps;
-      params.bn_w = bn_w;
-      params.bn_b = bn_b;
+      params.bn_w = std::move(bn_w);
+      params.bn_b = std::move(bn_b);
       std::tuple<Tensor, Tensor> out =
           computeUpdatedLinearWeightAndBias(params);
       WithInsertPoint guard(linear);
@@ -140,5 +139,4 @@ bool FoldFrozenLinearBatchnorm(std::shared_ptr<Graph>& graph) {
   return graph_modified;
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

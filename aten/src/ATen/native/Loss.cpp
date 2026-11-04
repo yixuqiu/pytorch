@@ -2,6 +2,7 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/core/Reduction.h>
 #include <ATen/Dispatch.h>
+#include <ATen/ExpandUtils.h>
 #include <ATen/TensorIterator.h>
 #include <ATen/TensorMeta.h>
 #include <ATen/TensorOperators.h>
@@ -61,7 +62,7 @@
 constexpr float EPSILON = 1e-12;
 
 namespace {
-  static inline at::Tensor apply_loss_reduction(const at::Tensor& unreduced, int64_t reduction) {
+  inline at::Tensor apply_loss_reduction(const at::Tensor& unreduced, int64_t reduction) {
     if (reduction == at::Reduction::Mean) {
       return unreduced.mean();
     } else if (reduction == at::Reduction::Sum) {
@@ -76,25 +77,47 @@ namespace at::meta {
 TORCH_META_FUNC(smooth_l1_loss)
 (const Tensor& input, const Tensor& target, const int64_t reduction, double beta) {
   TORCH_CHECK(beta >= 0, "smooth_l1_loss does not support negative values for beta.")
-  // TODO: Reduce this extra TensorIterator construction for Reduction::Mean & Sum.
-  // We do another TensorIterator construction in the IMPL for the two cases.
-  build_borrowing_binary_op(maybe_get_output(), input, target);
   if (reduction == Reduction::None) {
+    build_borrowing_binary_op(maybe_get_output(), input, target);
     return;
   }
 
   TORCH_INTERNAL_ASSERT(reduction == Reduction::Mean || reduction == Reduction::Sum);
+  // declare_static_shape skips broadcasting, so check the input shapes here.
+  infer_size(input.sizes(), target.sizes());
+  build(TensorIteratorConfig()
+      .add_output(maybe_get_output())
+      .add_const_input(input)
+      .add_const_input(target)
+      .allow_cpu_scalars(true)
+      .promote_inputs_to_common_dtype(true)
+      .cast_common_dtype_to_outputs(true)
+      .enforce_safe_casting_to_output(true)
+      .resize_outputs(false)
+      .declare_static_shape({}));
   maybe_get_output().resize_({});
 }
 
 TORCH_META_FUNC(mse_loss)
 (const Tensor& input, const Tensor& target, const int64_t reduction) {
-  build_borrowing_binary_op(maybe_get_output(), input, target);
   if (reduction == Reduction::None) {
+    build_borrowing_binary_op(maybe_get_output(), input, target);
     return;
   }
 
   TORCH_INTERNAL_ASSERT(reduction == Reduction::Mean || reduction == Reduction::Sum);
+  // declare_static_shape skips broadcasting, so check the input shapes here.
+  infer_size(input.sizes(), target.sizes());
+  build(TensorIteratorConfig()
+      .add_output(maybe_get_output())
+      .add_const_input(input)
+      .add_const_input(target)
+      .allow_cpu_scalars(true)
+      .promote_inputs_to_common_dtype(true)
+      .cast_common_dtype_to_outputs(true)
+      .enforce_safe_casting_to_output(true)
+      .resize_outputs(false)
+      .declare_static_shape({}));
   maybe_get_output().resize_({});
 }
 
@@ -127,6 +150,9 @@ TORCH_IMPL_FUNC(smooth_l1_loss_out)
 
 TORCH_IMPL_FUNC(mse_loss_out)
 (const Tensor& input, const Tensor& target, int64_t reduction, const Tensor& result) {
+  TORCH_CHECK(input.device() == target.device(),
+      "Expected all tensors to be on the same device, but found at least two devices, ",
+      input.device(), " and ", target.device(), "!");
   if (reduction != Reduction::None) {
     Tensor loss;
     auto iter = TensorIterator::borrowing_binary_op(loss, input, target);
@@ -250,21 +276,13 @@ Tensor kl_div(const Tensor& input, const Tensor& target, int64_t reduction, bool
   return apply_loss_reduction(output, reduction);
 }
 
-Tensor binary_cross_entropy_cpu(const Tensor& input, const Tensor& target, const c10::optional<Tensor>& weight_opt, int64_t reduction) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
+Tensor binary_cross_entropy_cpu(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight_opt, int64_t reduction) {
     Tensor loss = at::empty_like(input);
     return at::native::binary_cross_entropy_out_cpu(
-        input, target, weight, reduction, loss);
+        input, target, weight_opt, reduction, loss);
 }
 
-Tensor& binary_cross_entropy_out_cpu(const Tensor& input, const Tensor& target, const c10::optional<Tensor>& weight_opt, int64_t reduction, Tensor& loss) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
+Tensor& binary_cross_entropy_out_cpu(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight_opt, int64_t reduction, Tensor& loss) {
     Tensor loss_squeezed = at::squeeze(loss);
 
     auto iter = TensorIteratorConfig()
@@ -297,8 +315,8 @@ Tensor& binary_cross_entropy_out_cpu(const Tensor& input, const Tensor& target, 
               });
         });
 
-    if (weight.defined()) {
-        loss.mul_(weight);
+    if (weight_opt.has_value() && weight_opt->defined()) {
+        loss.mul_(*weight_opt);
     }
     if (reduction != at::Reduction::None) {
         Tensor loss_reduced = apply_loss_reduction(loss, reduction);
@@ -307,21 +325,13 @@ Tensor& binary_cross_entropy_out_cpu(const Tensor& input, const Tensor& target, 
     return loss;
 }
 
-Tensor binary_cross_entropy_backward_cpu(const Tensor& grad, const Tensor& input, const Tensor& target, const c10::optional<Tensor>& weight_opt, int64_t reduction) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
+Tensor binary_cross_entropy_backward_cpu(const Tensor& grad, const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight_opt, int64_t reduction) {
     Tensor grad_input = at::empty_like(input);
     return at::native::binary_cross_entropy_backward_out_cpu(
-        grad, input, target, weight, reduction, grad_input);
+        grad, input, target, weight_opt, reduction, grad_input);
 }
 
-Tensor& binary_cross_entropy_backward_out_cpu(const Tensor& grad, const Tensor& input, const Tensor& target, const c10::optional<Tensor>& weight_opt, int64_t reduction, Tensor& grad_input) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
+Tensor& binary_cross_entropy_backward_out_cpu(const Tensor& grad, const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight_opt, int64_t reduction, Tensor& grad_input) {
     Tensor grad_input_squeezed = at::squeeze(grad_input);
 
     auto iter = TensorIteratorConfig()
@@ -350,8 +360,8 @@ Tensor& binary_cross_entropy_backward_out_cpu(const Tensor& grad, const Tensor& 
               });
         });
 
-    if (weight.defined()) {
-        grad_input.mul_(weight);
+    if (weight_opt.has_value() && weight_opt->defined()) {
+        grad_input.mul_(*weight_opt);
     }
     if (reduction == at::Reduction::Mean) {
         grad_input.div_(input.numel());
@@ -359,24 +369,18 @@ Tensor& binary_cross_entropy_backward_out_cpu(const Tensor& grad, const Tensor& 
     return grad_input;
 }
 
-Tensor binary_cross_entropy_with_logits(const Tensor& input, const Tensor& target, const c10::optional<Tensor>& weight_opt, const c10::optional<Tensor>& pos_weight_opt, int64_t reduction) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-  c10::MaybeOwned<Tensor> pos_weight_maybe_owned = at::borrow_from_optional_tensor(pos_weight_opt);
-  const Tensor& pos_weight = *pos_weight_maybe_owned;
-
+Tensor binary_cross_entropy_with_logits(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& pos_weight_opt, int64_t reduction) {
   auto log_sigmoid_input = at::log_sigmoid(input);
-  if (pos_weight.defined()) {
+  if (pos_weight_opt.has_value() && pos_weight_opt->defined()) {
       // pos_weight need to be broadcasted, thus mul(target) is not inplace.
-      auto log_weight = (pos_weight - 1).mul(target).add_(1);
+      auto log_weight = (*pos_weight_opt- 1).mul(target).add_(1);
       log_sigmoid_input.mul_(log_weight);
   }
 
   Tensor loss = (1 - target).mul_(input).sub_(log_sigmoid_input);
 
-  if (weight.defined()) {
-      loss.mul_(weight);
+  if (weight_opt.has_value() && weight_opt->defined()) {
+      loss.mul_(*weight_opt);
   }
 
   return apply_loss_reduction(loss, reduction);
@@ -490,6 +494,9 @@ Tensor& huber_loss_backward_out(const Tensor& grad_output, const Tensor& input, 
     .add_const_input(input)
     .add_const_input(target)
     .add_const_input(grad_output)
+    .promote_inputs_to_common_dtype(true)
+    .cast_common_dtype_to_outputs(true)
+    .enforce_safe_casting_to_output(true)
     .build();
   huber_backward_stub(iter.device_type(), iter, norm, delta);
   return grad_input;
@@ -508,6 +515,9 @@ Tensor& mse_loss_backward_out(const Tensor& grad_output,
     .add_const_input(input)
     .add_const_input(target)
     .add_const_input(grad_output)
+    .promote_inputs_to_common_dtype(true)
+    .cast_common_dtype_to_outputs(true)
+    .enforce_safe_casting_to_output(true)
     .build();
   mse_backward_stub(iter.device_type(), iter, norm);
   return grad_input;

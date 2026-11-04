@@ -1,9 +1,11 @@
 import argparse
 
 import benchmark_core
+
 import benchmark_utils
 
 import torch
+
 
 """Performance microbenchmarks's main binary.
 
@@ -13,6 +15,8 @@ It also registers existing benchmark tests via Python module imports.
 parser = argparse.ArgumentParser(
     description="Run microbenchmarks.",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    conflict_handler="resolve",
+    allow_abbrev=False,
 )
 
 
@@ -50,6 +54,20 @@ def parse_args():
         "--list_ops",
         help="List operators without running them",
         action="store_true",
+    )
+
+    parser.add_argument(
+        "--output-json",
+        "--output_json",
+        help="JSON file path to write the results to",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--benchmark-name",
+        "--benchmark_name",
+        help="Name of the benchmark to store results to",
+        default="PyTorch operator benchmark",
     )
 
     parser.add_argument(
@@ -92,7 +110,7 @@ def parse_args():
     parser.add_argument(
         "--omp-num-threads",
         "--omp_num_threads",
-        help="Number of OpenMP threads used in PyTorch/Caffe2 runtime",
+        help="Number of OpenMP threads used in PyTorch runtime",
         default=None,
         type=int,
     )
@@ -100,7 +118,7 @@ def parse_args():
     parser.add_argument(
         "--mkl-num-threads",
         "--mkl_num_threads",
-        help="Number of MKL threads used in PyTorch/Caffe2 runtime",
+        help="Number of MKL threads used in PyTorch runtime",
         default=None,
         type=int,
     )
@@ -126,6 +144,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--use-compile",
+        "--use_compile",
+        type=benchmark_utils.str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Run operators with PyTorch Compile mode",
+    )
+
+    parser.add_argument(
         "--forward-only",
         "--forward_only",
         type=benchmark_utils.str2bool,
@@ -136,15 +164,23 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--framework",
-        help="Comma-delimited list of frameworks to test (Caffe2, PyTorch)",
-        default="Caffe2,PyTorch",
-    )
-
-    parser.add_argument(
         "--device",
         help="Run tests on the provided architecture (cpu, cuda)",
         default="None",
+    )
+
+    parser.add_argument(
+        "--output-csv",
+        "--output_csv",
+        help="CSV file path to store the results",
+        default="benchmark_logs",
+    )
+
+    parser.add_argument(
+        "--output-json-for-dashboard",
+        "--output_json_for_dashboard",
+        help="Save results in JSON format for display on the OSS dashboard",
+        default="benchmark-results.json",
     )
 
     args, _ = parser.parse_known_args()
@@ -160,8 +196,7 @@ def parse_args():
         # "Modifications to the environment variables after the program has started,
         # even if modified by the program itself, are ignored by the OpenMP implementation"
         benchmark_utils.set_omp_threads(args.omp_num_threads)
-        if benchmark_utils.is_pytorch_enabled(args.framework):
-            torch.set_num_threads(args.omp_num_threads)
+        torch.set_num_threads(args.omp_num_threads)
     if args.mkl_num_threads:
         benchmark_utils.set_mkl_threads(args.mkl_num_threads)
 

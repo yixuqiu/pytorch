@@ -16,8 +16,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 namespace {
 c10::AliasAnalysisKind aliasAnalysisIsSpecialCase() {
@@ -66,7 +65,7 @@ c10::AliasAnalysisKind aliasAnalysisIsSpecialCase() {
 
 // Note [Overlapping trees]
 // Additionally it wouldn't be too hard to add support for partially overlapping
-// trees. Right now the it's forbidden in the algorithm (only a single tree will
+// trees. Right now it's forbidden in the algorithm (only a single tree will
 // be allowed), so theoretically we might miss some optimization options,
 // especially that the rejected tree could be much larger. I didn't implement
 // that because it's not necessary for the simple RNN cases I saw, so I decided
@@ -111,7 +110,7 @@ static bool shape_is_fast_for_reduce(
   return m < 512 || ((l < 256 && r < 256) || (l > 256 && r > 256));
 }
 
-RegisterOperators mm_tree_reduction_reg({Operator(
+static RegisterOperators mm_tree_reduction_reg({Operator(
     "prim::MMTreeReduce(...) -> Tensor",
     [](Stack& stack) {
       auto num_inputs = pop(stack).toInt();
@@ -244,7 +243,8 @@ struct TreeToken {
         queue.push_back(n->inputs()[0]->node());
         queue.push_back(n->inputs()[1]->node());
       } else {
-        AT_ASSERTM(false, "Unsupported node found in a BatchMM tree!");
+        TORCH_INTERNAL_ASSERT(
+            false, "Unsupported node found in a BatchMM tree!");
       }
     }
     return matmuls;
@@ -319,11 +319,11 @@ static void BatchMMTreeReduce(Block* block, AliasDb& alias_db) {
 }
 
 static bool shape_is_fast_for_side(const at::Tensor& other_side_input) {
-  // Cutoff chosed by benchmarking on a TITAN V
+  // Cutoff chose by benchmarking on a TITAN V
   return other_side_input.numel() <= 1024 * 2048;
 }
 
-RegisterOperators mm_batch_side_reg({Operator(
+static RegisterOperators mm_batch_side_reg({Operator(
     prim::MMBatchSide,
     [](const Node* node) -> Operation {
       size_t num_other_side_inputs = node->inputs().size() - 1;
@@ -394,7 +394,7 @@ static std::pair<std::vector<Node*>, std::vector<Node*>> gatherIndependentMMUses
         }
       }
     }
-    return c10::filter(mms, [](Node* n) { return n != nullptr; });
+    return c10::filter(std::move(mms), [](Node* n) { return n != nullptr; });
   };
 
   Block* block = value->node()->owningBlock();
@@ -464,18 +464,6 @@ static void BatchMMSide(Block* block, AliasDb& alias_db) {
   }
 }
 
-static bool hasMutableOperators(Block* block) {
-  for (auto n : block->nodes()) {
-    if (n->kind().is_aten() && n->schema().is_mutable())
-      return true;
-    for (auto b : n->blocks()) {
-      if (hasMutableOperators(b))
-        return true;
-    }
-  }
-  return false;
-}
-
 static bool hasMMOperators(std::shared_ptr<Graph>& graph) {
   DepthFirstGraphNodeIterator it(graph);
   Node* n = nullptr;
@@ -502,5 +490,4 @@ void BatchMM(std::shared_ptr<Graph>& graph) {
   PeepholeOptimize(graph, /*disable_shape_peepholes*/ true);
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

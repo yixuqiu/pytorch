@@ -6,18 +6,16 @@ import operator
 import sys
 import warnings
 from fractions import Fraction
-
 from unittest import expectedFailure as xfail, skipIf as skipif
 
 import hypothesis
 import hypothesis.strategies as st
-
 import numpy
-
 import pytest
 from hypothesis.extra.numpy import arrays
 from pytest import raises as assert_raises
 
+import torch
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -26,8 +24,9 @@ from torch.testing._internal.common_utils import (
     subtest,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
-    xpassIfTorchDynamo,
+    xpassIfTorchDynamo_np,
 )
+
 
 skip = functools.partial(skipif, True)
 
@@ -35,10 +34,24 @@ HAS_REFCOUNT = True
 IS_WASM = False
 IS_PYPY = False
 
+import string
+
+
 # FIXME: make from torch._numpy
 # These are commented, as if they are imported, some of the tests pass for the wrong reasons
-# from numpy lib import digitize, piecewise, trapz, select, trim_zeros, interp
-from numpy.lib import delete, extract, insert, msort, place, setxor1d, unwrap, vectorize
+# from numpy lib import digitize, piecewise, select, trim_zeros, interp
+# FIXME: broken on numpy 2.0+
+if int(numpy.__version__[0]) < 2:
+    from numpy.lib import (
+        delete,
+        extract,
+        insert,
+        msort,
+        place,
+        setxor1d,
+        unwrap,
+        vectorize,
+    )
 
 
 # If we are going to trace through these, we should use NumPy
@@ -62,23 +75,21 @@ if TEST_WITH_TORCHDYNAMO:
         kaiser,
         meshgrid,
         sinc,
-        trapz,
         trim_zeros,
         unique,
     )
     from numpy.core.numeric import normalize_axis_tuple
     from numpy.random import rand
-
     from numpy.testing import (
         assert_,
-        assert_allclose,  # IS_PYPY,
+        assert_allclose,
         assert_almost_equal,
         assert_array_almost_equal,
         assert_array_equal,
         assert_equal,
         assert_raises_regex,
         assert_warns,
-        suppress_warnings,  # HAS_REFCOUNT, IS_WASM
+        suppress_warnings,
     )
 else:
     import torch._numpy as np
@@ -101,17 +112,16 @@ else:
     )
     from torch._numpy._util import normalize_axis_tuple
     from torch._numpy.random import rand
-
     from torch._numpy.testing import (
         assert_,
-        assert_allclose,  # IS_PYPY,
+        assert_allclose,
         assert_almost_equal,
         assert_array_almost_equal,
         assert_array_equal,
         assert_equal,
         assert_raises_regex,
         assert_warns,
-        suppress_warnings,  # HAS_REFCOUNT, IS_WASM
+        suppress_warnings,
     )
 
 
@@ -127,7 +137,7 @@ def _make_complex(real, imag):
     Like real + 1j * imag, but behaves as expected when imag contains non-finite
     values
     """
-    ret = np.zeros(np.broadcast(real, imag).shape, np.complex_)
+    ret = np.zeros(np.broadcast(real, imag).shape, np.complex128)
     ret.real = real
     ret.imag = imag
     return ret
@@ -268,8 +278,8 @@ class TestAny(TestCase):
     def test_nd(self):
         y1 = [[0, 0, 0], [0, 1, 0], [1, 1, 0]]
         assert_(np.any(y1))
-        assert_array_equal(np.sometrue(y1, axis=0), [1, 1, 0])
-        assert_array_equal(np.sometrue(y1, axis=1), [0, 1, 1])
+        assert_array_equal(np.any(y1, axis=0), [1, 1, 0])
+        assert_array_equal(np.any(y1, axis=1), [0, 1, 1])
 
 
 class TestAll(TestCase):
@@ -285,8 +295,8 @@ class TestAll(TestCase):
     def test_nd(self):
         y1 = [[0, 0, 1], [0, 1, 1], [1, 1, 1]]
         assert_(not np.all(y1))
-        assert_array_equal(np.alltrue(y1, axis=0), [0, 0, 1])
-        assert_array_equal(np.alltrue(y1, axis=1), [0, 0, 1])
+        assert_array_equal(np.all(y1, axis=0), [0, 0, 1])
+        assert_array_equal(np.all(y1, axis=1), [0, 0, 1])
 
 
 class TestCopy(TestCase):
@@ -298,7 +308,7 @@ class TestCopy(TestCase):
         assert_equal(a[0, 0], 1)
         assert_equal(a_copy[0, 0], 10)
 
-    @xpassIfTorchDynamo  # (reason="order='F' not implemented")
+    @xpassIfTorchDynamo_np  # (reason="order='F' not implemented")
     def test_order(self):
         # It turns out that people rely on np.copy() preserving order by
         # default; changing this broke scikit-learn:
@@ -356,19 +366,31 @@ class TestAverage(TestCase):
         self, x, axis, expected_avg, weights, expected_wavg, expected_wsum
     ):
         avg = np.average(x, axis=axis, keepdims=True)
-        assert avg.shape == np.shape(expected_avg)
+        if avg.shape != np.shape(expected_avg):
+            raise AssertionError(
+                f"Expected avg.shape == {np.shape(expected_avg)}, got {avg.shape}"
+            )
         assert_array_equal(avg, expected_avg)
 
         wavg = np.average(x, axis=axis, weights=weights, keepdims=True)
-        assert wavg.shape == np.shape(expected_wavg)
+        if wavg.shape != np.shape(expected_wavg):
+            raise AssertionError(
+                f"Expected wavg.shape == {np.shape(expected_wavg)}, got {wavg.shape}"
+            )
         assert_array_equal(wavg, expected_wavg)
 
         wavg, wsum = np.average(
             x, axis=axis, weights=weights, returned=True, keepdims=True
         )
-        assert wavg.shape == np.shape(expected_wavg)
+        if wavg.shape != np.shape(expected_wavg):
+            raise AssertionError(
+                f"Expected wavg.shape == {np.shape(expected_wavg)}, got {wavg.shape}"
+            )
         assert_array_equal(wavg, expected_wavg)
-        assert wsum.shape == np.shape(expected_wsum)
+        if wsum.shape != np.shape(expected_wsum):
+            raise AssertionError(
+                f"Expected wsum.shape == {np.shape(expected_wsum)}, got {wsum.shape}"
+            )
         assert_array_equal(wsum, expected_wsum)
 
     @skip(reason="NP_VER: fails on CI")
@@ -496,7 +518,7 @@ class TestSelect(TestCase):
         assert_equal(select([True], [0], default=[0]).shape, (1,))
 
     def test_return_dtype(self):
-        assert_equal(select(self.conditions, self.choices, 1j).dtype, np.complex_)
+        assert_equal(select(self.conditions, self.choices, 1j).dtype, np.complex128)
         # But the conditions need to be stronger then the scalar default
         # if it is scalar.
         choices = [choice.astype(np.int8) for choice in self.choices]
@@ -526,7 +548,7 @@ class TestSelect(TestCase):
         select(conditions, choices)
 
 
-@xpassIfTorchDynamo  # (reason="TODO: implement")
+@xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestInsert(TestCase):
     def test_basic(self):
@@ -845,17 +867,18 @@ class TestDiff(TestCase):
         assert_raises(np.AxisError, diff, x, append=0, axis=3)
 
 
-@xpassIfTorchDynamo  # (reason="TODO: implement")
+@xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestDelete(TestCase):
     def setUp(self):
+        super().setUp()
         self.a = np.arange(5)
         self.nd_a = np.arange(5).repeat(2).reshape(1, 5, 2)
 
     def _check_inverse_of_slicing(self, indices):
         a_del = delete(self.a, indices)
         nd_a_del = delete(self.nd_a, indices, axis=1)
-        msg = "Delete failed for obj: %r" % indices
+        msg = f"Delete failed for obj: {indices!r}"
         assert_array_equal(setxor1d(a_del, self.a[indices,]), self.a, err_msg=msg)
         xor = setxor1d(nd_a_del[0, :, 0], self.nd_a[0, indices, 0])
         assert_array_equal(xor, self.nd_a[0, :, 0], err_msg=msg)
@@ -1002,6 +1025,7 @@ class TestGradient(TestCase):
         assert_raises(TypeError, gradient, f_2d, x, x, axis=1)
         assert_raises(TypeError, gradient, f_2d, 1, 1, axis=1)
 
+    @torch._dynamo.config.patch(use_numpy_random_stream=True)
     def test_second_order_accurate(self):
         # Testing that the relative numerical error is less that 3% for
         # this example problem. This corresponds to second order
@@ -1194,7 +1218,7 @@ class TestAngle(TestCase):
         assert_array_almost_equal(z, zo, 11)
 
 
-@xpassIfTorchDynamo
+@xpassIfTorchDynamo_np
 @instantiate_parametrized_tests
 class TestTrimZeros(TestCase):
     a = np.array([0, 0, 1, 0, 2, 3, 4, 0])
@@ -1233,10 +1257,12 @@ class TestTrimZeros(TestCase):
             arr = np.zeros_like(_arr, dtype=_arr.dtype)
 
             res1 = trim_zeros(arr, trim="B")
-            assert len(res1) == 0
+            if len(res1) != 0:
+                raise AssertionError(f"Expected len(res1) == 0, got {len(res1)}")
 
             res2 = trim_zeros(arr, trim="f")
-            assert len(res2) == 0
+            if len(res2) != 0:
+                raise AssertionError(f"Expected len(res2) == 0, got {len(res2)}")
 
     def test_size_zero(self):
         arr = np.zeros(0)
@@ -1263,10 +1289,11 @@ class TestTrimZeros(TestCase):
 
     def test_list_to_list(self):
         res = trim_zeros(self.a.tolist())
-        assert isinstance(res, list)
+        if not isinstance(res, list):
+            raise AssertionError(f"Expected res to be list, got {type(res)}")
 
 
-@xpassIfTorchDynamo  # (reason="TODO: implement")
+@xpassIfTorchDynamo_np  # (reason="TODO: implement")
 class TestExtins(TestCase):
     def test_basic(self):
         a = np.array([1, 3, 2, 1, 2, 3, 3])
@@ -1435,7 +1462,7 @@ class TestVectorize(TestCase):
         try:
             vectorize(random.randrange)  # Should succeed
         except Exception:
-            raise AssertionError  # noqa: TRY200
+            raise AssertionError  # noqa: B904
 
     def test_keywords2_ticket_2100(self):
         # Test kwarg support: enhancement ticket 2100
@@ -1532,7 +1559,7 @@ class TestVectorize(TestCase):
     def test_string_ticket_1892(self):
         # Test vectorization over strings: issue 1892.
         f = np.vectorize(lambda x: x)
-        s = "0123456789" * 10
+        s = string.digits * 10
         assert_equal(s, f(s))
 
     def test_cache(self):
@@ -1668,7 +1695,7 @@ class TestVectorize(TestCase):
             f(x)
 
 
-@xpassIfTorchDynamo  # (reason="TODO: implement")
+@xpassIfTorchDynamo_np  # (reason="TODO: implement")
 class TestDigitize(TestCase):
     def test_forward(self):
         x = np.arange(-6, 5)
@@ -1767,7 +1794,10 @@ class TestUnwrap(TestCase):
         assert_array_equal(no_discont, [0, 75, 150, 225, 300, 180])
         sm_discont = unwrap(wrap_uneven, period=250, discont=140)
         assert_array_equal(sm_discont, [0, 75, 150, 225, 300, 430])
-        assert sm_discont.dtype == wrap_uneven.dtype
+        if sm_discont.dtype != wrap_uneven.dtype:
+            raise AssertionError(
+                f"dtype mismatch: {sm_discont.dtype} != {wrap_uneven.dtype}"
+            )
 
 
 @instantiate_parametrized_tests
@@ -1781,7 +1811,8 @@ class TestFilterwindows(TestCase):
 
         w = hanning(scalar)
         ref_dtype = np.result_type(dtype, np.float64)
-        assert w.dtype == ref_dtype
+        if w.dtype != ref_dtype:
+            raise AssertionError(f"dtype mismatch: {w.dtype} != {ref_dtype}")
 
         # check symmetry
         assert_allclose(w, flipud(w), atol=1e-15)
@@ -1803,7 +1834,8 @@ class TestFilterwindows(TestCase):
 
         w = hamming(scalar)
         ref_dtype = np.result_type(dtype, np.float64)
-        assert w.dtype == ref_dtype
+        if w.dtype != ref_dtype:
+            raise AssertionError(f"dtype mismatch: {w.dtype} != {ref_dtype}")
 
         # check symmetry
         assert_allclose(w, flipud(w), atol=1e-15)
@@ -1825,7 +1857,8 @@ class TestFilterwindows(TestCase):
 
         w = bartlett(scalar)
         ref_dtype = np.result_type(dtype, np.float64)
-        assert w.dtype == ref_dtype
+        if w.dtype != ref_dtype:
+            raise AssertionError(f"dtype mismatch: {w.dtype} != {ref_dtype}")
 
         # check symmetry
         assert_allclose(w, flipud(w), atol=1e-15)
@@ -1847,7 +1880,8 @@ class TestFilterwindows(TestCase):
 
         w = blackman(scalar)
         ref_dtype = np.result_type(dtype, np.float64)
-        assert w.dtype == ref_dtype
+        if w.dtype != ref_dtype:
+            raise AssertionError(f"dtype mismatch: {w.dtype} != {ref_dtype}")
 
         # check symmetry
         assert_allclose(w, flipud(w), atol=1e-15)
@@ -1869,7 +1903,8 @@ class TestFilterwindows(TestCase):
 
         w = kaiser(scalar, 0)
         ref_dtype = np.result_type(dtype, np.float64)
-        assert w.dtype == ref_dtype
+        if w.dtype != ref_dtype:
+            raise AssertionError(f"dtype mismatch: {w.dtype} != {ref_dtype}")
 
         # check symmetry
         assert_equal(w, flipud(w))
@@ -1881,52 +1916,6 @@ class TestFilterwindows(TestCase):
             assert_array_equal(w, np.ones(1))
         else:
             assert_almost_equal(np.sum(w, axis=0), 10, 15)
-
-
-@xpassIfTorchDynamo  # (reason="TODO: implement")
-class TestTrapz(TestCase):
-    def test_simple(self):
-        x = np.arange(-10, 10, 0.1)
-        r = trapz(np.exp(-0.5 * x**2) / np.sqrt(2 * np.pi), dx=0.1)
-        # check integral of normal equals 1
-        assert_almost_equal(r, 1, 7)
-
-    def test_ndim(self):
-        x = np.linspace(0, 1, 3)
-        y = np.linspace(0, 2, 8)
-        z = np.linspace(0, 3, 13)
-
-        wx = np.ones_like(x) * (x[1] - x[0])
-        wx[0] /= 2
-        wx[-1] /= 2
-        wy = np.ones_like(y) * (y[1] - y[0])
-        wy[0] /= 2
-        wy[-1] /= 2
-        wz = np.ones_like(z) * (z[1] - z[0])
-        wz[0] /= 2
-        wz[-1] /= 2
-
-        q = x[:, None, None] + y[None, :, None] + z[None, None, :]
-
-        qx = (q * wx[:, None, None]).sum(axis=0)
-        qy = (q * wy[None, :, None]).sum(axis=1)
-        qz = (q * wz[None, None, :]).sum(axis=2)
-
-        # n-d `x`
-        r = trapz(q, x=x[:, None, None], axis=0)
-        assert_almost_equal(r, qx)
-        r = trapz(q, x=y[None, :, None], axis=1)
-        assert_almost_equal(r, qy)
-        r = trapz(q, x=z[None, None, :], axis=2)
-        assert_almost_equal(r, qz)
-
-        # 1-d `x`
-        r = trapz(q, x=x, axis=0)
-        assert_almost_equal(r, qx)
-        r = trapz(q, x=y, axis=1)
-        assert_almost_equal(r, qy)
-        r = trapz(q, x=z, axis=2)
-        assert_almost_equal(r, qz)
 
 
 class TestSinc(TestCase):
@@ -1952,13 +1941,13 @@ class TestUnique(TestCase):
 
         assert_(unique(np.array([1, 1, 1, 1, 1])) == np.array([1]))
 
-    @xpassIfTorchDynamo  # (reason="unique not implemented for 'ComplexDouble'")
+    @xpassIfTorchDynamo_np  # (reason="unique not implemented for 'ComplexDouble'")
     def test_simple_complex(self):
         x = np.array([5 + 6j, 1 + 1j, 1 + 10j, 10, 5 + 6j])
         assert_(np.all(unique(x) == [1 + 1j, 1 + 10j, 5 + 6j, 10]))
 
 
-@xpassIfTorchDynamo  # (reason="TODO: implement")
+@xpassIfTorchDynamo_np  # (reason="TODO: implement")
 class TestCheckFinite(TestCase):
     def test_simple(self):
         a = [1, 2, 3]
@@ -2081,7 +2070,8 @@ class TestCorrCoef(TestCase):
     def test_corrcoef_dtype(self, test_type):
         cast_A = self.A.astype(test_type)
         res = corrcoef(cast_A, dtype=test_type)
-        assert test_type == res.dtype
+        if test_type != res.dtype:
+            raise AssertionError(f"dtype mismatch: {test_type} != {res.dtype}")
 
 
 @instantiate_parametrized_tests
@@ -2196,7 +2186,8 @@ class TestCov(TestCase):
     def test_cov_dtype(self, test_type):
         cast_x1 = self.x1.astype(test_type)
         res = cov(cast_x1, dtype=test_type)
-        assert test_type == res.dtype
+        if test_type != res.dtype:
+            raise AssertionError(f"dtype mismatch: {test_type} != {res.dtype}")
 
 
 class Test_I0(TestCase):
@@ -2243,7 +2234,7 @@ class Test_I0(TestCase):
             (TypeError, RuntimeError),
             # match="i0 not supported for complex values"
         ):
-            res = i0(a)
+            i0(a)
 
 
 class TestKaiser(TestCase):
@@ -2584,12 +2575,12 @@ class TestBincount(TestCase):
         intp_refcount = sys.getrefcount(np.dtype(np.intp))
         double_refcount = sys.getrefcount(np.dtype(np.double))
 
-        for j in range(10):
+        for _ in range(10):
             np.bincount([1, 2, 3])
         assert_equal(sys.getrefcount(np.dtype(np.intp)), intp_refcount)
         assert_equal(sys.getrefcount(np.dtype(np.double)), double_refcount)
 
-        for j in range(10):
+        for _ in range(10):
             np.bincount([1, 2, 3], [4, 5, 6])
         assert_equal(sys.getrefcount(np.dtype(np.intp)), intp_refcount)
         assert_equal(sys.getrefcount(np.dtype(np.double)), double_refcount)
@@ -2607,7 +2598,7 @@ class TestBincount(TestCase):
 parametrize_interp_sc = parametrize(
     "sc",
     [
-        subtest(lambda x: np.float_(x), name="real"),
+        subtest(lambda x: np.float64(x), name="real"),
         subtest(lambda x: _make_complex(x, 0), name="complex-real"),
         subtest(lambda x: _make_complex(0, x), name="complex-imag"),
         subtest(lambda x: _make_complex(x, np.multiply(x, -2)), name="complex-both"),
@@ -2615,7 +2606,7 @@ parametrize_interp_sc = parametrize(
 )
 
 
-@xpassIfTorchDynamo  # (reason="TODO: implement")
+@xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestInterp(TestCase):
     def test_exceptions(self):
@@ -2859,17 +2850,18 @@ class TestPercentile(TestCase):
         assert_array_equal(np.percentile(x, 50, axis=0), [1, 1, 1])
 
     @skip(reason="NP_VER: fails on CI; no method=")
-    @xpassIfTorchDynamo  # (reason="TODO: implement")
+    @xpassIfTorchDynamo_np  # (reason="TODO: implement")
     @parametrize("dtype", np.typecodes["Float"])
     def test_linear_nan_1D(self, dtype):
         # METHOD 1 of H&F
-        arr = np.asarray([15.0, np.NAN, 35.0, 40.0, 50.0], dtype=dtype)
+        arr = np.asarray([15.0, np.nan, 35.0, 40.0, 50.0], dtype=dtype)
         res = np.percentile(arr, 40.0, method="linear")
-        np.testing.assert_equal(res, np.NAN)
+        np.testing.assert_equal(res, np.nan)
         np.testing.assert_equal(res.dtype, arr.dtype)
 
     H_F_TYPE_CODES = [
-        (int_type, np.float64) for int_type in "Bbhil"  # np.typecodes["AllInteger"]
+        (int_type, np.float64)
+        for int_type in "Bbhil"  # np.typecodes["AllInteger"]
     ] + [
         (np.float16, np.float16),
         (np.float32, np.float32),
@@ -3162,7 +3154,7 @@ class TestPercentile(TestCase):
         b = np.percentile([2, 3, 4, 1], [50], overwrite_input=True)
         assert_equal(b, np.array([2.5]))
 
-    @xpassIfTorchDynamo  # (reason="pytorch percentile does not support tuple axes.")
+    @xpassIfTorchDynamo_np  # (reason="pytorch percentile does not support tuple axes.")
     def test_extended_axis(self):
         o = np.random.normal(size=(71, 23))
         x = np.dstack([o] * 10)
@@ -3259,7 +3251,7 @@ class TestPercentile(TestCase):
             subtest(
                 [1, 7],
                 decorators=[
-                    xpassIfTorchDynamo,
+                    skip(reason="Keepdims wrapper incorrect for multiple q"),
                 ],
             ),
         ],
@@ -3273,13 +3265,13 @@ class TestPercentile(TestCase):
             subtest(
                 (0, 1),
                 decorators=[
-                    xpassIfTorchDynamo,
+                    skip(reason="Tuple axes"),
                 ],
             ),
             subtest(
                 (-3, -1),
                 decorators=[
-                    xpassIfTorchDynamo,
+                    skip(reason="Tuple axes"),
                 ],
             ),
         ],
@@ -3297,7 +3289,8 @@ class TestPercentile(TestCase):
 
         out = np.empty(shape_out)
         result = np.percentile(d, q, axis=axis, keepdims=True, out=out)
-        assert result is out
+        if result is not out:
+            raise AssertionError("result is not out")
         assert_equal(result.shape, shape_out)
 
     @skip(reason="NP_VER: fails on CI; no method=")
@@ -3332,7 +3325,7 @@ class TestPercentile(TestCase):
             assert_equal(np.percentile(d, 1, method="nearest", out=o), o)
 
     @skip(reason="NP_VER: fails on CI; no method=")
-    @xpassIfTorchDynamo  # (reason="np.percentile undocumented nan weirdness")
+    @xpassIfTorchDynamo_np  # (reason="np.percentile undocumented nan weirdness")
     def test_nan_behavior(self):
         a = np.arange(24, dtype=float)
         a[2] = np.nan
@@ -3348,42 +3341,42 @@ class TestPercentile(TestCase):
         assert_equal(np.percentile(a, 0.3), np.nan)
         assert_equal(np.percentile(a, 0.3).ndim, 0)
 
-        # axis0 zerod
+        # axis0 zeroed
         b = np.percentile(np.arange(24, dtype=float).reshape(2, 3, 4), 0.3, 0)
         b[2, 3] = np.nan
         b[1, 2] = np.nan
         assert_equal(np.percentile(a, 0.3, 0), b)
 
-        # axis0 not zerod
+        # axis0 not zeroed
         b = np.percentile(np.arange(24, dtype=float).reshape(2, 3, 4), [0.3, 0.6], 0)
         b[:, 2, 3] = np.nan
         b[:, 1, 2] = np.nan
         assert_equal(np.percentile(a, [0.3, 0.6], 0), b)
 
-        # axis1 zerod
+        # axis1 zeroed
         b = np.percentile(np.arange(24, dtype=float).reshape(2, 3, 4), 0.3, 1)
         b[1, 3] = np.nan
         b[1, 2] = np.nan
         assert_equal(np.percentile(a, 0.3, 1), b)
-        # axis1 not zerod
+        # axis1 not zeroed
         b = np.percentile(np.arange(24, dtype=float).reshape(2, 3, 4), [0.3, 0.6], 1)
         b[:, 1, 3] = np.nan
         b[:, 1, 2] = np.nan
         assert_equal(np.percentile(a, [0.3, 0.6], 1), b)
 
-        # axis02 zerod
+        # axis02 zeroed
         b = np.percentile(np.arange(24, dtype=float).reshape(2, 3, 4), 0.3, (0, 2))
         b[1] = np.nan
         b[2] = np.nan
         assert_equal(np.percentile(a, 0.3, (0, 2)), b)
-        # axis02 not zerod
+        # axis02 not zeroed
         b = np.percentile(
             np.arange(24, dtype=float).reshape(2, 3, 4), [0.3, 0.6], (0, 2)
         )
         b[:, 1] = np.nan
         b[:, 2] = np.nan
         assert_equal(np.percentile(a, [0.3, 0.6], (0, 2)), b)
-        # axis02 not zerod with method='nearest'
+        # axis02 not zeroed with method='nearest'
         b = np.percentile(
             np.arange(24, dtype=float).reshape(2, 3, 4),
             [0.3, 0.6],
@@ -3489,7 +3482,8 @@ class TestQuantile(TestCase):
     @parametrize("dtype", "Bbhil")  # np.typecodes["AllInteger"])
     def test_quantile_preserve_int_type(self, dtype):
         res = np.quantile(np.array([1, 2], dtype=dtype), [0.5], method="nearest")
-        assert res.dtype == dtype
+        if res.dtype != dtype:
+            raise AssertionError(f"dtype mismatch: {res.dtype} != {dtype}")
 
     @skipif(numpy.__version__ < "1.22", reason="NP_VER: fails with NumPy 1.21.2 on CI")
     @parametrize(
@@ -3498,50 +3492,50 @@ class TestQuantile(TestCase):
             subtest(
                 "inverted_cdf",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             subtest(
                 "averaged_inverted_cdf",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             subtest(
                 "closest_observation",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             subtest(
                 "interpolated_inverted_cdf",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             subtest(
                 "hazen",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             subtest(
                 "weibull",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             "linear",
             subtest(
                 "median_unbiased",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             subtest(
                 "normal_unbiased",
                 decorators=[
-                    xpassIfTorchDynamo,
+                    xpassIfTorchDynamo_np,
                 ],
             ),
             "nearest",
@@ -3584,8 +3578,6 @@ class TestQuantile(TestCase):
     def test_quantile_scalar_nan(self):
         a = np.array([[10.0, 7.0, 4.0], [3.0, 2.0, 1.0]])
         a[0][1] = np.nan
-        actual = np.quantile(a, 0.5)
-        # assert np.isscalar(actual)    # XXX: our isscalar follows pytorch
         assert_equal(np.quantile(a, 0.5), np.nan)
 
 
@@ -3718,7 +3710,7 @@ class TestMedian(TestCase):
         b[1, 2] = np.nan
         assert_equal(np.median(a, 1), b)
 
-    @xpassIfTorchDynamo  # (reason="median: does not support tuple axes")
+    @xpassIfTorchDynamo_np  # (reason="median: does not support tuple axes")
     def test_nan_behavior_2(self):
         a = np.arange(24, dtype=float).reshape(2, 3, 4)
         a[1, 2, 3] = np.nan
@@ -3739,7 +3731,7 @@ class TestMedian(TestCase):
         # no axis
         assert_equal(np.median(a).ndim, 0)
 
-    @xpassIfTorchDynamo  # (reason="median: torch.quantile does not handle empty tensors")
+    @xpassIfTorchDynamo_np  # (reason="median: torch.quantile does not handle empty tensors")
     @skipif(IS_WASM, reason="fp errors don't work correctly")
     def test_empty(self):
         # mean(empty array) emits two warnings: empty slice and divide by 0
@@ -3770,7 +3762,7 @@ class TestMedian(TestCase):
             assert_equal(np.median(a, axis=2), b)
             assert_(w[0].category is RuntimeWarning)
 
-    @xpassIfTorchDynamo  # (reason="median: tuple axes not implemented")
+    @xpassIfTorchDynamo_np  # (reason="median: tuple axes not implemented")
     def test_extended_axis(self):
         o = np.random.normal(size=(71, 23))
         x = np.dstack([o] * 10)
@@ -3820,7 +3812,7 @@ class TestMedian(TestCase):
         d = np.ones((3, 5, 7, 11))
         assert_equal(np.median(d, axis=None, keepdims=True).shape, (1, 1, 1, 1))
 
-    @xpassIfTorchDynamo  # (reason="median: tuple axis")
+    @xpassIfTorchDynamo_np  # (reason="median: tuple axis")
     def test_keepdims_2(self):
         d = np.ones((3, 5, 7, 11))
         assert_equal(np.median(d, axis=(0, 1), keepdims=True).shape, (1, 1, 7, 11))
@@ -3839,13 +3831,13 @@ class TestMedian(TestCase):
             subtest(
                 (0, 1),
                 decorators=[
-                    xpassIfTorchDynamo,
+                    skip(reason="Tuple axes"),
                 ],
             ),
             subtest(
                 (-3, -1),
                 decorators=[
-                    xpassIfTorchDynamo,
+                    skip(reason="Tuple axes"),
                 ],
             ),
         ],
@@ -3861,11 +3853,12 @@ class TestMedian(TestCase):
             )
         out = np.empty(shape_out)
         result = np.median(d, axis=axis, keepdims=True, out=out)
-        assert result is out
+        if result is not out:
+            raise AssertionError("result is not out")
         assert_equal(result.shape, shape_out)
 
 
-@xpassIfTorchDynamo  # (reason="TODO: implement")
+@xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestSortComplex(TestCase):
     @parametrize(

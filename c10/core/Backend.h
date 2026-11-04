@@ -3,9 +3,12 @@
 #include <c10/core/DeviceType.h>
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
+#include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
 
 #include <stdexcept>
+
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wswitch-enum")
 
 namespace c10 {
 
@@ -38,6 +41,8 @@ enum class Backend {
   SparseCUDA,
   SparseCsrCPU,
   SparseCsrCUDA,
+  SparseCsrMPS,
+  SparseMPS,
   SparseHIP,
   SparseVE,
   SparseXPU,
@@ -65,7 +70,7 @@ enum class Backend {
   NumOptions
 };
 
-static inline Backend dispatchKeyToBackend(DispatchKey t) {
+inline Backend dispatchKeyToBackend(DispatchKey t) {
   if (t == DispatchKey::CPU || t == DispatchKey::AutogradCPU) {
     return Backend::CPU;
   } else if (t == DispatchKey::CUDA || t == DispatchKey::AutogradCUDA) {
@@ -76,7 +81,7 @@ static inline Backend dispatchKeyToBackend(DispatchKey t) {
     return Backend::VE;
   } else if (t == DispatchKey::FPGA) {
     return Backend::FPGA;
-  } else if (t == DispatchKey::MAIA) {
+  } else if (t == DispatchKey::MAIA || t == DispatchKey::AutogradMAIA) {
     return Backend::MAIA;
   } else if (t == DispatchKey::XLA || t == DispatchKey::AutogradXLA) {
     return Backend::XLA;
@@ -94,6 +99,10 @@ static inline Backend dispatchKeyToBackend(DispatchKey t) {
     return Backend::SparseCPU;
   } else if (t == DispatchKey::SparseCUDA) {
     return Backend::SparseCUDA;
+  } else if (t == DispatchKey::SparseMPS) {
+    return Backend::SparseMPS;
+  } else if (t == DispatchKey::SparseCsrMPS) {
+    return Backend::SparseCsrMPS;
   } else if (t == DispatchKey::SparseHIP) {
     return Backend::SparseHIP;
   } else if (t == DispatchKey::SparseVE) {
@@ -142,7 +151,7 @@ static inline Backend dispatchKeyToBackend(DispatchKey t) {
   }
 }
 
-static inline DispatchKey backendToDispatchKey(Backend b) {
+inline DispatchKey backendToDispatchKey(Backend b) {
   switch (b) {
     case Backend::CPU:
       return DispatchKey::CPU;
@@ -172,6 +181,10 @@ static inline DispatchKey backendToDispatchKey(Backend b) {
       return DispatchKey::SparseCPU;
     case Backend::SparseCUDA:
       return DispatchKey::SparseCUDA;
+    case Backend::SparseMPS:
+      return DispatchKey::SparseMPS;
+    case Backend::SparseCsrMPS:
+      return DispatchKey::SparseCsrMPS;
     case Backend::SparseHIP:
       return DispatchKey::SparseHIP;
     case Backend::SparseVE:
@@ -213,11 +226,11 @@ static inline DispatchKey backendToDispatchKey(Backend b) {
     case Backend::PrivateUse1:
       return DispatchKey::PrivateUse1;
     default:
-      throw std::runtime_error("Unknown backend");
+      TORCH_CHECK(false, "Unknown backend");
   }
 }
 
-static inline DeviceType backendToDeviceType(Backend b) {
+inline DeviceType backendToDeviceType(Backend b) {
   switch (b) {
     case Backend::CPU:
     case Backend::MkldnnCPU:
@@ -264,6 +277,8 @@ static inline DeviceType backendToDeviceType(Backend b) {
     case Backend::Meta:
       return DeviceType::Meta;
     case Backend::MPS:
+    case Backend::SparseMPS:
+    case Backend::SparseCsrMPS:
       return DeviceType::MPS;
     case Backend::HPU:
       return DeviceType::HPU;
@@ -281,8 +296,7 @@ static inline DeviceType backendToDeviceType(Backend b) {
   }
 }
 
-// TODO: This probably shouldn't actually be static inline
-static inline const char* toString(Backend b) {
+inline const char* toString(Backend b) {
   switch (b) {
     case Backend::CPU:
       return "CPU";
@@ -310,6 +324,10 @@ static inline const char* toString(Backend b) {
       return "SparseCPU";
     case Backend::SparseCUDA:
       return "SparseCUDA";
+    case Backend::SparseMPS:
+      return "SparseMPS";
+    case Backend::SparseCsrMPS:
+      return "SparseCsrMPS";
     case Backend::SparseHIP:
       return "SparseHIP";
     case Backend::SparseVE:
@@ -357,11 +375,12 @@ static inline const char* toString(Backend b) {
   }
 }
 
-static inline bool isSparse(Backend b) {
+inline bool isSparse(Backend b) {
   switch (b) {
     case Backend::SparseXPU:
     case Backend::SparseCPU:
     case Backend::SparseCUDA:
+    case Backend::SparseMPS:
     case Backend::SparseHIP:
     case Backend::SparseVE:
     case Backend::SparsePrivateUse1:
@@ -371,7 +390,7 @@ static inline bool isSparse(Backend b) {
   }
 }
 
-static inline bool isSparseCsr(Backend b) {
+inline bool isSparseCsr(Backend b) {
   switch (b) {
     case Backend::SparseCsrXPU:
     case Backend::SparseCsrCPU:
@@ -386,3 +405,5 @@ static inline bool isSparseCsr(Backend b) {
 }
 
 } // namespace c10
+
+C10_DIAGNOSTIC_POP()

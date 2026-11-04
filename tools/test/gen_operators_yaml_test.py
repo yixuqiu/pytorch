@@ -5,9 +5,9 @@ import argparse
 import json
 import unittest
 from collections import defaultdict
-
 from unittest.mock import Mock, patch
 
+# pyrefly: ignore [missing-import]
 from gen_operators_yaml import (
     fill_output,
     get_parser_options,
@@ -43,10 +43,10 @@ def _mock_load_op_dep_graph():
 
 
 class GenOperatorsYAMLTest(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         pass
 
-    def test_filter_creation(self):
+    def test_filter_creation(self) -> None:
         filter_func = make_filter_from_options(
             model_name="abc",
             model_versions=["100", "101"],
@@ -95,11 +95,12 @@ class GenOperatorsYAMLTest(unittest.TestCase):
         ]
 
         filtered_configs = list(filter(filter_func, config))
-        assert (
-            len(filtered_configs) == 2
-        ), f"Expected 2 elements in filtered_configs, but got {len(filtered_configs)}"
+        if len(filtered_configs) != 2:
+            raise AssertionError(
+                f"Expected 2 elements in filtered_configs, but got {len(filtered_configs)}"
+            )
 
-    def test_verification_success(self):
+    def test_verification_success(self) -> None:
         filter_func = make_filter_from_options(
             model_name="abc",
             model_versions=["100", "101"],
@@ -142,7 +143,7 @@ class GenOperatorsYAMLTest(unittest.TestCase):
                 "expected verify_all_specified_present to succeed instead it raised an exception"
             )
 
-    def test_verification_fail(self):
+    def test_verification_fail(self) -> None:
         config = [
             {
                 "model": {
@@ -229,7 +230,7 @@ class GenOperatorsYAMLTest(unittest.TestCase):
     )
     def test_fill_output_with_arguments_not_include_all_overloads(
         self, mock_parse_options: Mock, mock_load_op_dep_graph: Mock
-    ):
+    ) -> None:
         parser = argparse.ArgumentParser(description="Generate used operators YAML")
         options = get_parser_options(parser)
 
@@ -242,5 +243,6 @@ class GenOperatorsYAMLTest(unittest.TestCase):
 
         fill_output(output, options)
 
+        # pyrefly: ignore [missing-attribute]
         for op_val in output["operators"].values():
             self.assertFalse(op_val["include_all_overloads"])

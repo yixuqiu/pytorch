@@ -1,39 +1,33 @@
+from __future__ import annotations
+
 import argparse
 import os
-import pathlib
 from collections import namedtuple
-from typing import (
-    Any,
-    Callable,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Type,
-    Union,
-)
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
 
 import yaml
 
 import torchgen.dest as dest
-
 from torchgen.api.lazy import setValueT
 from torchgen.api.types import BaseCppType
 from torchgen.dest.lazy_ir import GenLazyIR, GenLazyNativeFuncDefinition, GenTSLazyIR
 from torchgen.gen import get_grouped_native_functions, parse_native_yaml
-
-from torchgen.model import NativeFunction, NativeFunctionsGroup, OperatorName
-from torchgen.selective_build.selector import SelectiveBuilder
-from torchgen.utils import FileManager, NamespaceHelper
-from torchgen.yaml_utils import YamlLoader
-from .gen_backend_stubs import (
+from torchgen.gen_backend_stubs import (
     error_on_missing_kernels,
     gen_dispatcher_registrations,
     gen_dispatchkey_nativefunc_headers,
     parse_backend_yaml,
 )
+from torchgen.model import NativeFunction, NativeFunctionsGroup, OperatorName
+from torchgen.selective_build.selector import SelectiveBuilder
+from torchgen.utils import FileManager, NamespaceHelper
+from torchgen.yaml_utils import YamlLoader
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator, Sequence
+
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
 #
@@ -103,25 +97,31 @@ ParsedExternalYaml = namedtuple(
 
 def parse_native_functions_keys(
     backend_yaml_path: str,
-    grouped_native_functions: Sequence[Union[NativeFunction, NativeFunctionsGroup]],
-) -> Tuple[List[OperatorName], List[Any], List[OperatorName]]:
+    grouped_native_functions: Sequence[NativeFunction | NativeFunctionsGroup],
+) -> tuple[list[OperatorName], list[Any], list[OperatorName]]:
     with open(backend_yaml_path) as f:
         yaml_values = yaml.load(f, Loader=YamlLoader)
-    assert isinstance(yaml_values, dict)
+    if not isinstance(yaml_values, dict):
+        raise AssertionError(f"Expected dict from YAML, got {type(yaml_values)}")
 
     full_codegen = yaml_values.pop("full_codegen", [])
     non_native = yaml_values.pop("non_native", [])
     ir_gen = yaml_values.pop("ir_gen", [])
-    assert isinstance(full_codegen, list)
-    assert isinstance(non_native, list)
-    assert isinstance(ir_gen, list)
+    if not isinstance(full_codegen, list):
+        raise AssertionError(
+            f"Expected full_codegen to be list, got {type(full_codegen)}"
+        )
+    if not isinstance(non_native, list):
+        raise AssertionError(f"Expected non_native to be list, got {type(non_native)}")
+    if not isinstance(ir_gen, list):
+        raise AssertionError(f"Expected ir_gen to be list, got {type(ir_gen)}")
     full_codegen_opnames = [OperatorName.parse(name) for name in full_codegen]
     ir_gen_opnames = [OperatorName.parse(name) for name in ir_gen]
     return full_codegen_opnames, non_native, ir_gen_opnames
 
 
 def validate_shape_inference_header(
-    shape_inference_hdr: str, expected_shape_infr_decls: List[str]
+    shape_inference_hdr: str, expected_shape_infr_decls: list[str]
 ) -> None:
     try:
         with open(shape_inference_hdr) as f:
@@ -153,8 +153,8 @@ at::Tensor to_meta(const at::Tensor& tensor) {
   // undefined tensors can't be converted to the meta device, since they don't have sizes/strides
   if (!tensor.defined()) return tensor;
   auto out = at::native::empty_strided_meta_symint(tensor.sym_sizes(), tensor.sym_strides(), \
-/*dtype=*/std::make_optional(tensor.scalar_type()), /*layout=*/std::make_optional(tensor.layout()), \
-/*device=*/std::make_optional(c10::Device(c10::kMeta)), /*pin_memory=*/std::nullopt);
+/*dtype=*/tensor.scalar_type(), /*layout=*/tensor.layout(), \
+/*device=*/c10::Device(c10::kMeta), /*pin_memory=*/std::nullopt);
   // needs to handle wrapped numbers, so dtype promotion works properly.
   if (tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
     out.unsafeGetTensorImpl()->set_wrapped_number(true);
@@ -181,14 +181,14 @@ std::vector<at::Tensor> to_meta(at::ITensorListRef t_list) {
 
 class default_args:
     node_base: str = "Node"
-    node_base_hdr: Optional[str] = None
+    node_base_hdr: str | None = None
     shape_inference_hdr: str = "torch/csrc/lazy/core/shape_inference.h"
     tensor_class: str = "torch::lazy::LazyTensor"
     tensor_class_hdr: str = "torch/csrc/lazy/core/tensor.h"
-    lazy_ir_generator: Type[GenLazyIR] = GenLazyIR
-    native_func_definition_generator: Type[
+    lazy_ir_generator: type[GenLazyIR] = GenLazyIR
+    native_func_definition_generator: type[GenLazyNativeFuncDefinition] = (
         GenLazyNativeFuncDefinition
-    ] = GenLazyNativeFuncDefinition
+    )
     backend_name: str = "TorchScript"
 
 
@@ -262,14 +262,14 @@ def main() -> None:
     options = parser.parse_args()
 
     # Assumes that this file lives at PYTORCH_ROOT/torchgen/gen_backend_stubs.py
-    torch_root = pathlib.Path(__file__).parent.parent.parent.absolute()
+    torch_root = Path(__file__).absolute().parents[2]
     aten_path = str(torch_root / "aten" / "src" / "ATen")
-    lazy_ir_generator: Type[GenLazyIR] = default_args.lazy_ir_generator
+    lazy_ir_generator: type[GenLazyIR] = default_args.lazy_ir_generator
     if options.gen_ts_lowerings:
         lazy_ir_generator = GenTSLazyIR
-    native_func_definition_generator: Type[
-        GenLazyNativeFuncDefinition
-    ] = default_args.native_func_definition_generator
+    native_func_definition_generator: type[GenLazyNativeFuncDefinition] = (
+        default_args.native_func_definition_generator
+    )
 
     run_gen_lazy_tensor(
         aten_path,
@@ -293,14 +293,14 @@ def run_gen_lazy_tensor(
     source_yaml: str,
     output_dir: str,
     dry_run: bool,
-    impl_path: Optional[str],
+    impl_path: str | None,
     node_base: str = default_args.node_base,
-    node_base_hdr: Optional[str] = default_args.node_base_hdr,
+    node_base_hdr: str | None = default_args.node_base_hdr,
     tensor_class: str = default_args.tensor_class,
     tensor_class_hdr: str = default_args.tensor_class_hdr,
     shape_inference_hdr: str = default_args.shape_inference_hdr,
-    lazy_ir_generator: Type[GenLazyIR] = default_args.lazy_ir_generator,
-    native_func_definition_generator: Type[
+    lazy_ir_generator: type[GenLazyIR] = default_args.lazy_ir_generator,
+    native_func_definition_generator: type[
         GenLazyNativeFuncDefinition
     ] = default_args.native_func_definition_generator,
     # build_in_tree is true for TS backend and affects include paths
@@ -348,7 +348,7 @@ def run_gen_lazy_tensor(
     )
     grouped_native_functions = get_grouped_native_functions(native_functions)
 
-    def sort_native_function(f: Union[NativeFunctionsGroup, NativeFunction]) -> str:
+    def sort_native_function(f: NativeFunctionsGroup | NativeFunction) -> str:
         """
         We sort the native function because of the note in concat_map_codegen.
         TODO(alanwaketan): Remove this sorting hack once all ops are grouped properly.
@@ -378,8 +378,8 @@ def run_gen_lazy_tensor(
 
     def concat_map_codegen(
         func: Callable[[NativeFunction], Sequence[str]],
-        xs: Iterable[Union[NativeFunctionsGroup, NativeFunction]],
-        ops_list: List[OperatorName] = full_codegen,
+        xs: Iterable[NativeFunctionsGroup | NativeFunction],
+        ops_list: list[OperatorName] = full_codegen,
     ) -> Iterator[str]:
         """
         We code-gen for the functional variant, which is all we need for IR classes/lowerings/shape inferences, but we
@@ -394,7 +394,8 @@ def run_gen_lazy_tensor(
 
     selector = SelectiveBuilder.get_nop_selector()
 
-    assert backend_key is not None
+    if backend_key is None:
+        raise AssertionError("backend_key must be non-None")
     class_name = backend_indices[backend_key].native_function_class_name()
 
     if impl_path is not None:
@@ -433,7 +434,8 @@ def run_gen_lazy_tensor(
         )
 
         validate_shape_inference_header(shape_inference_hdr, expected_shape_infr_decls)
-    assert class_name is not None
+    if class_name is None:
+        raise AssertionError("class_name must be non-None")
 
     # Generate nativefunction declarations
     # Note, eager registrations is set to False for the lazy TS backend as another LTC backend
@@ -542,10 +544,10 @@ def run_gen_lazy_tensor(
                 for path in [
                     "ATen/core/Formatting.h",
                     "c10/core/ScalarType.h",
-                    "c10/util/Optional.h",
                     "torch/csrc/lazy/core/hash.h",
                     "torch/csrc/lazy/core/ir.h",
                     "torch/csrc/lazy/core/shape.h",
+                    "optional",
                     "vector",
                 ]
             ],

@@ -1,11 +1,10 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/Cross.h>
 #include <ATen/core/Tensor.h>
-#include <ATen/Dispatch.h>
 #include <ATen/TensorMeta.h>
 #include <ATen/WrapDimUtils.h>
 #include <ATen/ExpandUtils.h>
-#include <ATen/native/Resize.h>
+#include <ATen/MemoryOverlap.h>
 
 
 #ifndef AT_PER_OPERATOR_HEADERS
@@ -40,7 +39,7 @@ namespace at::native {
 
 DEFINE_DISPATCH(cross_stub);
 
-static int64_t _default_cross_dim(const c10::optional<int64_t> &dimension, SymIntArrayRef sizes) {
+static int64_t _default_cross_dim(const std::optional<int64_t> &dimension, SymIntArrayRef sizes) {
   // If dimension is not given, it defaults to the first dimension found with the size 3.
   // Note that this behaviour might be unexpected.
   // _default_cross_dim is called internally inside the cross implementation to calculate
@@ -57,7 +56,7 @@ static int64_t _default_cross_dim(const c10::optional<int64_t> &dimension, SymIn
   TORCH_CHECK(false, "no dimension of size 3 in input");
 }
 
-Tensor cross(const Tensor & input, const Tensor & other, const c10::optional<int64_t> dimension) {
+Tensor cross(const Tensor & input, const Tensor & other, const std::optional<int64_t> dimension) {
   if (!dimension) {
     TORCH_WARN_ONCE(
       "Using torch.cross without specifying the dim arg is deprecated.\n",
@@ -69,7 +68,7 @@ Tensor cross(const Tensor & input, const Tensor & other, const c10::optional<int
   return at::linalg_cross(input, other, dim);
 }
 
-Tensor & cross_out(const Tensor & input, const Tensor & other, const c10::optional<int64_t> dimension, Tensor & out) {
+Tensor & cross_out(const Tensor & input, const Tensor & other, const std::optional<int64_t> dimension, Tensor & out) {
   auto dim = _default_cross_dim(dimension, input.sym_sizes());
   return at::linalg_cross_out(out, input, other, dim);
 }
@@ -77,6 +76,9 @@ Tensor & cross_out(const Tensor & input, const Tensor & other, const c10::option
 
 TORCH_IMPL_FUNC(linalg_cross_out)
 (const Tensor & input, const Tensor & other, int64_t dim, const Tensor & out) {
+  at::assert_no_internal_overlap(out);
+  at::assert_no_overlap(out, input);
+  at::assert_no_overlap(out, other);
   dim = maybe_wrap_dim(dim, input.dim());
   auto out_size = out.sizes();
   Tensor input_broadcasted = input.expand(out_size);

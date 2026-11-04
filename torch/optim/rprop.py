@@ -1,18 +1,29 @@
-from typing import List, Optional
+# mypy: allow-untyped-defs
+r"""Implementation for the Resilient backpropagation."""
+
+from typing import cast
 
 import torch
 from torch import Tensor
+
 from .optimizer import (
     _capturable_doc,
     _default_to_fused_or_foreach,
     _differentiable_doc,
+    _disable_dynamo_if_unsupported,
     _foreach_doc,
+    _functional_api_doc,
+    _get_capturable_supported_devices,
     _get_scalar_dtype,
     _maximize_doc,
+    _params_doc,
+    _to_scalar,
     _use_grad_for_differentiable,
     _view_as_real,
     Optimizer,
+    ParamsT,
 )
+
 
 __all__ = ["Rprop", "rprop"]
 
@@ -20,30 +31,32 @@ __all__ = ["Rprop", "rprop"]
 class Rprop(Optimizer):
     def __init__(
         self,
-        params,
-        lr=1e-2,
-        etas=(0.5, 1.2),
-        step_sizes=(1e-6, 50),
+        params: ParamsT,
+        lr: float | Tensor = 1e-2,
+        etas: tuple[float, float] = (0.5, 1.2),
+        step_sizes: tuple[float, float] = (1e-6, 50),
         *,
         capturable: bool = False,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         maximize: bool = False,
         differentiable: bool = False,
-    ):
+    ) -> None:
+        if isinstance(lr, Tensor) and lr.numel() != 1:
+            raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 < etas[0] < 1.0 < etas[1]:
             raise ValueError(f"Invalid eta values: {etas[0]}, {etas[1]}")
 
-        defaults = dict(
-            lr=lr,
-            etas=etas,
-            step_sizes=step_sizes,
-            foreach=foreach,
-            maximize=maximize,
-            differentiable=differentiable,
-            capturable=capturable,
-        )
+        defaults = {
+            "lr": lr,
+            "etas": etas,
+            "step_sizes": step_sizes,
+            "foreach": foreach,
+            "maximize": maximize,
+            "differentiable": differentiable,
+            "capturable": capturable,
+        }
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -95,7 +108,7 @@ class Rprop(Optimizer):
                         grad, complex(group["lr"], group["lr"])
                     )
                 else:
-                    state["step_size"] = torch.full_like(grad, group["lr"])
+                    state["step_size"] = torch.full_like(grad, _to_scalar(group["lr"]))
 
             prevs.append(state["prev"])
             step_sizes.append(state["step_size"])
@@ -105,13 +118,13 @@ class Rprop(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
-        """Performs a single optimization step.
+        """Perform a single optimization step.
 
         Args:
             closure (Callable, optional): A closure that reevaluates the model
                 and returns the loss.
         """
-        self._cuda_graph_capture_health_check()
+        self._accelerator_graph_capture_health_check()
 
         loss = None
         if closure is not None:
@@ -119,11 +132,11 @@ class Rprop(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            params = []
-            grads = []
-            prevs = []
-            step_sizes = []
-            state_steps = []
+            params: list[Tensor] = []
+            grads: list[Tensor] = []
+            prevs: list[Tensor] = []
+            step_sizes: list[Tensor] = []
+            state_steps: list[Tensor] = []
 
             etaminus, etaplus = group["etas"]
             step_size_min, step_size_max = group["step_sizes"]
@@ -188,20 +201,19 @@ Rprop.__doc__ = (
 
     For further details regarding the algorithm we refer to the paper
     `A Direct Adaptive Method for Faster Backpropagation Learning: The RPROP Algorithm
-    <http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.21.1417>`_.
-    """
+    <http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.21.1417>`_."""  # codespell:ignore
     + rf"""
+
     Args:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
+        {_params_doc}
         lr (float, optional): learning rate (default: 1e-2)
         etas (Tuple[float, float], optional): pair of (etaminus, etaplus), that
             are multiplicative increase and decrease factors
             (default: (0.5, 1.2))
         step_sizes (Tuple[float, float], optional): a pair of minimal and
             maximal allowed step sizes (default: (1e-6, 50))
-        {_foreach_doc}
         {_capturable_doc}
+        {_foreach_doc}
         {_maximize_doc}
         {_differentiable_doc}
 
@@ -209,74 +221,12 @@ Rprop.__doc__ = (
 )
 
 
-def rprop(
-    params: List[Tensor],
-    grads: List[Tensor],
-    prevs: List[Tensor],
-    step_sizes: List[Tensor],
-    state_steps: List[Tensor],
-    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
-    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
-    foreach: Optional[bool] = None,
-    capturable: bool = False,
-    maximize: bool = False,
-    differentiable: bool = False,
-    has_complex: bool = False,
-    *,
-    step_size_min: float,
-    step_size_max: float,
-    etaminus: float,
-    etaplus: float,
-):
-    r"""Functional API that performs rprop algorithm computation.
-
-    See :class:`~torch.optim.Rprop` for details.
-    """
-    # this check is slow during compilation, so we skip it
-    # if it's strictly needed we can add this check back in dynamo
-    if not torch._utils.is_compiling() and not all(
-        isinstance(t, torch.Tensor) for t in state_steps
-    ):
-        raise RuntimeError(
-            "API has changed, `state_steps` argument must contain a list of singleton tensors"
-        )
-
-    if foreach is None:
-        _, foreach = _default_to_fused_or_foreach(
-            params, differentiable, use_fused=False
-        )
-
-    if foreach and torch.jit.is_scripting():
-        raise RuntimeError("torch.jit.script not supported with foreach optimizers")
-
-    if foreach and not torch.jit.is_scripting():
-        func = _multi_tensor_rprop
-    else:
-        func = _single_tensor_rprop
-
-    func(
-        params,
-        grads,
-        prevs,
-        step_sizes,
-        state_steps,
-        step_size_min=step_size_min,
-        step_size_max=step_size_max,
-        etaminus=etaminus,
-        etaplus=etaplus,
-        capturable=capturable,
-        maximize=maximize,
-        differentiable=differentiable,
-        has_complex=has_complex,
-    )
-
-
 def _single_tensor_rprop(
-    params: List[Tensor],
-    grads: List[Tensor],
-    prevs: List[Tensor],
-    step_sizes: List[Tensor],
-    state_steps: List[Tensor],
+    params: list[Tensor],
+    grads: list[Tensor],
+    prevs: list[Tensor],
+    step_sizes: list[Tensor],
+    state_steps: list[Tensor],
     *,
     step_size_min: float,
     step_size_max: float,
@@ -286,7 +236,7 @@ def _single_tensor_rprop(
     capturable: bool,
     differentiable: bool,
     has_complex: bool,
-):
+) -> None:
     for i, param in enumerate(params):
         grad = grads[i]
         grad = grad if not maximize else -grad
@@ -295,10 +245,15 @@ def _single_tensor_rprop(
         step = state_steps[i]
 
         # If compiling, the compiler will handle cudagraph checks, see note [torch.compile x capturable]
-        if not torch._utils.is_compiling() and capturable:
-            assert (param.is_cuda and step.is_cuda) or (
-                param.is_xla and step.is_xla
-            ), "If capturable=True, params and state_steps must be CUDA or XLA tensors."
+        if not torch.compiler.is_compiling() and capturable:
+            capturable_supported_devices = _get_capturable_supported_devices()
+            if not (
+                param.device.type == step.device.type
+                and param.device.type in capturable_supported_devices
+            ):
+                raise AssertionError(
+                    f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+                )
 
         step += 1
 
@@ -338,11 +293,11 @@ def _single_tensor_rprop(
 
 
 def _multi_tensor_rprop(
-    params: List[Tensor],
-    grads: List[Tensor],
-    prevs: List[Tensor],
-    step_sizes: List[Tensor],
-    state_steps: List[Tensor],
+    params: list[Tensor],
+    grads: list[Tensor],
+    prevs: list[Tensor],
+    step_sizes: list[Tensor],
+    state_steps: list[Tensor],
     *,
     step_size_min: float,
     step_size_max: float,
@@ -352,34 +307,46 @@ def _multi_tensor_rprop(
     capturable: bool,
     differentiable: bool,
     has_complex: bool,
-):
+) -> None:
     if len(params) == 0:
         return
 
-    assert not differentiable, "_foreach ops don't support autograd"
+    if differentiable:
+        raise AssertionError("_foreach ops don't support autograd")
 
     # If compiling, the compiler will handle cudagraph checks, see note [torch.compile x capturable]
-    if not torch._utils.is_compiling() and capturable:
-        assert all(
-            (p.is_cuda and step.is_cuda) or (p.is_xla and step.is_xla)
-            for p, step in zip(params, state_steps)
-        ), "If capturable=True, params and state_steps must be CUDA or XLA tensors."
+    if not torch.compiler.is_compiling() and capturable:
+        capturable_supported_devices = _get_capturable_supported_devices()
+        if not all(
+            p.device.type == step.device.type
+            and p.device.type in capturable_supported_devices
+            for p, step in zip(params, state_steps, strict=True)
+        ):
+            raise AssertionError(
+                f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+            )
 
     grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
-        [params, grads, prevs, step_sizes, state_steps]
+        [params, grads, prevs, step_sizes, state_steps]  # type: ignore[list-item]
     )
     for (
-        grouped_params,
-        grouped_grads,
-        grouped_prevs,
-        grouped_step_sizes,
-        grouped_state_steps,
+        grouped_params_,
+        grouped_grads_,
+        grouped_prevs_,
+        grouped_step_sizes_,
+        grouped_state_steps_,
     ), _ in grouped_tensors.values():
+        grouped_params = cast(list[Tensor], grouped_params_)
+        grouped_grads = cast(list[Tensor], grouped_grads_)
+        grouped_prevs = cast(list[Tensor], grouped_prevs_)
+        grouped_step_sizes = cast(list[Tensor], grouped_step_sizes_)
+        grouped_state_steps = cast(list[Tensor], grouped_state_steps_)
+
         # Update steps
         # If steps are on CPU, foreach will fall back to the slow path, which is a for-loop calling t.add(1) over
         # and over. 1 will then be wrapped into a Tensor over and over again, which is slower than if we just
         # wrapped it once now. The alpha is required to assure we go to the right overload.
-        if grouped_state_steps[0].is_cpu:
+        if not torch.compiler.is_compiling() and grouped_state_steps[0].is_cpu:
             torch._foreach_add_(
                 grouped_state_steps, torch.tensor(1.0, device="cpu"), alpha=1.0
             )
@@ -441,3 +408,65 @@ def _multi_tensor_rprop(
         # Logically, you may expect grouped_prevs to get updated to grouped_grads, but that's
         # basically already happened since we've been using grouped_prevs' memory to store
         # updated grouped_grads!
+
+
+@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_rprop)
+def rprop(
+    params: list[Tensor],
+    grads: list[Tensor],
+    prevs: list[Tensor],
+    step_sizes: list[Tensor],
+    state_steps: list[Tensor],
+    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+    foreach: bool | None = None,
+    capturable: bool = False,
+    maximize: bool = False,
+    differentiable: bool = False,
+    has_complex: bool = False,
+    *,
+    step_size_min: float,
+    step_size_max: float,
+    etaminus: float,
+    etaplus: float,
+) -> None:
+    # this check is slow during compilation, so we skip it
+    # if it's strictly needed we can add this check back in dynamo
+    if not torch.compiler.is_compiling() and not all(
+        isinstance(t, torch.Tensor) for t in state_steps
+    ):
+        raise RuntimeError(
+            "API has changed, `state_steps` argument must contain a list of singleton tensors"
+        )
+
+    if foreach is None:
+        _, foreach = _default_to_fused_or_foreach(
+            params, differentiable, use_fused=False
+        )
+
+    if foreach and torch.jit.is_scripting():
+        raise RuntimeError("torch.jit.script not supported with foreach optimizers")
+
+    if foreach and not torch.jit.is_scripting():
+        func = _multi_tensor_rprop
+    else:
+        func = _single_tensor_rprop
+
+    func(
+        params,
+        grads,
+        prevs,
+        step_sizes,
+        state_steps,
+        step_size_min=step_size_min,
+        step_size_max=step_size_max,
+        etaminus=etaminus,
+        etaplus=etaplus,
+        capturable=capturable,
+        maximize=maximize,
+        differentiable=differentiable,
+        has_complex=has_complex,
+    )
+
+
+rprop.__doc__ = _functional_api_doc.format(optimizer="Rprop")

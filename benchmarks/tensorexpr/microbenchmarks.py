@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
 import torch
 import torch._C._te as te
 
@@ -286,7 +287,7 @@ def run_benchmarks(benchmarks, sizes):
                     def check_correctness(a, b):
                         if not np.allclose(a, b):
                             print(name)
-                            assert np.allclose(a, b)
+                            raise AssertionError(f"Arrays not close for {name}")
 
                     check_correctness(tX, tR)
     return df

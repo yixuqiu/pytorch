@@ -1,33 +1,40 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+from model_registry import MLPModule, ModelWithParamAlias
+
 import torch
 from torch.distributed.pipelining import pipe_split, pipeline
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    TestCase,
+)
 
 
 d_hid = 512
-batch_size = 256
+microbatch_size = 16
 
 torch.manual_seed(0)
 
 
 # Basic example
 class ExampleCode(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.mm_param0 = torch.nn.Parameter(torch.randn(d_hid, d_hid))
         self.mm_param1 = torch.nn.Parameter(torch.randn(d_hid, d_hid))
         self.mm_param2 = torch.nn.Parameter(torch.randn(d_hid, d_hid))
         self.lin1 = torch.nn.Linear(d_hid, d_hid)
         self.lin2 = torch.nn.Linear(d_hid, d_hid)
 
     def forward(self, x, y):
-        x = torch.mm(x, self.mm_param0)
+        x = torch.mm(x, self.mm_param1)  # mutli-use param
         skip_connection = x
         x = x + y
         x = torch.relu(x)
         pipe_split()
-        x = torch.mm(x, self.mm_param1)
+        x = torch.mm(x, self.mm_param1)  # mutli-use param
         x = self.lin1(x)
         pipe_split()
         x = torch.relu(x)
@@ -39,23 +46,8 @@ class ExampleCode(torch.nn.Module):
         return x
 
 
-# MLP example
-class MLPModule(torch.nn.Module):
-    def __init__(self, d_hid):
-        super().__init__()
-        self.net1 = torch.nn.Linear(d_hid, d_hid)
-        self.relu = torch.nn.ReLU()
-        self.net2 = torch.nn.Linear(d_hid, d_hid)
-
-    def forward(self, x):
-        x = self.net1(x)
-        x = self.relu(x)
-        x = self.net2(x)
-        return x
-
-
 class MultiMLP(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.mlp0 = MLPModule(d_hid)
         self.mlp1 = MLPModule(d_hid)
@@ -73,19 +65,37 @@ class MultiMLP(torch.nn.Module):
         return x - y
 
 
+EXPECTED_N_STAGES = {
+    ExampleCode: 4,
+    MultiMLP: 4,
+    ModelWithParamAlias: 2,
+}
+
+# Currently, we don't enforce full set equality on the FQNs between the original
+# and pipelined models, because in the multi-use param case, PP will deduplicate
+# the FQNs from the state_dict.
+# TODO
+CHECK_FQN_SET_EQUALITY = False
+
+
 class PipeTests(TestCase):
-    def _test_model_split(self, model_class):
-        mod = model_class()
-        x = torch.randn(batch_size, d_hid)
-        y = torch.randn(batch_size, d_hid)
+    hw_classification = HardwareClassification.GENERIC
+
+    @parametrize("ModelClass", [ExampleCode, MultiMLP, ModelWithParamAlias])
+    def test_model_split(self, ModelClass):
+        mod = ModelClass()
+        x = torch.randn(microbatch_size, d_hid)
+        y = torch.randn(microbatch_size, d_hid)
 
         pipe = pipeline(
             mod,
-            num_chunks=4,
-            example_args=(x, y),
+            mb_args=(x, y),
         )
 
-        assert pipe.num_stages == 4, f"nstages = {pipe.num_stages}, expect 4"
+        if pipe.num_stages != EXPECTED_N_STAGES[ModelClass]:
+            raise AssertionError(
+                f"nstages = {pipe.num_stages}, expect {EXPECTED_N_STAGES[ModelClass]}"
+            )
 
         ref_out = mod(x, y)
         out = pipe(x, y)[0]
@@ -98,22 +108,52 @@ class PipeTests(TestCase):
         new_names = set()
         for idx in range(pipe.num_stages):
             stage_mod = pipe.get_stage_module(idx)
-            new_names.update(stage_mod.state_dict().keys())
+            stage_fqns = set(stage_mod.state_dict().keys())
+            if not stage_fqns.issubset(old_names):
+                raise AssertionError(
+                    f"stage_fqns {stage_fqns} is not a subset of old_names {old_names}"
+                )
+            new_names.update(stage_fqns)
 
-        assert (
-            old_names == new_names
-        ), f"""
-        old names {old_names}
-        new names {new_names}
-        """
+        if CHECK_FQN_SET_EQUALITY:
+            if old_names != new_names:
+                raise AssertionError(f"""
+            old names {old_names}
+            new names {new_names}
+            """)
         print("Qualname check passed")
 
-    def test_example_code(self):
-        self._test_model_split(ExampleCode)
+    def test_pipeline_with_non_float_inputs(self):
+        """Test that pipeline() handles non-float tensors crossing stage boundaries."""
 
-    def test_multi_mlp(self):
-        self._test_model_split(MultiMLP)
+        class EmbeddingModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(100, 64)
+                self.linear = torch.nn.Linear(64, 64)
 
+            def forward(self, input_ids, mask):
+                x = self.embed(input_ids)
+                pipe_split()
+                x = self.linear(x)
+                x = x * mask.unsqueeze(-1).float()
+                return x
+
+        model = EmbeddingModel()
+        input_ids = torch.randint(0, 100, (2, 16))
+        mask = torch.ones(2, 16, dtype=torch.bool)
+
+        # This should not raise "only Tensors of floating point dtype can require gradients"
+        pipe = pipeline(model, mb_args=(input_ids, mask))
+        self.assertEqual(pipe.num_stages, 2)
+
+        # Verify non-float tensors don't have requires_grad in metadata
+        ref_out = model(input_ids, mask)
+        out = pipe(input_ids, mask)[0]
+        torch.testing.assert_close(out, ref_out)
+
+
+instantiate_parametrized_tests(PipeTests)
 
 if __name__ == "__main__":
     run_tests()

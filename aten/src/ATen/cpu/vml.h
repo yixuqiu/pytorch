@@ -35,8 +35,8 @@
 #include <mkl.h>
 #endif
 
-namespace at {
-namespace vml {
+
+namespace at::vml {
 inline namespace CPU_CAPABILITY {
 
 using namespace vec;
@@ -46,7 +46,7 @@ inline void vrsqrt(scalar_t* out, scalar_t* in, int64_t size) {
   parallel_for(0, size, 2048, [out, in](int64_t begin, int64_t end) {
     map(
         [](const Vectorized<scalar_t>& x) {
-          return Vectorized<scalar_t>((scalar_t)(1)) / x.sqrt();
+          return Vectorized<scalar_t>((scalar_t)1) / x.sqrt();
         },
         out + begin,
         in + begin,
@@ -108,12 +108,12 @@ static_assert(
 #define IMPLEMENT_VML_MKL_STUB(op, mklop, type, mkltype)                \
   template <>                                                           \
   inline void v##op(type * out, const type * in, int64_t size) {        \
-    int64_t max_mkl_ind = std::numeric_limits<MKL_INT>::max();          \
+    auto constexpr max_mkl_ind = std::numeric_limits<MKL_INT>::max();   \
     if (size <= static_cast<int64_t>(max_mkl_ind)) {                    \
       vm##mkltype##mklop(                                               \
           size, in, out, VML_HA | VML_FTZDAZ_OFF | VML_ERRMODE_IGNORE); \
     } else {                                                            \
-      MKL_INT ind = 0;                                                  \
+      int64_t ind = 0;                                                  \
       int64_t chunks = size / max_mkl_ind;                              \
       int64_t rest = size % max_mkl_ind;                                \
       for (; ind < chunks; ind++) {                                     \
@@ -131,9 +131,18 @@ static_assert(
     }                                                                   \
   }
 
+#ifdef AT_VEC_CUSTOM_MATH
+
+#define IMPLEMENT_VML_MKL(op, mklop)          \
+  IMPLEMENT_VML_MKL_STUB(op, mklop, double, d)
+
+#else
+
 #define IMPLEMENT_VML_MKL(op, mklop)          \
   IMPLEMENT_VML_MKL_STUB(op, mklop, float, s) \
   IMPLEMENT_VML_MKL_STUB(op, mklop, double, d)
+
+#endif
 
 // NB: abs, cosh and sinh were temporarily disabled due to issues with Apple
 // NB: expm1 is disabled because on some configs it produces expm1(nan)=-1
@@ -167,5 +176,4 @@ IMPLEMENT_VML_MKL(log2, Log2)
 #endif
 
 } // namespace
-} // namespace vml
-} // namespace at
+} // namespace at::vml

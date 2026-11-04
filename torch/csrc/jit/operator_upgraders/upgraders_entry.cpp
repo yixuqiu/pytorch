@@ -94,7 +94,9 @@ def div__Scalar_mode_0_3(self: Tensor, other: number, *, rounding_mode: Optional
 def full_names_0_4(size:List[int], fill_value:number, *, names:Optional[List[str]]=None,
                    dtype:Optional[int]=None, layout:Optional[int]=None, device:Optional[Device]=None,
                    pin_memory:Optional[bool]=None) -> Tensor:
-  return torch.full(size, fill_value, names=names, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+  if dtype is None:
+    fill_value = float(fill_value)
+  return torch.full(size, fill_value, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 )SCRIPT"},
     {"full_0_4", R"SCRIPT(
 def full_0_4(size:List[int], fill_value:number, *, dtype:Optional[int]=None,
@@ -122,7 +124,7 @@ std::shared_ptr<Graph> create_upgrader_graph(
     const std::string& upgrader_name,
     const std::string& upgrader_body) {
   auto cu = std::make_shared<CompilationUnit>();
-  cu->define(c10::nullopt, upgrader_body, nativeResolver(), nullptr);
+  cu->define(std::nullopt, upgrader_body, nativeResolver(), nullptr);
   Function& jitFunc = cu->get_function(upgrader_name);
   GraphFunction& graphFunction = toGraphFunction(jitFunc);
   return graphFunction.graph();

@@ -1,21 +1,25 @@
+# mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import contextlib
-from typing import cast, Dict, Optional, Tuple
+from typing import cast
 
 import torch
 import torch._prims_common as utils
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 from torch import Tensor
-from torch.distributed._tensor import DTensor, Replicate, Shard
-from torch.distributed._tensor.ops.embedding_ops import _MaskPartial
-from torch.distributed._tensor.ops.math_ops import (
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed.tensor._ops._embedding_ops import _MaskPartial
+from torch.distributed.tensor._ops._math_ops import (
     _skip_dim,
     Reduction,
     replicate_reduction_dims,
 )
-from torch.distributed._tensor.placement_types import Placement, TensorMeta
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor._ops.utils import normalize_dim
+from torch.distributed.tensor.placement_types import Placement
+
 
 aten = torch.ops.aten
 
@@ -34,19 +38,61 @@ def loss_parallel():
     :class:`~torch.nn.CrossEntropyLoss` as usual, with the following assumptions on the input parameters.
     The corresponding ``backward()`` call, if any, also needs to happen under this context manager.
 
+    Both one-dimensional and multi-dimensional ``DeviceMesh`` are supported. On a
+    multi-dimensional mesh, exactly one mesh dim must shard the class dimension —
+    that dim is treated as the "TP" dim and can be in any position (not necessarily
+    last). The remaining mesh dims may be ``Shard`` (e.g. batch-sharded for DP/CP)
+    or ``Replicate``.
+
     Args:
         input (:class:`DTensor`):
-            Input logits. Assumed to be sharded on the class dimension.
+            Input logits. Assumed to be sharded on the class dimension on exactly
+            one mesh dim.
         target (Union[:class:`torch.Tensor`, :class:`DTensor`]):
-            Must be ground truth class indices (class probabilities currently not supported).
-            Assumed to be replicated across the ``DeviceMesh``.
+            Must be ground truth class indices (class probabilities currently not
+            supported). Its placements are derived from ``input``'s placements by
+            (1) replacing the TP dim's ``Shard(class_dim)`` with ``Replicate`` and
+            (2) shifting any other ``Shard(d)`` with ``d > class_dim`` down by one
+            (since the class tensor dim is removed from the output)::
+
+                input tensor shape       input placements             target shape      target placements
+                ----------------------   --------------------------   ---------------   ------------------------
+                (batch, class)           (Shard(0), Shard(1))         (batch,)          (Shard(0), Replicate())
+                (batch, class)           (Replicate(), Shard(1))      (batch,)          (Replicate(), Replicate())
+                (batch, class, seq)      (Shard(2), Shard(1))         (batch, seq)      (Shard(1), Replicate())
+                (batch, class, seq)      (Shard(0), Shard(1))         (batch, seq)      (Shard(0), Replicate())
+
+            A plain :class:`torch.Tensor` is only accepted when the derived target
+            placements are all ``Replicate`` (e.g. on a one-dimensional mesh);
+            otherwise a :class:`DTensor` must be passed explicitly so that the
+            intended sharding is unambiguous.
         weight (Union[:class:`torch.Tensor`, :class:`DTensor`], optional):
             If given, assumed to be replicated across the ``DeviceMesh``.
         label_smoothing:
             Currently not supported.
 
     Returns:
-        A replicated :class:`DTensor`.
+        A :class:`DTensor` whose placements depend on ``reduction``:
+
+        - ``reduction="none"`` — per-sample loss; inherits the ``target``
+          placements (``Shard`` on batch-parallel dims, ``Replicate`` on TP).
+        - ``reduction="sum"`` — scalar; ``Replicate`` on the TP dim (the custom
+          all-reduce makes each rank's local value globally correct over TP),
+          ``Partial("sum")`` on every other ``Shard`` mesh dim so that the
+          cross-rank reduction happens lazily on materialization/redistribution,
+          and ``Replicate`` on ``Replicate`` mesh dims.
+        - ``reduction="mean"`` — only supported on a one-dimensional mesh; returns
+          a fully replicated :class:`DTensor`.
+
+        On a one-dimensional mesh all three cases simplify to a fully replicated
+        :class:`DTensor` (the original behavior).
+
+    .. note::
+        ``reduction="mean"`` is only supported on a one-dimensional ``DeviceMesh``.
+        On a multi-dimensional mesh the per-rank division by ``total_weight`` uses a
+        local count, so aggregating across non-TP dims does not yield the correct
+        global mean; use ``reduction="sum"`` or ``"none"`` instead and divide by the
+        global count yourself if needed.
 
     Example:
         A sharded DTensor is manually created here to showcase the usage.
@@ -72,22 +118,33 @@ def loss_parallel():
     _disable_custom_loss_ops()
 
 
-# Currently only needs to support one dimensional DeviceMesh; in general return
-# the mesh_dim with placements[mesh_dim].is_shard(dim)
-def _find_all_reduce_mesh_dim(placements: Tuple[Placement, ...], dim: int) -> int:
-    if not len(placements) == 1:
+# Return the mesh_dim whose placement is Shard(dim). Exactly one such mesh dim
+# (the "TP" dim) is required; other mesh dims must be Shard on a different
+# tensor dim or Replicate. Partial on a non-TP dim is rejected so that
+# reduction="none" cannot silently accept garbage (replicate_reduction_dims
+# would otherwise rewrite Partial -> Replicate in target_placements).
+def _find_all_reduce_mesh_dim(placements: tuple[Placement, ...], dim: int) -> int:
+    shard_mesh_dims = [i for i, p in enumerate(placements) if p.is_shard(dim)]
+    if len(shard_mesh_dims) != 1:
         raise ValueError(
-            "Currently loss_parallel() only supports input on one-dimensional DeviceMesh."
+            f"loss_parallel() requires exactly one mesh dim to shard tensor "
+            f"dimension {dim}, but got placements {placements} with "
+            f"{len(shard_mesh_dims)} such mesh dim(s)."
         )
-    if not placements[0].is_shard(dim):
-        raise ValueError(
-            f"loss_parallel() should be enabled only when the input tensor is sharded on dimension {dim}."
-        )
-    return 0
+    mesh_dim = shard_mesh_dims[0]
+    for i, p in enumerate(placements):
+        if i == mesh_dim:
+            continue
+        if not (p.is_shard() or p.is_replicate()):
+            raise ValueError(
+                f"loss_parallel() expects non-TP mesh dims to be "
+                f"Shard or Replicate, got {p} at dim {i}."
+            )
+    return mesh_dim
 
 
 def _cast_to_dtensor(
-    tensor, placements: Tuple[Placement, ...], mesh: DeviceMesh
+    tensor, placements: tuple[Placement, ...], mesh: DeviceMesh
 ) -> DTensor:
     if isinstance(tensor, DTensor):
         if tensor.placements == placements:
@@ -95,6 +152,17 @@ def _cast_to_dtensor(
         else:
             raise RuntimeError(f"Expected {placements} but got {tensor.placements}.")
     elif isinstance(tensor, torch.Tensor):
+        if any(p.is_shard() for p in placements):
+            # A plain torch.Tensor with Shard placements is ambiguous: it could
+            # be a full global tensor the user expects us to shard, or an
+            # already-local slice. Require a DTensor so the intent is explicit.
+            raise ValueError(
+                f"loss_parallel() requires a DTensor (not a plain torch.Tensor) "
+                f"when the derived placements {placements} contain Shard — this "
+                f"happens on a multi-dimensional mesh with a batch-sharded non-TP "
+                f"dim. Wrap the tensor with DTensor.from_local or distribute_tensor "
+                f"to make the sharding explicit."
+            )
         return DTensor.from_local(
             tensor, device_mesh=mesh, placements=placements, run_check=False
         )
@@ -104,16 +172,21 @@ def _cast_to_dtensor(
 
 def _propagate_tensor_meta(
     op_call: torch._ops.OpOverload,
-    args: Tuple[object, ...],
-    kwargs: Dict[str, object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
 ) -> TensorMeta:
     op_info = DTensor._op_dispatcher.unwrap_to_op_info(op_call, args, kwargs)
+    if op_info.schema is None:
+        raise AssertionError(
+            "op_info.schema should not be None after unwrap_to_op_info"
+        )
     tensor_meta = DTensor._op_dispatcher.sharding_propagator._propagate_tensor_meta(
         op_info.schema
     )
     if isinstance(tensor_meta, TensorMeta):
         return tensor_meta
     elif isinstance(tensor_meta, tuple):
+        # pyrefly: ignore [bad-return]
         return tensor_meta[0]
     else:
         raise RuntimeError(f"Unexpected tensor meta type: {type(tensor_meta)}.")
@@ -122,13 +195,13 @@ def _propagate_tensor_meta(
 # NOTE: The implementation follows torch._decomp.decomposition._log_softmax,
 # with all_reduce manually inserted to perform distributed computation.
 def _log_softmax(x, dim, half_to_float, mesh, mesh_dim):
-    x = x.contiguous()
     if half_to_float:
-        assert x.dtype == torch.half
+        if x.dtype != torch.half:
+            raise AssertionError
     computation_dtype, result_dtype = utils.elementwise_dtypes(
         x, type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
     )
-    x = x.to(computation_dtype)
+    x = x.to(dtype=computation_dtype, memory_format=torch.contiguous_format)
     if x.numel() == 0:
         shifted = x
     else:
@@ -150,28 +223,34 @@ def _log_softmax(x, dim, half_to_float, mesh, mesh_dim):
 
 def _log_softmax_handler(
     op_call: torch._ops.OpOverload,
-    args: Tuple[object, ...],
-    kwargs: Dict[str, object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
 ) -> object:
     x = cast(DTensor, args[0])
     dim = cast(int, args[1])
     half_to_float = cast(bool, args[2])
 
     spec = x._spec
+    dim = normalize_dim(dim, x.dim())
     mesh_dim = _find_all_reduce_mesh_dim(spec.placements, dim)
 
     output_tensor_meta = _propagate_tensor_meta(op_call, args, kwargs)
 
     res = _log_softmax(x._local_tensor, dim, half_to_float, spec.mesh, mesh_dim)
 
-    return DTensor(
-        res,
+    res_spec = DTensorSpec(
         spec.mesh,
         spec.placements,
-        shape=output_tensor_meta.shape,
-        dtype=output_tensor_meta.dtype,
+        tensor_meta=output_tensor_meta,
+    )
+
+    # pyrefly: ignore [bad-argument-type]
+    return DTensor(
+        # pyrefly: ignore [bad-argument-count]
+        res,
+        res_spec,
+        # pyrefly: ignore [unexpected-keyword]
         requires_grad=res.requires_grad,
-        stride=output_tensor_meta.stride,
     )
 
 
@@ -179,8 +258,8 @@ def _log_softmax_handler(
 # _log_softmax_backward_handler does not actually do any computation.
 def _log_softmax_backward_handler(
     op_call: torch._ops.OpOverload,
-    args: Tuple[object, ...],
-    kwargs: Dict[str, object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
 ) -> object:
     grad_output = cast(DTensor, args[0])
     input_dtype = cast(torch.dtype, args[3])
@@ -192,14 +271,15 @@ def _log_softmax_backward_handler(
 def _nll_loss_forward(
     x: Tensor,
     target: Tensor,
-    weight: Optional[Tensor],
-    local_weight: Optional[Tensor],
+    weight: Tensor | None,
+    local_weight: Tensor | None,
     reduction: int,
     ignore_index: int,
-    channel_dim_size: int,
+    input_shape: torch.Size,
+    channel_dim: int,
     mesh: DeviceMesh,
     mesh_dim: int,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     n_dims = x.dim()
     channel_dim = 1
     if n_dims < 2:
@@ -218,7 +298,8 @@ def _nll_loss_forward(
 
     if weight is not None:
         w = _weight_view(weight)
-        assert local_weight is not None
+        if local_weight is None:
+            raise AssertionError
         local_w = _weight_view(local_weight)
         x = x * local_w
     safe_target = torch.where(target != ignore_index, target, 0)
@@ -226,7 +307,7 @@ def _nll_loss_forward(
 
     # The following code block is a distributed version of
     # result = -torch.gather(self, channel_dim, safe_target_).squeeze(channel_dim)
-    partial_placement = _MaskPartial(logical_dim_size=channel_dim_size)
+    partial_placement = _MaskPartial(offset_shape=input_shape, offset_dim=channel_dim)
     safe_target_partial_ = partial_placement._partition_value(
         safe_target_, mesh, mesh_dim
     )
@@ -244,6 +325,7 @@ def _nll_loss_forward(
     if weight is not None:
         new_shape = list(x.shape)
         new_shape[channel_dim] = -1
+        # pyrefly: ignore [unbound-name]
         w = w.expand(new_shape)
         wsum = torch.gather(w, channel_dim, safe_target_).squeeze(channel_dim)
         wsum = torch.where(target != ignore_index, wsum, 0)
@@ -251,8 +333,11 @@ def _nll_loss_forward(
     else:
         total_weight = (target != ignore_index).sum().to(x)
 
-    # NOTE: this is correct only on 1D DeviceMesh; o/w additional
-    #       all-reduce on result and total_weight is needed
+    # On an N-D mesh, result.sum() is a per-rank sum over the local batch;
+    # the caller emits Partial("sum") on non-TP Shard dims so the cross-rank
+    # reduction happens when the output is later materialized/redistributed.
+    # reduction="mean" is rejected in the handler for N-D mesh because
+    # total_weight is a per-rank local count.
     if reduction == Reduction.SUM.value:
         result = result.sum()
     elif reduction == Reduction.MEAN.value:
@@ -263,8 +348,8 @@ def _nll_loss_forward(
 
 def _nll_loss_forward_handler(
     op_call: torch._ops.OpOverload,
-    args: Tuple[object, ...],
-    kwargs: Dict[str, object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
 ) -> object:
     x = cast(DTensor, args[0])
     target = args[1]
@@ -273,7 +358,6 @@ def _nll_loss_forward_handler(
     ignore_index = cast(int, args[4])
 
     channel_dim = 1 if x.dim() >= 2 else 0
-    channel_dim_size = x.shape[channel_dim]
     spec = x._spec
     mesh_dim = _find_all_reduce_mesh_dim(spec.placements, channel_dim)
 
@@ -294,15 +378,39 @@ def _nll_loss_forward_handler(
             Shard(0) if i == mesh_dim else Replicate() for i in range(spec.mesh.ndim)
         ]
         local_weight = weight.redistribute(spec.mesh, sharded_placements)._local_tensor
-        assert local_weight.shape[0] == x._local_tensor.shape[channel_dim]
+        if local_weight.shape[0] != x._local_tensor.shape[channel_dim]:
+            raise AssertionError
 
     if reduction == Reduction.NONE.value:
         output_placements = target_placements
     else:
-        output_placements = all_replicate_placements
+        # reduction="mean" is not yet correct on multi-dimensional mesh: the
+        # local division by total_weight uses a per-rank count, so summing
+        # across non-TP dims does not yield the global mean. See the NOTE in
+        # _nll_loss_forward.
+        if reduction == Reduction.MEAN.value and spec.mesh.ndim > 1:
+            raise NotImplementedError(
+                "loss_parallel() with reduction='mean' is only supported on "
+                "one-dimensional DeviceMesh; got mesh with ndim="
+                f"{spec.mesh.ndim}. Use reduction='sum' or 'none' instead."
+            )
+        # On the shard dim (TP), the custom all-reduce produces a globally
+        # correct result -> Replicate. On other dims (e.g. DP/CP), each rank
+        # only reduced its local batch -> Partial(sum).
+        out_placements_list: list[Placement] = []
+        for i, p in enumerate(spec.placements):
+            if i == mesh_dim:
+                out_placements_list.append(Replicate())
+            elif p.is_shard():
+                out_placements_list.append(Partial())
+            else:
+                out_placements_list.append(p)
+        output_placements = tuple(out_placements_list)
 
     # tensor inputs to _propagate_tensor_meta need to be DTensors
+    # pyrefly: ignore [bad-assignment]
     args = list(args)
+    # pyrefly: ignore [unsupported-operation]
     args[1], args[2] = target, weight
     output_tensor_meta = _propagate_tensor_meta(op_call, tuple(args), kwargs)
 
@@ -313,20 +421,21 @@ def _nll_loss_forward_handler(
         local_weight,
         reduction,
         ignore_index,
-        channel_dim_size,
+        x.shape,
+        channel_dim,
         spec.mesh,
         mesh_dim,
     )
+    out_spec = DTensorSpec(spec.mesh, output_placements, tensor_meta=output_tensor_meta)
 
     return (
+        # pyrefly: ignore [bad-argument-type]
         DTensor(
+            # pyrefly: ignore [bad-argument-count]
             result,
-            spec.mesh,
-            output_placements,
-            shape=output_tensor_meta.shape,
-            dtype=output_tensor_meta.dtype,
+            out_spec,
+            # pyrefly: ignore [unexpected-keyword]
             requires_grad=result.requires_grad,
-            stride=output_tensor_meta.stride,
         ),
         total_weight,
     )
@@ -343,11 +452,12 @@ def _nll_loss_and_log_softmax_backward(
     grad_output: Tensor,
     x: Tensor,
     target: Tensor,
-    weight: Optional[Tensor],
+    weight: Tensor | None,
     reduction: int,
     ignore_index: int,
     total_weight: Tensor,
-    channel_dim_size: int,
+    input_shape: torch.Size,
+    channel_dim: int,
     mesh: DeviceMesh,
     mesh_dim: int,
 ) -> Tensor:
@@ -361,12 +471,13 @@ def _nll_loss_and_log_softmax_backward(
 
     # The following code block is a distributed version of
     # grad_input = torch.scatter(grad_input, channel_dim, safe_target, -1.0)
-    partial_placement = _MaskPartial(logical_dim_size=channel_dim_size)
+    partial_placement = _MaskPartial(offset_shape=input_shape, offset_dim=channel_dim)
     safe_target = safe_target.squeeze(channel_dim).flatten()
     masked_safe_target = partial_placement._partition_value(safe_target, mesh, mesh_dim)
     # only update grad_input to -1 if not masked
-    assert partial_placement.mask_buffer.data is not None
-    grad_update = partial_placement.mask_buffer.data.float() - 1.0
+    if partial_placement.mask_buffer.data is None:
+        raise AssertionError
+    grad_update = partial_placement.mask_buffer.data.to(grad_input.dtype) - 1.0
     arange_1d = torch.arange(
         masked_safe_target.shape[0], device=masked_safe_target.device
     )
@@ -409,8 +520,8 @@ def _nll_loss_and_log_softmax_backward(
 
 def _nll_loss_backward_handler(
     op_call: torch._ops.OpOverload,
-    args: Tuple[object, ...],
-    kwargs: Dict[str, object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
 ) -> object:
     grad_output = cast(DTensor, args[0])
     x = cast(DTensor, args[1])
@@ -421,7 +532,6 @@ def _nll_loss_backward_handler(
     total_weight = cast(Tensor, args[6])
 
     channel_dim = 1 if x.dim() >= 2 else 0
-    channel_dim_size = x.shape[channel_dim]
     spec = x._spec
     mesh_dim = _find_all_reduce_mesh_dim(spec.placements, channel_dim)
 
@@ -434,9 +544,24 @@ def _nll_loss_backward_handler(
     if weight is not None:
         weight = _cast_to_dtensor(weight, all_replicate_placements, spec.mesh)
 
+    # For reduction="none", autograd may deliver grad_output with different
+    # placements than the forward output (e.g. Replicate on a batch-sharded dim),
+    # causing a shape mismatch with the local batch. Redistribute it to match
+    # target_placements — which is what the forward output uses for reduction="none".
+    # For reduction="sum"/"mean" the forward output is a 0-D scalar, so a placement
+    # mismatch (e.g. Replicate vs. Partial("sum")) cannot produce a shape mismatch
+    # against x._local_tensor and no redistribute is needed here.
+    if reduction == Reduction.NONE.value:
+        grad_output = grad_output.redistribute(spec.mesh, target_placements)
+
     # tensor inputs to _propagate_tensor_meta need to be DTensors
+    # pyrefly: ignore [bad-assignment]
     args = list(args)
+    # pyrefly: ignore [unsupported-operation]
+    args[0] = grad_output
+    # pyrefly: ignore [unsupported-operation]
     args[2], args[3] = target, weight
+    # pyrefly: ignore [unsupported-operation]
     args[6] = _cast_to_dtensor(total_weight, all_replicate_placements, spec.mesh)
     output_tensor_meta = _propagate_tensor_meta(op_call, tuple(args), kwargs)
 
@@ -448,20 +573,25 @@ def _nll_loss_backward_handler(
         reduction,
         ignore_index,
         total_weight,
-        channel_dim_size,
+        x.shape,
+        channel_dim,
         spec.mesh,
         mesh_dim,
     )
-
-    return DTensor(
-        result,
+    # the output sharding is the same as input sharding: Shard(channel_dim) on mesh_dim
+    out_spec = DTensorSpec(
         spec.mesh,
-        # the output sharding is the same as input sharding: Shard(channel_dim) on mesh_dim
         spec.placements,
-        shape=output_tensor_meta.shape,
-        dtype=output_tensor_meta.dtype,
+        tensor_meta=output_tensor_meta,
+    )
+
+    # pyrefly: ignore [bad-argument-type]
+    return DTensor(
+        # pyrefly: ignore [bad-argument-count]
+        result,
+        out_spec,
+        # pyrefly: ignore [unexpected-keyword]
         requires_grad=result.requires_grad,
-        stride=output_tensor_meta.stride,
     )
 
 

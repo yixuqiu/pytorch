@@ -1,7 +1,9 @@
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/frontend/source_range.h>
 #include <torch/csrc/jit/serialization/source_range_serialization.h>
+#include <functional>
 #include <iostream>
+#include <regex>
 
 namespace torch::jit {
 
@@ -13,16 +15,15 @@ StringCordView::StringCordView() {
 }
 
 StringCordView::StringCordView(
-    std::vector<c10::string_view> inputs,
+    std::vector<std::string_view> inputs,
     std::vector<std::shared_ptr<std::string>> ownerships)
     : pieces_(std::move(inputs)), owned_strings_(std::move(ownerships)) {
+  accumulated_sizes_.reserve(pieces_.size() + 1);
   accumulated_sizes_.push_back(0);
   size_t running_sum = 0;
   for (auto& s : pieces_) {
-    if (!s.empty()) {
-      running_sum += s.size();
-      accumulated_sizes_.push_back(running_sum);
-    }
+    running_sum += s.size();
+    accumulated_sizes_.push_back(running_sum);
   }
 }
 
@@ -31,25 +32,70 @@ size_t StringCordView::find(const std::string& tok, size_t start) const {
     return 0;
   }
 
-  if ((size() - start) < tok.size()) {
+  const size_t total_size = size();
+  if (start > total_size || (total_size - start) < tok.size()) {
     return std::string::npos;
   }
 
-  Iterator begin = iter_for_pos(start);
-  Iterator end_iter = end();
-  size_t offset = start;
-  for (; begin != end_iter; ++begin, ++offset) {
-    if (*begin == tok[0]) {
-      auto mis = std::mismatch(begin, end_iter, tok.begin(), tok.end());
-      if (mis.second == tok.end()) {
-        // no mismatch, and second string (tok) is exhausted.
-        return offset;
+  const std::string_view needle(tok);
+  if (pieces_.size() == 1) {
+    return pieces_[0].find(needle, start);
+  }
+
+  const auto upper = std::upper_bound(
+      accumulated_sizes_.begin(), accumulated_sizes_.end(), start);
+  size_t piece_index = upper - accumulated_sizes_.begin() - 1;
+  size_t piece_start = accumulated_sizes_[piece_index];
+  for (; piece_index < pieces_.size(); ++piece_index) {
+    const std::string_view piece = pieces_[piece_index];
+    if (start >= piece_start + piece.size()) {
+      piece_start += piece.size();
+      continue;
+    }
+
+    size_t search_from = start - piece_start;
+    while (search_from < piece.size()) {
+      const size_t local_match = piece.find(needle.front(), search_from);
+      if (local_match == std::string_view::npos) {
+        break;
       }
-      if (mis.first == end_iter) {
-        // this str is exhausted but tok is not
+
+      const size_t match_start = piece_start + local_match;
+      if ((total_size - match_start) < needle.size()) {
         return std::string::npos;
       }
+
+      size_t match_piece = piece_index;
+      size_t match_pos = local_match;
+      size_t needle_pos = 0;
+      while (needle_pos < needle.size()) {
+        while (match_piece < pieces_.size() &&
+               match_pos == pieces_[match_piece].size()) {
+          ++match_piece;
+          match_pos = 0;
+        }
+        if (match_piece == pieces_.size()) {
+          break;
+        }
+
+        const std::string_view fragment =
+            pieces_[match_piece].substr(match_pos);
+        const size_t count =
+            std::min(fragment.size(), needle.size() - needle_pos);
+        if (fragment.substr(0, count) != needle.substr(needle_pos, count)) {
+          break;
+        }
+        match_pos += count;
+        needle_pos += count;
+      }
+      if (needle_pos == needle.size()) {
+        return match_start;
+      }
+
+      search_from = local_match + 1;
     }
+    piece_start += piece.size();
+    start = piece_start;
   }
   return std::string::npos;
 }
@@ -69,7 +115,7 @@ size_t StringCordView::find_regex(const std::string& tok, size_t start) const {
 }
 
 StringCordView StringCordView::substr(size_t start, size_t size) const {
-  std::vector<c10::string_view> pieces;
+  std::vector<std::string_view> pieces;
   std::vector<std::shared_ptr<std::string>> ownerships;
   if (start >= this->size()) {
     // out of bounds
@@ -78,8 +124,8 @@ StringCordView StringCordView::substr(size_t start, size_t size) const {
   if (start + size >= this->size()) {
     size = this->size() - start;
   }
-  Iterator begin = iter_for_pos(start);
-  Iterator end = iter_for_pos(start + size);
+  IteratorImpl begin = iter_impl_for_pos(start);
+  IteratorImpl end = iter_impl_for_pos(start + size);
 
   if (begin.line_ == end.line_) {
     // same line
@@ -88,14 +134,14 @@ StringCordView StringCordView::substr(size_t start, size_t size) const {
     pieces.push_back(pieces_[begin.line_].substr(begin.pos_));
 
     size_t last_line = pieces_.size();
-    if (end != this->end() && end.line_ < last_line) {
+    if (end.has_next() && end.line_ < last_line) {
       // end is within the string
       last_line = end.line_;
     }
     for (size_t i = begin.line_ + 1; i < last_line; i++) {
       pieces.push_back(pieces_[i]);
     }
-    if (end != this->end()) {
+    if (end.has_next()) {
       pieces.push_back(pieces_[end.line_].substr(0, end.pos_));
     }
   }
@@ -128,33 +174,69 @@ bool StringCordView::operator==(const StringCordView& rhs) const {
 }
 
 StringCordView::Iterator StringCordView::iter_for_pos(size_t pos) const {
-  if (pos == 0) {
-    return begin();
-  }
   if (pos >= size()) {
     return end();
   }
-  auto upper = std::upper_bound(
-      accumulated_sizes_.begin(), accumulated_sizes_.end(), pos);
-  if (upper == accumulated_sizes_.end()) {
-    return end();
+  return begin() + pos;
+}
+
+StringCordView::IteratorImpl StringCordView::iter_impl_for_pos(
+    size_t pos) const {
+  if (pos >= size()) {
+    return end_impl();
   }
-  size_t line = upper - accumulated_sizes_.begin() - 1;
-  assert(accumulated_sizes_[line] <= pos);
-  assert(accumulated_sizes_[line + 1] > pos);
-  return Iterator(this, line, pos - accumulated_sizes_[line], size() - pos);
+  return begin_impl() + pos;
+}
+
+StringCordView::IteratorImpl& StringCordView::IteratorImpl::operator+=(
+    size_t num) {
+  if (!has_next()) {
+    return *this;
+  }
+  size_t target_pos = pos_ + num;
+  if (target_pos >= str_->accumulated_sizes_[line_] &&
+      (line_ + 1) < str_->accumulated_sizes_.size() &&
+      target_pos < str_->accumulated_sizes_[line_ + 1]) {
+    pos_ = target_pos;
+    return *this;
+  }
+
+  size_t target_abs_pos = pos() + num;
+  if (target_abs_pos >= size_) {
+    *this = str_->end_impl();
+    return *this;
+  }
+  auto upper = std::upper_bound(
+      str_->accumulated_sizes_.begin(),
+      str_->accumulated_sizes_.end(),
+      target_abs_pos);
+  if (upper == str_->accumulated_sizes_.end()) {
+    *this = str_->end_impl();
+    return *this;
+  }
+  size_t line = upper - str_->accumulated_sizes_.begin() - 1;
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+      str_->accumulated_sizes_[line] <= target_abs_pos);
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+      str_->accumulated_sizes_[line + 1] > target_abs_pos);
+  *this = IteratorImpl(
+      str_,
+      line,
+      target_abs_pos - str_->accumulated_sizes_[line],
+      str_->size() - target_abs_pos);
+  return *this;
 }
 
 size_t SourceRangeHasher::operator()(const torch::jit::SourceRange& key) const {
   return (
-      std::hash<uintptr_t>()(reinterpret_cast<uintptr_t>(key.source().get())) ^
+      std::hash<const void*>()(key.source().get()) ^
       std::hash<size_t>()(key.start()) ^ std::hash<size_t>()(key.end()));
 }
 
-c10::optional<SourceRange> Source::findSourceRangeThatGenerated(
+std::optional<SourceRange> Source::findSourceRangeThatGenerated(
     const SourceRange& range) {
   if (!gen_ranges_) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   return gen_ranges_->findSourceRangeThatGenerated(range);
 }
@@ -272,9 +354,9 @@ void SourceRange::print_with_context(
     if (!funcname.empty()) {
       out << ", in " << funcname;
     }
-    out << "\n";
+    out << '\n';
   }
-  // print out inital context
+  // print out initial context
   out << str.substr(begin_context, start() - begin_context);
   size_t line_start = start();
   size_t line_end = range_end;
@@ -289,7 +371,7 @@ void SourceRange::print_with_context(
       auto actual_line = str.substr(line_start, (line_end - line_start) + 1);
       out << actual_line;
       if (actual_line.back() != '\n') {
-        out << "\n";
+        out << '\n';
       }
 
       size_t empty_space = 0;
@@ -339,7 +421,7 @@ void SourceRange::print_with_context(
     auto line_substr = str.substr(line_end, end_context - line_end);
     out << line_substr;
     if (!line_substr.empty() && line_substr.back() != '\n') {
-      out << "\n";
+      out << '\n';
     }
   }
 }

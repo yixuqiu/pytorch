@@ -12,6 +12,7 @@ namespace torch {
 TORCH_PYTHON_API py::handle get_symint_class();
 TORCH_PYTHON_API py::handle get_symfloat_class();
 TORCH_PYTHON_API py::handle get_symbool_class();
+TORCH_PYTHON_API py::handle get_dynint_class();
 
 // NB: These functions must not be called too early, otherwise torch not setup.
 // Alternate design is to have torch "register" the object to us
@@ -24,6 +25,9 @@ inline bool is_symfloat(py::handle obj) {
 inline bool is_symbool(py::handle obj) {
   return py::isinstance(obj, get_symbool_class());
 }
+inline bool is_dynint(py::handle obj) {
+  return py::isinstance(obj, get_dynint_class());
+}
 
 namespace impl {
 
@@ -35,7 +39,7 @@ class PythonSymNodeImpl : public c10::SymNodeImpl {
   PythonSymNodeImpl(py::object pyobj) : c10::SymNodeImpl() {
     pyobj_ = std::make_shared<c10::SafePyObject>(
         pyobj.release().ptr(), getPyInterpreter());
-  };
+  }
 
   c10::SymNode wrap_int(int64_t num) override {
     py::gil_scoped_acquire acquire;
@@ -105,6 +109,13 @@ class PythonSymNodeImpl : public c10::SymNodeImpl {
     return getPyObj().attr("has_hint")().is(py::handle(Py_True));
   }
 
+  std::optional<int64_t> guarding_hint() override {
+    py::gil_scoped_acquire acquire;
+    const auto r = getPyObj().attr("hint");
+    return r.is_none() ? std::nullopt
+                       : std::optional<int64_t>(r.cast<int64_t>());
+  }
+
   int64_t guard_int(const char* file, int64_t line) override {
     py::gil_scoped_acquire acquire;
     return getPyObj().attr("guard_int")(file, line).cast<int64_t>();
@@ -125,14 +136,24 @@ class PythonSymNodeImpl : public c10::SymNodeImpl {
     return getPyObj().attr("expect_true")(file, line).cast<bool>();
   }
 
-  bool expect_size(const char* file, int64_t line) override {
-    py::gil_scoped_acquire acquire;
-    return getPyObj().attr("expect_size")(file, line).cast<bool>();
-  }
-
   bool guard_size_oblivious(const char* file, int64_t line) override {
     py::gil_scoped_acquire acquire;
     return getPyObj().attr("guard_size_oblivious")(file, line).cast<bool>();
+  }
+
+  bool guard_or_false(const char* file, int64_t line) override {
+    py::gil_scoped_acquire acquire;
+    return getPyObj().attr("guard_or_false")(file, line).cast<bool>();
+  }
+
+  bool statically_known_true(const char* file, int64_t line) override {
+    py::gil_scoped_acquire acquire;
+    return getPyObj().attr("statically_known_true")(file, line).cast<bool>();
+  }
+
+  bool guard_or_true(const char* file, int64_t line) override {
+    py::gil_scoped_acquire acquire;
+    return getPyObj().attr("guard_or_true")(file, line).cast<bool>();
   }
 
   int64_t int_() override {
@@ -140,11 +161,11 @@ class PythonSymNodeImpl : public c10::SymNodeImpl {
     return getPyObj().attr("int_")().cast<int64_t>();
   }
 
-  c10::optional<int64_t> maybe_as_int() override {
+  std::optional<int64_t> maybe_as_int() override {
     py::gil_scoped_acquire acquire;
     const auto& r = getPyObj().attr("maybe_as_int")();
     if (r.is_none()) {
-      return c10::nullopt;
+      return std::nullopt;
     } else {
       return r.cast<int64_t>();
     }
@@ -153,6 +174,11 @@ class PythonSymNodeImpl : public c10::SymNodeImpl {
   std::string str() override {
     py::gil_scoped_acquire acquire;
     return getPyObj().attr("str")().cast<std::string>();
+  }
+
+  std::string _graph_repr() override {
+    py::gil_scoped_acquire acquire;
+    return getPyObj().attr("_graph_repr")().cast<std::string>();
   }
 
   c10::SymNode dispatch_sym_ite_(
@@ -198,11 +224,31 @@ class PythonSymNodeImpl : public c10::SymNodeImpl {
     return dispatch_common_(__func__, other);
   }
 
+  c10::SymNode float_truediv(const c10::SymNode& other) override {
+    return dispatch_common_(__func__, other);
+  }
+
+  c10::SymNode int_truediv(const c10::SymNode& other) override {
+    return dispatch_common_(__func__, other);
+  }
+
   c10::SymNode pow(const c10::SymNode& other) override {
     return dispatch_common_(__func__, other);
   }
 
+  c10::SymNode float_pow(const c10::SymNode& other) override {
+    return dispatch_common_(__func__, other);
+  }
+
+  c10::SymNode pow_by_natural(const c10::SymNode& other) override {
+    return dispatch_common_(__func__, other);
+  }
+
   c10::SymNode floordiv(const c10::SymNode& other) override {
+    return dispatch_common_(__func__, other);
+  }
+
+  c10::SymNode int_floordiv(const c10::SymNode& other) override {
     return dispatch_common_(__func__, other);
   }
 

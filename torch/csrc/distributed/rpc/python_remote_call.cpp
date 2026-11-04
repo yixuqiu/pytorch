@@ -2,9 +2,7 @@
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 #include <torch/csrc/jit/serialization/pickle.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 PythonRemoteCall::PythonRemoteCall(
     SerializedPyObj&& serializedPyObj,
@@ -34,7 +32,7 @@ c10::intrusive_ptr<Message> PythonRemoteCall::toMessageImpl() && {
 
 std::unique_ptr<PythonRemoteCall> PythonRemoteCall::fromMessage(
     const Message& message) {
-  auto payload = static_cast<const char*>(message.payload().data());
+  auto payload = message.payload().data();
   auto payload_size = message.payload().size();
 
   auto value = jit::unpickle(
@@ -64,6 +62,4 @@ std::unique_ptr<PythonRemoteCall> PythonRemoteCall::fromMessage(
       isAsyncExecution);
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

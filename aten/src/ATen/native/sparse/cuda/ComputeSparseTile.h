@@ -4,22 +4,14 @@
 #include <ATen/native/sparse/cuda/StaticSort.h>
 #include <cutlass/bfloat16.h>
 #include <cutlass/half.h>
+#include <cutlass/platform/platform.h>
+#include <cutlass/version.h>
 
 // Given 4x4 values, computes the selected indices that will remain after 2:4
 // sparsification, as a bitmask.
 // NOTE: Algorithms might select LESS than 8 values in total in some cases.
 
-namespace platform {
-template <>
-struct numeric_limits<cutlass::bfloat16_t> {
-  CUTLASS_HOST_DEVICE
-  static cutlass::bfloat16_t infinity() {
-    return cutlass::bfloat16_t::bitcast(0x7f80);
-  }
-};
-} // namespace platform
-
-namespace at::native{
+namespace at::native {
 
 template <typename Element, typename Pointwise>
 struct TileValueOrderedT {
@@ -68,7 +60,7 @@ template <typename Op = IdentityOp>
 struct LargestValuesGreedy {
   template <typename T>
   static CUTLASS_DEVICE T outOfBoundsFillValue() {
-    return -platform::numeric_limits<T>::infinity();
+    return -cutlass::platform::numeric_limits<T>::infinity();
   }
 
   template <typename Tile4x4Accessor>
@@ -84,8 +76,8 @@ struct LargestValuesGreedy {
       for (int j = 0; j < 4; ++j) {
         TileValueOrdered& v = values_ordered[i * 4 + j];
         v.parts.value = values.at(i, j).get();
-        v.parts.col = j;
-        v.parts.row = i;
+        v.parts.col = uint2b_t(j);
+        v.parts.row = uint2b_t(i);
       }
     }
     // Use a sorting network (aka without branches) to avoid
@@ -120,7 +112,7 @@ struct LargestValuesGreedy {
   }
 };
 
-// We consider each rows independantly in order
+// We consider each rows independently in order
 // This is to ensure that a row's sparsity pattern is only determined
 // by its values and the rows before (but never the rows after)
 // This enforces causality strictly
@@ -128,7 +120,7 @@ template <typename Op = IdentityOp>
 struct Causal1122 {
   template <typename T>
   static CUTLASS_DEVICE T outOfBoundsFillValue() {
-    return -platform::numeric_limits<T>::infinity();
+    return -cutlass::platform::numeric_limits<T>::infinity();
   }
 
   template <typename Tile4x4Accessor>
@@ -149,7 +141,7 @@ struct Causal1122 {
       for (int col = 0; col < 4; ++col) {
         TileValueOrdered& v = values_ordered[col];
         v.parts.value = values.at(row, col).get();
-        v.parts.col = col;
+        v.parts.col = uint2b_t(col);
       }
       // Use a sorting network (aka without branches) to avoid
       // warp divergence
@@ -181,4 +173,4 @@ void named_algorithms(T callback) {
   callback(LargestValuesGreedy<IdentityOp>(), "");
 }
 
-} // namespace
+} // namespace at::native

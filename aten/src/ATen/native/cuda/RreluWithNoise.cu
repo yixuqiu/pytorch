@@ -17,9 +17,7 @@
 namespace at::native {
 
 template <typename scalar_t, int unroll_factor, typename F>
-#if __CUDA_ARCH__ >= 350 || defined USE_ROCM
 C10_LAUNCH_BOUNDS_2(256, 4)
-#endif
 __global__ void rrelu_with_noise_cuda_kernel(
     int numel,
     PhiloxCudaState philox_args,
@@ -45,7 +43,7 @@ __global__ void rrelu_with_noise_cuda_kernel(
     auto rand = random_func(&state);
 
     // ensure that (&rand.x)[ii] is safe
-    static_assert(sizeof(rand)/sizeof(rand.x) == unroll_factor, "");
+    static_assert(sizeof(rand)/sizeof(rand.x) == unroll_factor);
 
     #pragma unroll
     for (int ii = 0; ii < unroll_factor; ii++) {
@@ -71,20 +69,17 @@ template <typename scalar_t>
 inline void _rrelu_with_noise_cuda_train(
     Tensor& output,
     const Tensor& input_,
-    const Tensor& noise_,
+    Tensor& noise_,
     const Scalar& lower_,
     const Scalar& upper_,
-    c10::optional<Generator> generator) {
+    std::optional<Generator> generator) {
   auto input = input_.contiguous();
-  auto noise = noise_.contiguous();
   Tensor tmp_output = output.contiguous();
+  Tensor tmp_noise = noise_.contiguous();
 
   int64_t numel = input.numel();
-  auto execution_policy = calc_execution_policy(numel);
-
-  auto counter_offset = std::get<0>(execution_policy);
-  auto grid = std::get<1>(execution_policy);
-  auto block = std::get<2>(execution_policy);
+  const int unroll_factor = std::is_same_v<scalar_t, double> ? 2 : 4;
+  auto [counter_offset, grid, block] = calc_execution_policy(numel, unroll_factor);
 
   auto gen = get_generator_or_default<CUDAGeneratorImpl>(
       generator, cuda::detail::getDefaultCUDAGenerator());
@@ -96,7 +91,7 @@ inline void _rrelu_with_noise_cuda_train(
   }
 
   const scalar_t* input_data = input.const_data_ptr<scalar_t>();
-  scalar_t* noise_data = noise.mutable_data_ptr<scalar_t>();
+  scalar_t* noise_data = tmp_noise.mutable_data_ptr<scalar_t>();
   scalar_t* output_data = tmp_output.mutable_data_ptr<scalar_t>();
 
   double lower = lower_.to<double>();
@@ -104,7 +99,7 @@ inline void _rrelu_with_noise_cuda_train(
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  if (std::is_same<scalar_t, double>::value) {
+  if (std::is_same_v<scalar_t, double>) {
     rrelu_with_noise_cuda_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(
         numel,
         rng_engine_inputs,
@@ -135,14 +130,17 @@ inline void _rrelu_with_noise_cuda_train(
   if (!output.is_contiguous()) {
     output.copy_(tmp_output);
   }
+  if (!noise_.is_contiguous()) {
+    noise_.copy_(tmp_noise);
+  }
 }
 
 Tensor& rrelu_with_noise_out_cuda(const Tensor& self,
-    const Tensor& noise,
+    Tensor& noise,
     const Scalar& lower,
     const Scalar& upper,
     bool training,
-    c10::optional<Generator> generator,
+    std::optional<Generator> generator,
     Tensor& output) {
   at::native::resize_output(output, self.sizes());
 
@@ -172,22 +170,22 @@ Tensor& rrelu_with_noise_out_cuda(const Tensor& self,
 
 Tensor rrelu_with_noise_cuda(
     const Tensor& self,
-    const Tensor& noise,
+    Tensor& noise,
     const Scalar& lower,
     const Scalar& upper,
     bool training,
-    c10::optional<Generator> generator) {
+    std::optional<Generator> generator) {
   Tensor output = at::empty_like(self, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   return at::native::rrelu_with_noise_out_cuda(self, noise, lower, upper, training, generator, output);
 }
 
 Tensor& rrelu_with_noise_cuda_(
     Tensor& self,
-    const Tensor& noise,
+    Tensor& noise,
     const Scalar& lower,
     const Scalar& upper,
     bool training,
-    c10::optional<Generator> generator) {
+    std::optional<Generator> generator) {
   return at::native::rrelu_with_noise_out_cuda(
       self, noise, lower, upper, training, generator, self);
 }

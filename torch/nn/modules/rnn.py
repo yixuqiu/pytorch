@@ -1,22 +1,35 @@
+# mypy: allow-untyped-decorators
+# mypy: allow-untyped-defs
 import math
-import warnings
 import numbers
+import warnings
 import weakref
-from typing import List, Tuple, Optional, overload
+from typing import overload
+from typing_extensions import deprecated
 
 import torch
-from torch import Tensor
-from .module import Module
-from ..parameter import Parameter
-from ..utils.rnn import PackedSequence
-from .. import init
-from ... import _VF
+from torch import _VF, Tensor
+from torch.nn import init
+from torch.nn.parameter import Parameter
+from torch.nn.utils.rnn import PackedSequence
 
-__all__ = ['RNNBase', 'RNN', 'LSTM', 'GRU', 'RNNCellBase', 'RNNCell', 'LSTMCell', 'GRUCell']
+from .module import Module
+
+
+__all__ = [
+    "RNNBase",
+    "RNN",
+    "LSTM",
+    "GRU",
+    "RNNCellBase",
+    "RNNCell",
+    "LSTMCell",
+    "GRUCell",
+]
 
 _rnn_impls = {
-    'RNN_TANH': _VF.rnn_tanh,
-    'RNN_RELU': _VF.rnn_relu,
+    "RNN_TANH": _VF.rnn_tanh,
+    "RNN_RELU": _VF.rnn_relu,
 }
 
 
@@ -24,8 +37,11 @@ def _apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Ten
     return tensor.index_select(dim, permutation)
 
 
+@deprecated(
+    "`apply_permutation` is deprecated, please use `tensor.index_select(dim, permutation)` instead",
+    category=FutureWarning,
+)
 def apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tensor:
-    warnings.warn("apply_permutation is deprecated, please use tensor.index_select(dim, permutation) instead")
     return _apply_permutation(tensor, permutation, dim)
 
 
@@ -42,9 +58,18 @@ class RNNBase(Module):
         LSTM and GRU classes override some methods implemented by RNNBase.
     """
 
-    __constants__ = ['mode', 'input_size', 'hidden_size', 'num_layers', 'bias',
-                     'batch_first', 'dropout', 'bidirectional', 'proj_size']
-    __jit_unused_properties__ = ['all_weights']
+    __constants__ = [
+        "mode",
+        "input_size",
+        "hidden_size",
+        "num_layers",
+        "bias",
+        "batch_first",
+        "dropout",
+        "bidirectional",
+        "proj_size",
+    ]
+    __jit_unused_properties__ = ["all_weights"]
 
     mode: str
     input_size: int
@@ -56,11 +81,21 @@ class RNNBase(Module):
     bidirectional: bool
     proj_size: int
 
-    def __init__(self, mode: str, input_size: int, hidden_size: int,
-                 num_layers: int = 1, bias: bool = True, batch_first: bool = False,
-                 dropout: float = 0., bidirectional: bool = False, proj_size: int = 0,
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        mode: str,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = False,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+        proj_size: int = 0,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.mode = mode
         self.input_size = input_size
@@ -71,38 +106,62 @@ class RNNBase(Module):
         self.dropout = float(dropout)
         self.bidirectional = bidirectional
         self.proj_size = proj_size
-        self._flat_weight_refs: List[Optional[weakref.ReferenceType[Parameter]]] = []
+        self._flat_weight_refs: list[weakref.ReferenceType[Parameter] | None] = []
         num_directions = 2 if bidirectional else 1
 
-        if not isinstance(dropout, numbers.Number) or not 0 <= dropout <= 1 or \
-                isinstance(dropout, bool):
-            raise ValueError("dropout should be a number in range [0, 1] "
-                             "representing the probability of an element being "
-                             "zeroed")
+        if (
+            not isinstance(dropout, numbers.Number)
+            or not 0 <= dropout <= 1
+            or isinstance(dropout, bool)
+        ):
+            raise ValueError(
+                "dropout should be a number in range [0, 1] "
+                "representing the probability of an element being "
+                "zeroed"
+            )
         if dropout > 0 and num_layers == 1:
-            warnings.warn("dropout option adds dropout after all but last "
-                          "recurrent layer, so non-zero dropout expects "
-                          f"num_layers greater than 1, but got dropout={dropout} and "
-                          f"num_layers={num_layers}")
+            warnings.warn(
+                "dropout option adds dropout after all but last "
+                "recurrent layer, so non-zero dropout expects "
+                f"num_layers greater than 1, but got dropout={dropout} and "
+                f"num_layers={num_layers}",
+                stacklevel=2,
+            )
 
+        if not isinstance(bias, bool):
+            raise TypeError(f"bias should be of type bool, got: {type(bias).__name__}")
+        if not isinstance(batch_first, bool):
+            raise TypeError(
+                f"batch_first should be of type bool, got: {type(batch_first).__name__}"
+            )
+        if not isinstance(input_size, int):
+            raise TypeError(
+                f"input_size should be of type int, got: {type(input_size).__name__}"
+            )
+        if input_size <= 0:
+            raise ValueError("input_size must be greater than zero")
         if not isinstance(hidden_size, int):
-            raise TypeError(f"hidden_size should be of type int, got: {type(hidden_size).__name__}")
+            raise TypeError(
+                f"hidden_size should be of type int, got: {type(hidden_size).__name__}"
+            )
         if hidden_size <= 0:
             raise ValueError("hidden_size must be greater than zero")
         if num_layers <= 0:
             raise ValueError("num_layers must be greater than zero")
         if proj_size < 0:
-            raise ValueError("proj_size should be a positive integer or zero to disable projections")
+            raise ValueError(
+                "proj_size should be a positive integer or zero to disable projections"
+            )
         if proj_size >= hidden_size:
             raise ValueError("proj_size has to be smaller than hidden_size")
 
-        if mode == 'LSTM':
+        if mode == "LSTM":
             gate_size = 4 * hidden_size
-        elif mode == 'GRU':
+        elif mode == "GRU":
             gate_size = 3 * hidden_size
-        elif mode == 'RNN_TANH':
+        elif mode == "RNN_TANH":
             gate_size = hidden_size
-        elif mode == 'RNN_RELU':
+        elif mode == "RNN_RELU":
             gate_size = hidden_size
         else:
             raise ValueError("Unrecognized RNN mode: " + mode)
@@ -112,36 +171,44 @@ class RNNBase(Module):
         for layer in range(num_layers):
             for direction in range(num_directions):
                 real_hidden_size = proj_size if proj_size > 0 else hidden_size
-                layer_input_size = input_size if layer == 0 else real_hidden_size * num_directions
+                layer_input_size = (
+                    input_size if layer == 0 else real_hidden_size * num_directions
+                )
 
-                w_ih = Parameter(torch.empty((gate_size, layer_input_size), **factory_kwargs))
-                w_hh = Parameter(torch.empty((gate_size, real_hidden_size), **factory_kwargs))
+                w_ih = Parameter(
+                    torch.empty((gate_size, layer_input_size), **factory_kwargs)
+                )
+                w_hh = Parameter(
+                    torch.empty((gate_size, real_hidden_size), **factory_kwargs)
+                )
                 b_ih = Parameter(torch.empty(gate_size, **factory_kwargs))
                 # Second bias vector included for CuDNN compatibility. Only one
                 # bias vector is needed in standard definition.
                 b_hh = Parameter(torch.empty(gate_size, **factory_kwargs))
-                layer_params: Tuple[Tensor, ...] = ()
+                layer_params: tuple[Tensor, ...] = ()
                 if self.proj_size == 0:
                     if bias:
                         layer_params = (w_ih, w_hh, b_ih, b_hh)
                     else:
                         layer_params = (w_ih, w_hh)
                 else:
-                    w_hr = Parameter(torch.empty((proj_size, hidden_size), **factory_kwargs))
+                    w_hr = Parameter(
+                        torch.empty((proj_size, hidden_size), **factory_kwargs)
+                    )
                     if bias:
                         layer_params = (w_ih, w_hh, b_ih, b_hh, w_hr)
                     else:
                         layer_params = (w_ih, w_hh, w_hr)
 
-                suffix = '_reverse' if direction == 1 else ''
-                param_names = ['weight_ih_l{}{}', 'weight_hh_l{}{}']
+                suffix = "_reverse" if direction == 1 else ""
+                param_names = ["weight_ih_l{}{}", "weight_hh_l{}{}"]
                 if bias:
-                    param_names += ['bias_ih_l{}{}', 'bias_hh_l{}{}']
+                    param_names += ["bias_ih_l{}{}", "bias_hh_l{}{}"]
                 if self.proj_size > 0:
-                    param_names += ['weight_hr_l{}{}']
+                    param_names += ["weight_hr_l{}{}"]
                 param_names = [x.format(layer, suffix) for x in param_names]
 
-                for name, param in zip(param_names, layer_params):
+                for name, param in zip(param_names, layer_params, strict=True):
                     setattr(self, name, param)
                 self._flat_weights_names.extend(param_names)
                 self._all_weights.append(param_names)
@@ -150,14 +217,17 @@ class RNNBase(Module):
 
         self.reset_parameters()
 
-    def _init_flat_weights(self):
-        self._flat_weights = [getattr(self, wn) if hasattr(self, wn) else None
-                              for wn in self._flat_weights_names]
-        self._flat_weight_refs = [weakref.ref(w) if w is not None else None
-                                  for w in self._flat_weights]
+    def _init_flat_weights(self) -> None:
+        self._flat_weights = [
+            getattr(self, wn) if hasattr(self, wn) else None
+            for wn in self._flat_weights_names
+        ]
+        self._flat_weight_refs = [
+            weakref.ref(w) if w is not None else None for w in self._flat_weights
+        ]
         self.flatten_parameters()
 
-    def __setattr__(self, attr, value):
+    def __setattr__(self, attr, value) -> None:
         if hasattr(self, "_flat_weights_names") and attr in self._flat_weights_names:
             # keep self._flat_weights up to date if you do self.weight = ...
             idx = self._flat_weights_names.index(attr)
@@ -180,12 +250,14 @@ class RNNBase(Module):
         # Short-circuits if any tensor in self._flat_weights is not acceptable to cuDNN
         # or the tensors in _flat_weights are of different dtypes
 
-        first_fw = self._flat_weights[0]
-        dtype = first_fw.dtype
+        first_fw = self._flat_weights[0]  # type: ignore[union-attr]
+        dtype = first_fw.dtype  # type: ignore[union-attr]
         for fw in self._flat_weights:
             if (
-                not isinstance(fw, Tensor) or not (fw.dtype == dtype) or
-                not fw.is_cuda or not torch.backends.cudnn.is_acceptable(fw)
+                not isinstance(fw, Tensor)
+                or fw.dtype != dtype
+                or not fw.is_cuda
+                or not torch.backends.cudnn.is_acceptable(fw)
             ):
                 return
 
@@ -193,7 +265,10 @@ class RNNBase(Module):
         # a sufficient check, because overlapping parameter buffers that don't completely
         # alias would break the assumptions of the uniqueness check in
         # Module.named_parameters().
-        unique_data_ptrs = {p.data_ptr() for p in self._flat_weights}
+        unique_data_ptrs = {
+            p.data_ptr()  # type: ignore[union-attr]
+            for p in self._flat_weights
+        }
         if len(unique_data_ptrs) != len(self._flat_weights):
             return
 
@@ -208,10 +283,16 @@ class RNNBase(Module):
                     if self.proj_size > 0:
                         num_weights += 1
                     torch._cudnn_rnn_flatten_weight(
-                        self._flat_weights, num_weights,
-                        self.input_size, rnn.get_cudnn_mode(self.mode),
-                        self.hidden_size, self.proj_size, self.num_layers,
-                        self.batch_first, bool(self.bidirectional))
+                        self._flat_weights,  # type: ignore[arg-type]
+                        num_weights,
+                        self.input_size,
+                        rnn.get_cudnn_mode(self.mode),
+                        self.hidden_size,
+                        self.proj_size,
+                        self.num_layers,
+                        self.batch_first,
+                        bool(self.bidirectional),
+                    )
 
     def _apply(self, fn, recurse=True):
         self._flat_weight_refs = []
@@ -229,34 +310,54 @@ class RNNBase(Module):
         for weight in self.parameters():
             init.uniform_(weight, -stdv, stdv)
 
-    def check_input(self, input: Tensor, batch_sizes: Optional[Tensor]) -> None:
+    def check_input(self, input: Tensor, batch_sizes: Tensor | None) -> None:
         if not torch.jit.is_scripting():
-            if input.dtype != self._flat_weights[0].dtype and not torch._C._is_any_autocast_enabled():
-                raise ValueError(f'input must have the type {self._flat_weights[0].dtype}, got type {input.dtype}')
+            if (
+                input.dtype != self._flat_weights[0].dtype  # type: ignore[union-attr]
+                and not torch._C._is_any_autocast_enabled()
+            ):
+                raise ValueError(
+                    f"RNN input dtype ({input.dtype}) does not match weight dtype ({self._flat_weights[0].dtype}). "  # type: ignore[union-attr]
+                    f"Convert input: input.to({self._flat_weights[0].dtype}), or convert model: model.to({input.dtype})"  # type: ignore[union-attr]
+                )
         expected_input_dim = 2 if batch_sizes is not None else 3
         if input.dim() != expected_input_dim:
             raise RuntimeError(
-                f'input must have {expected_input_dim} dimensions, got {input.dim()}')
+                f"input must have {expected_input_dim} dimensions, got {input.dim()}"
+            )
         if self.input_size != input.size(-1):
             raise RuntimeError(
-                f'input.size(-1) must be equal to input_size. Expected {self.input_size}, got {input.size(-1)}')
+                f"input.size(-1) must be equal to input_size. Expected {self.input_size}, got {input.size(-1)}"
+            )
 
-    def get_expected_hidden_size(self, input: Tensor, batch_sizes: Optional[Tensor]) -> Tuple[int, int, int]:
+    def get_expected_hidden_size(
+        self, input: Tensor, batch_sizes: Tensor | None
+    ) -> tuple[int, int, int]:
         if batch_sizes is not None:
             mini_batch = int(batch_sizes[0])
         else:
             mini_batch = input.size(0) if self.batch_first else input.size(1)
         num_directions = 2 if self.bidirectional else 1
         if self.proj_size > 0:
-            expected_hidden_size = (self.num_layers * num_directions,
-                                    mini_batch, self.proj_size)
+            expected_hidden_size = (
+                self.num_layers * num_directions,
+                mini_batch,
+                self.proj_size,
+            )
         else:
-            expected_hidden_size = (self.num_layers * num_directions,
-                                    mini_batch, self.hidden_size)
+            expected_hidden_size = (
+                self.num_layers * num_directions,
+                mini_batch,
+                self.hidden_size,
+            )
         return expected_hidden_size
 
-    def check_hidden_size(self, hx: Tensor, expected_hidden_size: Tuple[int, int, int],
-                          msg: str = 'Expected hidden size {}, got {}') -> None:
+    def check_hidden_size(
+        self,
+        hx: Tensor,
+        expected_hidden_size: tuple[int, int, int],
+        msg: str = "Expected hidden size {}, got {}",
+    ) -> None:
         if hx.size() != expected_hidden_size:
             raise RuntimeError(msg.format(expected_hidden_size, list(hx.size())))
 
@@ -264,42 +365,45 @@ class RNNBase(Module):
         # Returns True if the weight tensors have changed since the last forward pass.
         # This is the case when used with torch.func.functional_call(), for example.
         weights_changed = False
-        for ref, name in zip(self._flat_weight_refs, self._flat_weights_names):
+        for ref, name in zip(
+            self._flat_weight_refs, self._flat_weights_names, strict=True
+        ):
             weight = getattr(self, name) if hasattr(self, name) else None
             if weight is not None and ref is not None and ref() is not weight:
                 weights_changed = True
                 break
         return weights_changed
 
-    def check_forward_args(self, input: Tensor, hidden: Tensor, batch_sizes: Optional[Tensor]):
+    def check_forward_args(
+        self, input: Tensor, hidden: Tensor, batch_sizes: Tensor | None
+    ) -> None:
         self.check_input(input, batch_sizes)
         expected_hidden_size = self.get_expected_hidden_size(input, batch_sizes)
 
         self.check_hidden_size(hidden, expected_hidden_size)
 
-    def permute_hidden(self, hx: Tensor, permutation: Optional[Tensor]):
+    def permute_hidden(self, hx: Tensor, permutation: Tensor | None):
         if permutation is None:
             return hx
         return _apply_permutation(hx, permutation)
 
-
     def extra_repr(self) -> str:
-        s = '{input_size}, {hidden_size}'
+        s = "{input_size}, {hidden_size}"
         if self.proj_size != 0:
-            s += ', proj_size={proj_size}'
+            s += ", proj_size={proj_size}"
         if self.num_layers != 1:
-            s += ', num_layers={num_layers}'
+            s += ", num_layers={num_layers}"
         if self.bias is not True:
-            s += ', bias={bias}'
+            s += ", bias={bias}"
         if self.batch_first is not False:
-            s += ', batch_first={batch_first}'
+            s += ", batch_first={batch_first}"
         if self.dropout != 0:
-            s += ', dropout={dropout}'
+            s += ", dropout={dropout}"
         if self.bidirectional is not False:
-            s += ', bidirectional={bidirectional}'
+            s += ", bidirectional={bidirectional}"
         return s.format(**self.__dict__)
 
-    def _update_flat_weights(self):
+    def _update_flat_weights(self) -> None:
         if not torch.jit.is_scripting():
             if self._weights_have_changed():
                 self._init_flat_weights()
@@ -309,17 +413,17 @@ class RNNBase(Module):
         self._update_flat_weights()
         # Don't serialize the weight references.
         state = self.__dict__.copy()
-        del state['_flat_weight_refs']
+        del state["_flat_weight_refs"]
         return state
 
     def __setstate__(self, d):
         super().__setstate__(d)
-        if 'all_weights' in d:
-            self._all_weights = d['all_weights']
+        if "all_weights" in d:
+            self._all_weights = d["all_weights"]
         # In PyTorch 1.8 we added a proj_size member variable to LSTM.
         # LSTMs that were serialized via torch.save(module) before PyTorch 1.8
         # don't have it, so to preserve compatibility we set proj_size here.
-        if 'proj_size' not in d:
+        if "proj_size" not in d:
             self.proj_size = 0
 
         if not isinstance(self._all_weights[0][0], str):
@@ -329,9 +433,14 @@ class RNNBase(Module):
             self._all_weights = []
             for layer in range(num_layers):
                 for direction in range(num_directions):
-                    suffix = '_reverse' if direction == 1 else ''
-                    weights = ['weight_ih_l{}{}', 'weight_hh_l{}{}', 'bias_ih_l{}{}',
-                               'bias_hh_l{}{}', 'weight_hr_l{}{}']
+                    suffix = "_reverse" if direction == 1 else ""
+                    weights = [
+                        "weight_ih_l{}{}",
+                        "weight_hh_l{}{}",
+                        "bias_ih_l{}{}",
+                        "bias_hh_l{}{}",
+                        "weight_hr_l{}{}",
+                    ]
                     weights = [x.format(layer, suffix) for x in weights]
                     if self.bias:
                         if self.proj_size > 0:
@@ -343,19 +452,27 @@ class RNNBase(Module):
                     else:
                         if self.proj_size > 0:
                             self._all_weights += [weights[:2]] + [weights[-1:]]
-                            self._flat_weights_names.extend(weights[:2] + [weights[-1:]])
+                            self._flat_weights_names.extend(
+                                weights[:2] + [weights[-1:]]
+                            )
                         else:
                             self._all_weights += [weights[:2]]
                             self._flat_weights_names.extend(weights[:2])
-            self._flat_weights = [getattr(self, wn) if hasattr(self, wn) else None
-                                  for wn in self._flat_weights_names]
+            self._flat_weights = [
+                getattr(self, wn) if hasattr(self, wn) else None
+                for wn in self._flat_weights_names
+            ]
 
-        self._flat_weight_refs = [weakref.ref(w) if w is not None else None
-                                  for w in self._flat_weights]
+        self._flat_weight_refs = [
+            weakref.ref(w) if w is not None else None for w in self._flat_weights
+        ]
 
     @property
-    def all_weights(self) -> List[List[Parameter]]:
-        return [[getattr(self, weight) for weight in weights] for weights in self._all_weights]
+    def all_weights(self) -> list[list[Parameter]]:
+        return [
+            [getattr(self, weight) for weight in weights]
+            for weights in self._all_weights
+        ]
 
     def _replicate_for_data_parallel(self):
         replica = super()._replicate_for_data_parallel()
@@ -384,26 +501,30 @@ class RNN(RNNBase):
     .. code-block:: python
 
         # Efficient implementation equivalent to the following with bidirectional=False
-        def forward(x, h_0=None):
+        rnn = nn.RNN(input_size, hidden_size, num_layers)
+        params = dict(rnn.named_parameters())
+        def forward(x, hx=None, batch_first=False):
             if batch_first:
                 x = x.transpose(0, 1)
             seq_len, batch_size, _ = x.size()
-            if h_0 is None:
-                h_0 = torch.zeros(num_layers, batch_size, hidden_size)
-            h_t_minus_1 = h_0
-            h_t = h_0
+            if hx is None:
+                hx = torch.zeros(rnn.num_layers, batch_size, rnn.hidden_size)
+            h_t_minus_1 = hx
             output = []
             for t in range(seq_len):
-                for layer in range(num_layers):
-                    h_t[layer] = torch.tanh(
-                        x[t] @ weight_ih[layer].T
-                        + bias_ih[layer]
-                        + h_t_minus_1[layer] @ weight_hh[layer].T
-                        + bias_hh[layer]
-                    )
+                h_t = []
+                for layer in range(rnn.num_layers):
+                    input_t = x[t] if layer == 0 else h_t[layer - 1]
+                    h_t.append(torch.tanh(
+                        input_t @ params[f"weight_ih_l{layer}"].T
+                        + h_t_minus_1[layer] @ params[f"weight_hh_l{layer}"].T
+                        + params[f"bias_hh_l{layer}"]
+                        + params[f"bias_ih_l{layer}"]
+                    ))
                 output.append(h_t[-1])
                 h_t_minus_1 = h_t
             output = torch.stack(output)
+            h_t = torch.stack(h_t)
             if batch_first:
                 output = output.transpose(0, 1)
             return output, h_t
@@ -427,14 +548,14 @@ class RNN(RNNBase):
             :attr:`dropout`. Default: 0
         bidirectional: If ``True``, becomes a bidirectional RNN. Default: ``False``
 
-    Inputs: input, h_0
+    Inputs: input, hx
         * **input**: tensor of shape :math:`(L, H_{in})` for unbatched input,
           :math:`(L, N, H_{in})` when ``batch_first=False`` or
           :math:`(N, L, H_{in})` when ``batch_first=True`` containing the features of
           the input sequence.  The input can also be a packed variable length sequence.
           See :func:`torch.nn.utils.rnn.pack_padded_sequence` or
           :func:`torch.nn.utils.rnn.pack_sequence` for details.
-        * **h_0**: tensor of shape :math:`(D * \text{num\_layers}, H_{out})` for unbatched input or
+        * **hx**: tensor of shape :math:`(D * \text{num\_layers}, H_{out})` for unbatched input or
           :math:`(D * \text{num\_layers}, N, H_{out})` containing the initial hidden
           state for the input sequence batch. Defaults to zeros if not provided.
 
@@ -483,7 +604,8 @@ class RNN(RNNBase):
     .. note::
         ``batch_first`` argument is ignored for unbatched inputs.
 
-    .. include:: ../cudnn_rnn_determinism.rst
+    .. include:: ../cudnn_rnn_determinism.md
+        :parser: myst_parser.sphinx_
 
     .. include:: ../cudnn_persistent_rnn.rst
 
@@ -496,43 +618,65 @@ class RNN(RNNBase):
     """
 
     @overload
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1,
-                 nonlinearity: str = 'tanh', bias: bool = True, batch_first: bool = False,
-                 dropout: float = 0., bidirectional: bool = False, device=None,
-                 dtype=None) -> None:
-        ...
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        nonlinearity: str = "tanh",
+        bias: bool = True,
+        batch_first: bool = False,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None: ...
 
     @overload
-    def __init__(self, *args, **kwargs):
-        ...
+    def __init__(self, *args, **kwargs) -> None: ...
 
     def __init__(self, *args, **kwargs):
-        if 'proj_size' in kwargs:
-            raise ValueError("proj_size argument is only supported for LSTM, not RNN or GRU")
+        if "proj_size" in kwargs:
+            raise ValueError(
+                "proj_size argument is only supported for LSTM, not RNN or GRU"
+            )
         if len(args) > 3:
             self.nonlinearity = args[3]
             args = args[:3] + args[4:]
         else:
-            self.nonlinearity = kwargs.pop('nonlinearity', 'tanh')
-        if self.nonlinearity == 'tanh':
-            mode = 'RNN_TANH'
-        elif self.nonlinearity == 'relu':
-            mode = 'RNN_RELU'
+            self.nonlinearity = kwargs.pop("nonlinearity", "tanh")
+        if self.nonlinearity == "tanh":
+            mode = "RNN_TANH"
+        elif self.nonlinearity == "relu":
+            mode = "RNN_RELU"
         else:
-            raise ValueError(f"Unknown nonlinearity '{self.nonlinearity}'. Select from 'tanh' or 'relu'.")
+            raise ValueError(
+                f"Unknown nonlinearity '{self.nonlinearity}'. Select from 'tanh' or 'relu'."
+            )
         super().__init__(mode, *args, **kwargs)
 
     @overload
-    @torch._jit_internal._overload_method  # noqa: F811
-    def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    @torch._jit_internal._overload_method
+    def forward(
+        self,
+        input: Tensor,
+        hx: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         pass
 
     @overload
-    @torch._jit_internal._overload_method  # noqa: F811
-    def forward(self, input: PackedSequence, hx: Optional[Tensor] = None) -> Tuple[PackedSequence, Tensor]:
+    @torch._jit_internal._overload_method
+    def forward(
+        self,
+        input: PackedSequence,
+        hx: Tensor | None = None,
+    ) -> tuple[PackedSequence, Tensor]:
         pass
 
-    def forward(self, input, hx=None):  # noqa: F811
+    def forward(self, input, hx=None):
+        """
+        Runs the forward pass.
+        """
         self._update_flat_weights()
 
         num_directions = 2 if self.bidirectional else 1
@@ -543,9 +687,13 @@ class RNN(RNNBase):
             max_batch_size = batch_sizes[0]
             # script() is unhappy when max_batch_size is different type in cond branches, so we duplicate
             if hx is None:
-                hx = torch.zeros(self.num_layers * num_directions,
-                                 max_batch_size, self.hidden_size,
-                                 dtype=input.dtype, device=input.device)
+                hx = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    self.hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
             else:
                 # Each batch of the hidden state should match the input sequence that
                 # the user believes he/she is passing in.
@@ -553,7 +701,9 @@ class RNN(RNNBase):
         else:
             batch_sizes = None
             if input.dim() not in (2, 3):
-                raise ValueError(f"RNN: Expected input to be 2D or 3D, got {input.dim()}D tensor instead")
+                raise ValueError(
+                    f"RNN: Expected input to be 2D or 3D, got {input.dim()}D tensor instead"
+                )
             is_batched = input.dim() == 3
             batch_dim = 0 if self.batch_first else 1
             if not is_batched:
@@ -561,51 +711,100 @@ class RNN(RNNBase):
                 if hx is not None:
                     if hx.dim() != 2:
                         raise RuntimeError(
-                            f"For unbatched 2-D input, hx should also be 2-D but got {hx.dim()}-D tensor")
+                            f"For unbatched 2-D input, hx should also be 2-D but got {hx.dim()}-D tensor"
+                        )
                     hx = hx.unsqueeze(1)
             else:
                 if hx is not None and hx.dim() != 3:
                     raise RuntimeError(
-                        f"For batched 3-D input, hx should also be 3-D but got {hx.dim()}-D tensor")
+                        f"For batched 3-D input, hx should also be 3-D but got {hx.dim()}-D tensor"
+                    )
             max_batch_size = input.size(0) if self.batch_first else input.size(1)
             sorted_indices = None
             unsorted_indices = None
             if hx is None:
-                hx = torch.zeros(self.num_layers * num_directions,
-                                 max_batch_size, self.hidden_size,
-                                 dtype=input.dtype, device=input.device)
+                hx = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    self.hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
             else:
                 # Each batch of the hidden state should match the input sequence that
                 # the user believes he/she is passing in.
                 hx = self.permute_hidden(hx, sorted_indices)
 
-        assert hx is not None
+        if hx is None:
+            raise AssertionError("hx must not be None")
         self.check_forward_args(input, hx, batch_sizes)
-        assert self.mode == 'RNN_TANH' or self.mode == 'RNN_RELU'
+        if self.mode != "RNN_TANH" and self.mode != "RNN_RELU":
+            raise AssertionError(f"mode must be RNN_TANH or RNN_RELU, got {self.mode}")
         if batch_sizes is None:
-            if self.mode == 'RNN_TANH':
-                result = _VF.rnn_tanh(input, hx, self._flat_weights, self.bias, self.num_layers,
-                                      self.dropout, self.training, self.bidirectional,
-                                      self.batch_first)
+            if self.mode == "RNN_TANH":
+                # pyrefly: ignore [no-matching-overload]
+                result = _VF.rnn_tanh(
+                    input,
+                    hx,
+                    self._flat_weights,  # type: ignore[arg-type]
+                    self.bias,
+                    self.num_layers,
+                    self.dropout,
+                    self.training,
+                    self.bidirectional,
+                    self.batch_first,
+                )
             else:
-                result = _VF.rnn_relu(input, hx, self._flat_weights, self.bias, self.num_layers,
-                                      self.dropout, self.training, self.bidirectional,
-                                      self.batch_first)
+                # pyrefly: ignore [no-matching-overload]
+                result = _VF.rnn_relu(
+                    input,
+                    hx,
+                    self._flat_weights,  # type: ignore[arg-type]
+                    self.bias,
+                    self.num_layers,
+                    self.dropout,
+                    self.training,
+                    self.bidirectional,
+                    self.batch_first,
+                )
         else:
-            if self.mode == 'RNN_TANH':
-                result = _VF.rnn_tanh(input, batch_sizes, hx, self._flat_weights, self.bias,
-                                      self.num_layers, self.dropout, self.training,
-                                      self.bidirectional)
+            if self.mode == "RNN_TANH":
+                # pyrefly: ignore [no-matching-overload]
+                result = _VF.rnn_tanh(
+                    input,
+                    batch_sizes,
+                    hx,
+                    self._flat_weights,  # type: ignore[arg-type]
+                    self.bias,
+                    self.num_layers,
+                    self.dropout,
+                    self.training,
+                    self.bidirectional,
+                )
             else:
-                result = _VF.rnn_relu(input, batch_sizes, hx, self._flat_weights, self.bias,
-                                      self.num_layers, self.dropout, self.training,
-                                      self.bidirectional)
+                # pyrefly: ignore [no-matching-overload]
+                result = _VF.rnn_relu(
+                    input,
+                    batch_sizes,
+                    hx,
+                    self._flat_weights,  # type: ignore[arg-type]
+                    self.bias,
+                    self.num_layers,
+                    self.dropout,
+                    self.training,
+                    self.bidirectional,
+                )
 
         output = result[0]
         hidden = result[1]
 
         if isinstance(orig_input, PackedSequence):
-            output_packed = PackedSequence(output, batch_sizes, sorted_indices, unsorted_indices)
+            output_packed = PackedSequence(
+                output,
+                batch_sizes,
+                sorted_indices,
+                unsorted_indices,
+            )
             return output_packed, self.permute_hidden(hidden, unsorted_indices)
 
         if not is_batched:  # type: ignore[possibly-undefined]
@@ -613,6 +812,7 @@ class RNN(RNNBase):
             hidden = hidden.squeeze(1)
 
         return output, self.permute_hidden(hidden, unsorted_indices)
+
 
 # XXX: LSTM and GRU implementation is different from RNNBase, this is because:
 # 1. we want to support nn.LSTM and nn.GRU in TorchScript and TorchScript in
@@ -625,7 +825,7 @@ class RNN(RNNBase):
 # More discussion details in https://github.com/pytorch/pytorch/pull/23266
 #
 # TODO: remove the overriding implementations for LSTM and GRU when TorchScript
-# support expressing these two modules generally.
+# supports expressing these two modules generally.
 
 
 class LSTM(RNNBase):
@@ -776,7 +976,8 @@ class LSTM(RNNBase):
     .. note::
         ``proj_size`` should be smaller than ``hidden_size``.
 
-    .. include:: ../cudnn_rnn_determinism.rst
+    .. include:: ../cudnn_rnn_determinism.md
+        :parser: myst_parser.sphinx_
 
     .. include:: ../cudnn_persistent_rnn.rst
 
@@ -790,83 +991,120 @@ class LSTM(RNNBase):
     """
 
     @overload
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True,
-                 batch_first: bool = False, dropout: float = 0., bidirectional: bool = False,
-                 proj_size: int = 0, device=None, dtype=None) -> None:
-        ...
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = False,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+        proj_size: int = 0,
+        device=None,
+        dtype=None,
+    ) -> None: ...
 
     @overload
-    def __init__(self, *args, **kwargs):
-        ...
+    def __init__(self, *args, **kwargs) -> None: ...
 
     def __init__(self, *args, **kwargs):
-        super().__init__('LSTM', *args, **kwargs)
+        super().__init__("LSTM", *args, **kwargs)
 
-    def get_expected_cell_size(self, input: Tensor, batch_sizes: Optional[Tensor]) -> Tuple[int, int, int]:
+    def get_expected_cell_size(
+        self, input: Tensor, batch_sizes: Tensor | None
+    ) -> tuple[int, int, int]:
         if batch_sizes is not None:
             mini_batch = int(batch_sizes[0])
         else:
             mini_batch = input.size(0) if self.batch_first else input.size(1)
         num_directions = 2 if self.bidirectional else 1
-        expected_hidden_size = (self.num_layers * num_directions,
-                                mini_batch, self.hidden_size)
+        expected_hidden_size = (
+            self.num_layers * num_directions,
+            mini_batch,
+            self.hidden_size,
+        )
         return expected_hidden_size
 
     # In the future, we should prevent mypy from applying contravariance rules here.
     # See torch/nn/modules/module.py::_forward_unimplemented
-    def check_forward_args(self,  # type: ignore[override]
-                           input: Tensor,
-                           hidden: Tuple[Tensor, Tensor],
-                           batch_sizes: Optional[Tensor],
-                           ):
+    # pyrefly: ignore [bad-override]
+    def check_forward_args(
+        self,
+        input: Tensor,
+        hidden: tuple[Tensor, Tensor],  # type: ignore[override]
+        batch_sizes: Tensor | None,
+    ) -> None:
         self.check_input(input, batch_sizes)
-        self.check_hidden_size(hidden[0], self.get_expected_hidden_size(input, batch_sizes),
-                               'Expected hidden[0] size {}, got {}')
-        self.check_hidden_size(hidden[1], self.get_expected_cell_size(input, batch_sizes),
-                               'Expected hidden[1] size {}, got {}')
+        self.check_hidden_size(
+            hidden[0],
+            self.get_expected_hidden_size(input, batch_sizes),
+            "Expected hidden[0] size {}, got {}",
+        )
+        self.check_hidden_size(
+            hidden[1],
+            self.get_expected_cell_size(input, batch_sizes),
+            "Expected hidden[1] size {}, got {}",
+        )
 
     # Same as above, see torch/nn/modules/module.py::_forward_unimplemented
-    def permute_hidden(self,  # type: ignore[override]
-                       hx: Tuple[Tensor, Tensor],
-                       permutation: Optional[Tensor]
-                       ) -> Tuple[Tensor, Tensor]:
+    def permute_hidden(  # type: ignore[override]
+        self,
+        hx: tuple[Tensor, Tensor],
+        permutation: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
         if permutation is None:
             return hx
-        return _apply_permutation(hx[0], permutation), _apply_permutation(hx[1], permutation)
+        return _apply_permutation(hx[0], permutation), _apply_permutation(
+            hx[1], permutation
+        )
 
     # Same as above, see torch/nn/modules/module.py::_forward_unimplemented
     @overload  # type: ignore[override]
-    @torch._jit_internal._overload_method  # noqa: F811
-    def forward(self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None
-                ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:  # noqa: F811
+    @torch._jit_internal._overload_method
+    def forward(
+        self,
+        input: Tensor,
+        hx: tuple[Tensor, Tensor] | None = None,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         pass
 
     # Same as above, see torch/nn/modules/module.py::_forward_unimplemented
     @overload
-    @torch._jit_internal._overload_method  # noqa: F811
-    def forward(self, input: PackedSequence, hx: Optional[Tuple[Tensor, Tensor]] = None
-                ) -> Tuple[PackedSequence, Tuple[Tensor, Tensor]]:  # noqa: F811
+    @torch._jit_internal._overload_method
+    def forward(
+        self,
+        input: PackedSequence,
+        hx: tuple[Tensor, Tensor] | None = None,
+    ) -> tuple[PackedSequence, tuple[Tensor, Tensor]]:
         pass
 
-    def forward(self, input, hx=None):  # noqa: F811
+    def forward(self, input, hx=None):
         self._update_flat_weights()
 
         orig_input = input
         # xxx: isinstance check needs to be in conditional for TorchScript to compile
         batch_sizes = None
-        do_permute = False
         num_directions = 2 if self.bidirectional else 1
         real_hidden_size = self.proj_size if self.proj_size > 0 else self.hidden_size
         if isinstance(orig_input, PackedSequence):
             input, batch_sizes, sorted_indices, unsorted_indices = input
             max_batch_size = batch_sizes[0]
             if hx is None:
-                h_zeros = torch.zeros(self.num_layers * num_directions,
-                                      max_batch_size, real_hidden_size,
-                                      dtype=input.dtype, device=input.device)
-                c_zeros = torch.zeros(self.num_layers * num_directions,
-                                      max_batch_size, self.hidden_size,
-                                      dtype=input.dtype, device=input.device)
+                h_zeros = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    real_hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
+                c_zeros = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    self.hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
                 hx = (h_zeros, c_zeros)
             else:
                 # Each batch of the hidden state should match the input sequence that
@@ -874,7 +1112,9 @@ class LSTM(RNNBase):
                 hx = self.permute_hidden(hx, sorted_indices)
         else:
             if input.dim() not in (2, 3):
-                raise ValueError(f"LSTM: Expected input to be 2D or 3D, got {input.dim()}D instead")
+                raise ValueError(
+                    f"LSTM: Expected input to be 2D or 3D, got {input.dim()}D instead"
+                )
             is_batched = input.dim() == 3
             batch_dim = 0 if self.batch_first else 1
             if not is_batched:
@@ -883,24 +1123,36 @@ class LSTM(RNNBase):
             sorted_indices = None
             unsorted_indices = None
             if hx is None:
-                h_zeros = torch.zeros(self.num_layers * num_directions,
-                                      max_batch_size, real_hidden_size,
-                                      dtype=input.dtype, device=input.device)
-                c_zeros = torch.zeros(self.num_layers * num_directions,
-                                      max_batch_size, self.hidden_size,
-                                      dtype=input.dtype, device=input.device)
+                h_zeros = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    real_hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
+                c_zeros = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    self.hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
                 hx = (h_zeros, c_zeros)
                 self.check_forward_args(input, hx, batch_sizes)
             else:
                 if is_batched:
-                    if (hx[0].dim() != 3 or hx[1].dim() != 3):
-                        msg = ("For batched 3-D input, hx and cx should "
-                               f"also be 3-D but got ({hx[0].dim()}-D, {hx[1].dim()}-D) tensors")
+                    if hx[0].dim() != 3 or hx[1].dim() != 3:
+                        msg = (
+                            "For batched 3-D input, hx and cx should "
+                            f"also be 3-D but got ({hx[0].dim()}-D, {hx[1].dim()}-D) tensors"
+                        )
                         raise RuntimeError(msg)
                 else:
                     if hx[0].dim() != 2 or hx[1].dim() != 2:
-                        msg = ("For unbatched 2-D input, hx and cx should "
-                               f"also be 2-D but got ({hx[0].dim()}-D, {hx[1].dim()}-D) tensors")
+                        msg = (
+                            "For unbatched 2-D input, hx and cx should "
+                            f"also be 2-D but got ({hx[0].dim()}-D, {hx[1].dim()}-D) tensors"
+                        )
                         raise RuntimeError(msg)
                     hx = (hx[0].unsqueeze(1), hx[1].unsqueeze(1))
                 # Each batch of the hidden state should match the input sequence that
@@ -909,16 +1161,41 @@ class LSTM(RNNBase):
                 hx = self.permute_hidden(hx, sorted_indices)
 
         if batch_sizes is None:
-            result = _VF.lstm(input, hx, self._flat_weights, self.bias, self.num_layers,
-                              self.dropout, self.training, self.bidirectional, self.batch_first)
+            # pyrefly: ignore [no-matching-overload]
+            result = _VF.lstm(
+                input,
+                hx,
+                self._flat_weights,  # type: ignore[arg-type]
+                self.bias,
+                self.num_layers,
+                self.dropout,
+                self.training,
+                self.bidirectional,
+                self.batch_first,
+            )
         else:
-            result = _VF.lstm(input, batch_sizes, hx, self._flat_weights, self.bias,
-                              self.num_layers, self.dropout, self.training, self.bidirectional)
+            # pyrefly: ignore [no-matching-overload]
+            result = _VF.lstm(
+                input,
+                batch_sizes,
+                hx,
+                self._flat_weights,  # type: ignore[arg-type]
+                self.bias,
+                self.num_layers,
+                self.dropout,
+                self.training,
+                self.bidirectional,
+            )
         output = result[0]
         hidden = result[1:]
         # xxx: isinstance check needs to be in conditional for TorchScript to compile
         if isinstance(orig_input, PackedSequence):
-            output_packed = PackedSequence(output, batch_sizes, sorted_indices, unsorted_indices)
+            output_packed = PackedSequence(
+                output,
+                batch_sizes,
+                sorted_indices,
+                unsorted_indices,
+            )
             return output_packed, self.permute_hidden(hidden, unsorted_indices)
         else:
             if not is_batched:  # type: ignore[possibly-undefined]
@@ -1058,31 +1335,48 @@ class GRU(RNNBase):
     """
 
     @overload
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True,
-                 batch_first: bool = False, dropout: float = 0., bidirectional: bool = False,
-                 device=None, dtype=None) -> None:
-        ...
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = False,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None: ...
 
     @overload
-    def __init__(self, *args, **kwargs):
-        ...
+    def __init__(self, *args, **kwargs) -> None: ...
 
     def __init__(self, *args, **kwargs):
-        if 'proj_size' in kwargs:
-            raise ValueError("proj_size argument is only supported for LSTM, not RNN or GRU")
-        super().__init__('GRU', *args, **kwargs)
+        if "proj_size" in kwargs:
+            raise ValueError(
+                "proj_size argument is only supported for LSTM, not RNN or GRU"
+            )
+        super().__init__("GRU", *args, **kwargs)
 
     @overload  # type: ignore[override]
-    @torch._jit_internal._overload_method  # noqa: F811
-    def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:  # noqa: F811
+    @torch._jit_internal._overload_method
+    def forward(
+        self,
+        input: Tensor,
+        hx: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         pass
 
     @overload
-    @torch._jit_internal._overload_method  # noqa: F811
-    def forward(self, input: PackedSequence, hx: Optional[Tensor] = None) -> Tuple[PackedSequence, Tensor]:  # noqa: F811
+    @torch._jit_internal._overload_method
+    def forward(
+        self,
+        input: PackedSequence,
+        hx: Tensor | None = None,
+    ) -> tuple[PackedSequence, Tensor]:
         pass
 
-    def forward(self, input, hx=None):  # noqa: F811
+    def forward(self, input, hx=None):
         self._update_flat_weights()
 
         orig_input = input
@@ -1092,9 +1386,13 @@ class GRU(RNNBase):
             max_batch_size = batch_sizes[0]
             if hx is None:
                 num_directions = 2 if self.bidirectional else 1
-                hx = torch.zeros(self.num_layers * num_directions,
-                                 max_batch_size, self.hidden_size,
-                                 dtype=input.dtype, device=input.device)
+                hx = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    self.hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
             else:
                 # Each batch of the hidden state should match the input sequence that
                 # the user believes he/she is passing in.
@@ -1102,7 +1400,9 @@ class GRU(RNNBase):
         else:
             batch_sizes = None
             if input.dim() not in (2, 3):
-                raise ValueError(f"GRU: Expected input to be 2D or 3D, got {input.dim()}D instead")
+                raise ValueError(
+                    f"GRU: Expected input to be 2D or 3D, got {input.dim()}D instead"
+                )
             is_batched = input.dim() == 3
             batch_dim = 0 if self.batch_first else 1
             if not is_batched:
@@ -1110,20 +1410,26 @@ class GRU(RNNBase):
                 if hx is not None:
                     if hx.dim() != 2:
                         raise RuntimeError(
-                            f"For unbatched 2-D input, hx should also be 2-D but got {hx.dim()}-D tensor")
+                            f"For unbatched 2-D input, hx should also be 2-D but got {hx.dim()}-D tensor"
+                        )
                     hx = hx.unsqueeze(1)
             else:
                 if hx is not None and hx.dim() != 3:
                     raise RuntimeError(
-                        f"For batched 3-D input, hx should also be 3-D but got {hx.dim()}-D tensor")
+                        f"For batched 3-D input, hx should also be 3-D but got {hx.dim()}-D tensor"
+                    )
             max_batch_size = input.size(0) if self.batch_first else input.size(1)
             sorted_indices = None
             unsorted_indices = None
             if hx is None:
                 num_directions = 2 if self.bidirectional else 1
-                hx = torch.zeros(self.num_layers * num_directions,
-                                 max_batch_size, self.hidden_size,
-                                 dtype=input.dtype, device=input.device)
+                hx = torch.zeros(
+                    self.num_layers * num_directions,
+                    max_batch_size,
+                    self.hidden_size,
+                    dtype=input.dtype,
+                    device=input.device,
+                )
             else:
                 # Each batch of the hidden state should match the input sequence that
                 # the user believes he/she is passing in.
@@ -1131,17 +1437,42 @@ class GRU(RNNBase):
 
         self.check_forward_args(input, hx, batch_sizes)
         if batch_sizes is None:
-            result = _VF.gru(input, hx, self._flat_weights, self.bias, self.num_layers,
-                             self.dropout, self.training, self.bidirectional, self.batch_first)
+            # pyrefly: ignore [no-matching-overload]
+            result = _VF.gru(
+                input,
+                hx,
+                self._flat_weights,  # type: ignore[arg-type]
+                self.bias,
+                self.num_layers,
+                self.dropout,
+                self.training,
+                self.bidirectional,
+                self.batch_first,
+            )
         else:
-            result = _VF.gru(input, batch_sizes, hx, self._flat_weights, self.bias,
-                             self.num_layers, self.dropout, self.training, self.bidirectional)
+            # pyrefly: ignore [no-matching-overload]
+            result = _VF.gru(
+                input,
+                batch_sizes,
+                hx,
+                self._flat_weights,  # type: ignore[arg-type]
+                self.bias,
+                self.num_layers,
+                self.dropout,
+                self.training,
+                self.bidirectional,
+            )
         output = result[0]
         hidden = result[1]
 
         # xxx: isinstance check needs to be in conditional for TorchScript to compile
         if isinstance(orig_input, PackedSequence):
-            output_packed = PackedSequence(output, batch_sizes, sorted_indices, unsorted_indices)
+            output_packed = PackedSequence(
+                output,
+                batch_sizes,
+                sorted_indices,
+                unsorted_indices,
+            )
             return output_packed, self.permute_hidden(hidden, unsorted_indices)
         else:
             if not is_batched:  # type: ignore[possibly-undefined]
@@ -1152,7 +1483,7 @@ class GRU(RNNBase):
 
 
 class RNNCellBase(Module):
-    __constants__ = ['input_size', 'hidden_size', 'bias']
+    __constants__ = ["input_size", "hidden_size", "bias"]
 
     input_size: int
     hidden_size: int
@@ -1162,30 +1493,45 @@ class RNNCellBase(Module):
     # WARNING: bias_ih and bias_hh purposely not defined here.
     # See https://github.com/pytorch/pytorch/issues/39670
 
-    def __init__(self, input_size: int, hidden_size: int, bias: bool, num_chunks: int,
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool,
+        num_chunks: int,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.bias = bias
-        self.weight_ih = Parameter(torch.empty((num_chunks * hidden_size, input_size), **factory_kwargs))
-        self.weight_hh = Parameter(torch.empty((num_chunks * hidden_size, hidden_size), **factory_kwargs))
+        self.weight_ih = Parameter(
+            torch.empty((num_chunks * hidden_size, input_size), **factory_kwargs)
+        )
+        self.weight_hh = Parameter(
+            torch.empty((num_chunks * hidden_size, hidden_size), **factory_kwargs)
+        )
         if bias:
-            self.bias_ih = Parameter(torch.empty(num_chunks * hidden_size, **factory_kwargs))
-            self.bias_hh = Parameter(torch.empty(num_chunks * hidden_size, **factory_kwargs))
+            self.bias_ih = Parameter(
+                torch.empty(num_chunks * hidden_size, **factory_kwargs)
+            )
+            self.bias_hh = Parameter(
+                torch.empty(num_chunks * hidden_size, **factory_kwargs)
+            )
         else:
-            self.register_parameter('bias_ih', None)
-            self.register_parameter('bias_hh', None)
+            self.register_parameter("bias_ih", None)
+            self.register_parameter("bias_hh", None)
 
         self.reset_parameters()
 
     def extra_repr(self) -> str:
-        s = '{input_size}, {hidden_size}'
-        if 'bias' in self.__dict__ and self.bias is not True:
-            s += ', bias={bias}'
-        if 'nonlinearity' in self.__dict__ and self.nonlinearity != "tanh":
-            s += ', nonlinearity={nonlinearity}'
+        s = "{input_size}, {hidden_size}"
+        if "bias" in self.__dict__ and self.bias is not True:
+            s += ", bias={bias}"
+        if "nonlinearity" in self.__dict__ and self.nonlinearity != "tanh":
+            s += ", nonlinearity={nonlinearity}"
         return s.format(**self.__dict__)
 
     def reset_parameters(self) -> None:
@@ -1249,45 +1595,63 @@ class RNNCell(RNNCellBase):
         ...     output.append(hx)
     """
 
-    __constants__ = ['input_size', 'hidden_size', 'bias', 'nonlinearity']
+    __constants__ = ["input_size", "hidden_size", "bias", "nonlinearity"]
     nonlinearity: str
 
-    def __init__(self, input_size: int, hidden_size: int, bias: bool = True, nonlinearity: str = "tanh",
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        nonlinearity: str = "tanh",
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(input_size, hidden_size, bias, num_chunks=1, **factory_kwargs)
         self.nonlinearity = nonlinearity
 
-    def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
+    def forward(self, input: Tensor, hx: Tensor | None = None) -> Tensor:
         if input.dim() not in (1, 2):
-            raise ValueError(f"RNNCell: Expected input to be 1D or 2D, got {input.dim()}D instead")
+            raise ValueError(
+                f"RNNCell: Expected input to be 1D or 2D, got {input.dim()}D instead"
+            )
         if hx is not None and hx.dim() not in (1, 2):
-            raise ValueError(f"RNNCell: Expected hidden to be 1D or 2D, got {hx.dim()}D instead")
+            raise ValueError(
+                f"RNNCell: Expected hidden to be 1D or 2D, got {hx.dim()}D instead"
+            )
         is_batched = input.dim() == 2
         if not is_batched:
             input = input.unsqueeze(0)
 
         if hx is None:
-            hx = torch.zeros(input.size(0), self.hidden_size, dtype=input.dtype, device=input.device)
+            hx = torch.zeros(
+                input.size(0), self.hidden_size, dtype=input.dtype, device=input.device
+            )
         else:
             hx = hx.unsqueeze(0) if not is_batched else hx
 
         if self.nonlinearity == "tanh":
             ret = _VF.rnn_tanh_cell(
-                input, hx,
-                self.weight_ih, self.weight_hh,
-                self.bias_ih, self.bias_hh,
+                input,
+                hx,
+                self.weight_ih,
+                self.weight_hh,
+                self.bias_ih,
+                self.bias_hh,
             )
         elif self.nonlinearity == "relu":
             ret = _VF.rnn_relu_cell(
-                input, hx,
-                self.weight_ih, self.weight_hh,
-                self.bias_ih, self.bias_hh,
+                input,
+                hx,
+                self.weight_ih,
+                self.weight_hh,
+                self.bias_ih,
+                self.bias_hh,
             )
         else:
             ret = input  # TODO: remove when jit supports exception flow
-            raise RuntimeError(
-                f"Unknown nonlinearity: {self.nonlinearity}")
+            raise RuntimeError(f"Unknown nonlinearity: {self.nonlinearity}")
 
         if not is_batched:
             ret = ret.squeeze(0)
@@ -1355,32 +1719,49 @@ class LSTMCell(RNNCellBase):
         >>> output = torch.stack(output, dim=0)
     """
 
-    def __init__(self, input_size: int, hidden_size: int, bias: bool = True,
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(input_size, hidden_size, bias, num_chunks=4, **factory_kwargs)
 
-    def forward(self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self, input: Tensor, hx: tuple[Tensor, Tensor] | None = None
+    ) -> tuple[Tensor, Tensor]:
         if input.dim() not in (1, 2):
-            raise ValueError(f"LSTMCell: Expected input to be 1D or 2D, got {input.dim()}D instead")
+            raise ValueError(
+                f"LSTMCell: Expected input to be 1D or 2D, got {input.dim()}D instead"
+            )
         if hx is not None:
             for idx, value in enumerate(hx):
                 if value.dim() not in (1, 2):
-                    raise ValueError(f"LSTMCell: Expected hx[{idx}] to be 1D or 2D, got {value.dim()}D instead")
+                    raise ValueError(
+                        f"LSTMCell: Expected hx[{idx}] to be 1D or 2D, got {value.dim()}D instead"
+                    )
         is_batched = input.dim() == 2
         if not is_batched:
             input = input.unsqueeze(0)
 
         if hx is None:
-            zeros = torch.zeros(input.size(0), self.hidden_size, dtype=input.dtype, device=input.device)
+            zeros = torch.zeros(
+                input.size(0), self.hidden_size, dtype=input.dtype, device=input.device
+            )
             hx = (zeros, zeros)
         else:
             hx = (hx[0].unsqueeze(0), hx[1].unsqueeze(0)) if not is_batched else hx
 
         ret = _VF.lstm_cell(
-            input, hx,
-            self.weight_ih, self.weight_hh,
-            self.bias_ih, self.bias_hh,
+            input,
+            hx,
+            self.weight_ih,
+            self.weight_hh,
+            self.bias_ih,
+            self.bias_hh,
         )
 
         if not is_batched:
@@ -1450,29 +1831,44 @@ class GRUCell(RNNCellBase):
         ...     output.append(hx)
     """
 
-    def __init__(self, input_size: int, hidden_size: int, bias: bool = True,
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(input_size, hidden_size, bias, num_chunks=3, **factory_kwargs)
 
-    def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
+    def forward(self, input: Tensor, hx: Tensor | None = None) -> Tensor:
         if input.dim() not in (1, 2):
-            raise ValueError(f"GRUCell: Expected input to be 1D or 2D, got {input.dim()}D instead")
+            raise ValueError(
+                f"GRUCell: Expected input to be 1D or 2D, got {input.dim()}D instead"
+            )
         if hx is not None and hx.dim() not in (1, 2):
-            raise ValueError(f"GRUCell: Expected hidden to be 1D or 2D, got {hx.dim()}D instead")
+            raise ValueError(
+                f"GRUCell: Expected hidden to be 1D or 2D, got {hx.dim()}D instead"
+            )
         is_batched = input.dim() == 2
         if not is_batched:
             input = input.unsqueeze(0)
 
         if hx is None:
-            hx = torch.zeros(input.size(0), self.hidden_size, dtype=input.dtype, device=input.device)
+            hx = torch.zeros(
+                input.size(0), self.hidden_size, dtype=input.dtype, device=input.device
+            )
         else:
             hx = hx.unsqueeze(0) if not is_batched else hx
 
         ret = _VF.gru_cell(
-            input, hx,
-            self.weight_ih, self.weight_hh,
-            self.bias_ih, self.bias_hh,
+            input,
+            hx,
+            self.weight_ih,
+            self.weight_hh,
+            self.bias_ih,
+            self.bias_hh,
         )
 
         if not is_batched:

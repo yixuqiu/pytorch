@@ -381,8 +381,8 @@ TEST_F(ModuleTest, CallingCloneOnModuleThatDoesNotOverrideCloneThrows) {
 TEST_F(ModuleTest, CallingCloneOnModuleThatDoesOverrideCloneDoesNotThrow) {
   struct Cloneable : Module {
     std::shared_ptr<Module> clone(
-        const torch::optional<torch::Device>& device =
-            torch::nullopt) const override {
+        const std::optional<torch::Device>& device =
+            std::nullopt) const override {
       return nullptr;
     }
   };
@@ -1033,7 +1033,7 @@ TEST_F(ModuleTest, PrettyPrint) {
     TestModule(int x, float y) : x_(x), y_(y) {}
 
     void pretty_print(std::ostream& stream) const override {
-      stream << "TestModule(x=" << x_ << ", y=" << y_ << ")";
+      stream << "TestModule(x=" << x_ << ", y=" << y_ << ')';
     }
 
     int x_;

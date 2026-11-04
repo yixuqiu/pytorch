@@ -1,16 +1,10 @@
 
-#include <ATen/ATen.h>
-#include <ATen/Parallel.h>
 #include <ATen/core/ivalue.h>
 #include <ATen/core/symbol.h>
 #include <torch/csrc/jit/ir/ir_views.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/freeze_module.h>
-#include <torch/csrc/jit/passes/frozen_graph_optimizations.h>
 #include <torch/csrc/jit/passes/inliner.h>
-#include <torch/csrc/jit/passes/insert_guards.h>
-#include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
 #include <torch/csrc/jit/runtime/interpreter.h>
 #include <torch/csrc/jit/runtime/jit_trace.h>
@@ -56,18 +50,21 @@ Node* traceNode(Node* node, TracingData& td, Stack& stack) {
 }
 
 void eraseAllOutputs(Node* opt_pn) {
-  // NOLINTNEXTLINE
-  for (int i = opt_pn->outputs().size() - 1; i >= 0; i--) {
+  for (auto i = static_cast<int64_t>(opt_pn->outputs().size()) - 1; i >= 0;
+       i--) {
     opt_pn->eraseOutput(i);
   }
 }
 
-void insertTracingNodes(Block*, ProfilingRecord*, TracingData&);
+void insertTracingNodes(
+    Block* /*block*/,
+    ProfilingRecord* /*pr*/,
+    TracingData& /*td*/);
 
 // The subtlety in `createPropNodeForIfBlock` is that we need to create
 // a "propagate" node that will propagate the mapping between the outputs
 // of a then/else block and the outputs in the traced graph onto the outputs
-// of the if node in the scripted node. Note, if nodes will disappear in the
+// of the if node in the scripted node. Note, if nodes will disappear in
 // the traced graph but they are still used in the scripted graph.
 void createPropNodeForIfBlock(
     Block* b,
@@ -275,10 +272,12 @@ void insertTracingNodes(Block* block, ProfilingRecord* pr, TracingData& td) {
 // nodes and the outputs of the node in the scripted graph.
 // There are a few subtleties with tracing Ifs and Loops
 // discussed above
-std::shared_ptr<Graph> TraceGraph(std::shared_ptr<Graph> graph, Stack& stack) {
+std::shared_ptr<Graph> TraceGraph(
+    const std::shared_ptr<Graph>& graph,
+    Stack& stack) {
   TracingData td;
   GRAPH_DUMP("Before Inline:", graph);
-  Inline(*graph.get());
+  Inline(*graph);
   EliminateDeadCode(graph);
   GRAPH_DUMP("After Inline:", graph);
   auto pr = ProfilingRecord::instrumentGraph(graph);

@@ -12,8 +12,7 @@
 #include <ATen/ops/channel_shuffle_native.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 #ifdef USE_PYTORCH_QNNPACK
 namespace {
@@ -38,9 +37,9 @@ Tensor quantized_channel_shuffle_impl(
   Tensor qy = at::native::empty_affine_quantized(
       self_nhwc.sizes(),
       kQUInt8,
-      c10::nullopt /* layout */,
+      std::nullopt /* layout */,
       kCPU,
-      c10::nullopt /* pin_memory */,
+      std::nullopt /* pin_memory */,
       self_nhwc.q_scale(),
       self_nhwc.q_zero_point(),
       MemoryFormat::ChannelsLast);
@@ -77,9 +76,9 @@ Tensor quantized_channel_shuffle_impl(
   const pytorch_qnnp_status setupStatus = pytorch_qnnp_setup_channel_shuffle_nc_x8(
       qnnpack_uniq_ptr.get(),
       self_nhwc.numel() / channels /* batch size */,
-      (uint8_t*)self_nhwc.data_ptr<c10::quint8>() /* self data */,
+      reinterpret_cast<const uint8_t*>(self_nhwc.const_data_ptr<c10::quint8>()) /* self data */,
       channels /* self stride */,
-      (uint8_t*)qy.data_ptr<c10::quint8>() /* qy data */,
+      reinterpret_cast<uint8_t*>(qy.mutable_data_ptr<c10::quint8>()) /* qy data */,
       channels /* qy stride */);
   TORCH_INTERNAL_ASSERT(
       setupStatus == pytorch_qnnp_status_success,
@@ -103,10 +102,11 @@ Tensor channel_shuffle_quantized_cpu(
     int64_t groups) {
 #ifdef USE_PYTORCH_QNNPACK
   return quantized_channel_shuffle_impl(self, groups);
-#endif
+#else
   // If QNNPACK is not available then fall back to the
   // non quantized path.
   return at::native::channel_shuffle(self, groups);
+#endif
 }
 
 // Keep the registry in the anonymous namespace.
@@ -120,5 +120,4 @@ class QChannelShuffle final : public c10::OperatorKernel {
 
 } // namespace
 
-} // namespace native
-} // namespace at
+} // namespace at::native

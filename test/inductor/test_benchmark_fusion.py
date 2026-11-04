@@ -4,18 +4,21 @@ import os
 import sys
 
 import torch
+from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.test_case import TestCase as InductorTestCase
-from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
+from torch._inductor.test_operators import realize
+from torch._inductor.utils import fresh_cache, is_big_gpu, run_and_get_code
 from torch.testing import FileCheck
-from torch.testing._internal.common_utils import (
-    IS_CI,
-    IS_WINDOWS,
-    skipIfRocm,
-    slowTest,
-    TEST_WITH_ASAN,
+from torch.testing._internal.common_utils import slowTest
+from torch.testing._internal.inductor_utils import (
+    get_func_call,
+    GPU_TYPE,
+    HAS_CPU,
+    HAS_GPU_AND_TRITON,
+    IS_BIG_GPU,
 )
+from torch.utils._triton import has_triton_cuda_tma_device
 
-from torch.testing._internal.inductor_utils import HAS_CPU, HAS_CUDA
 
 # Make the helper files in test/ importable
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -24,20 +27,16 @@ sys.path.append(pytorch_test_dir)
 import contextlib
 import unittest
 
+from inductor.test_torchinductor import (  # @manual=fbcode//caffe2/test/inductor:test_inductor-library
+    check_model,
+    check_model_gpu,
+    copy_tests,
+    skip_if_cpp_wrapper,
+)
 from torch._inductor import config
+from torch._inductor.ir import MultiTemplateBuffer
 from torch._inductor.scheduler import Scheduler
-
-
-if IS_WINDOWS and IS_CI:
-    sys.stderr.write(
-        "Windows CI does not have necessary dependencies for test_torchinductor yet\n"
-    )
-    if __name__ == "__main__":
-        sys.exit(0)
-    raise unittest.SkipTest("requires sympy/functorch/filelock")
-
-
-from inductor.test_torchinductor import check_model, check_model_cuda, copy_tests
+from torch._inductor.select_algorithm import TritonTemplate
 
 
 class TestCase(InductorTestCase):
@@ -68,9 +67,11 @@ class BenchmarkFusionTestTemplate:
         self.common(f, (torch.rand(2, 8192),))
 
     @slowTest
-    @skipIfRocm  # fail accuracy check on ROCm
     def test_resnet18(self):
-        import torchvision
+        try:
+            import torchvision
+        except ImportError:
+            self.skipTest("TorchVision not available")
 
         model = torchvision.models.resnet18()
         model.eval()
@@ -99,9 +100,12 @@ class BenchmarkFusionTestTemplate:
 
         # Disable dynamic_scale_rblock to make it easier to trigger register
         # spilling.
-        with unittest.mock.patch.object(
-            Scheduler, "benchmark_fused_nodes", new_benchmark_fn
-        ), config.patch("dynamic_scale_rblock", False):
+        with (
+            unittest.mock.patch.object(
+                Scheduler, "benchmark_fused_nodes", new_benchmark_fn
+            ),
+            config.patch("dynamic_scale_rblock", False),
+        ):
             S = 512
 
             def f(*inputs):
@@ -135,10 +139,13 @@ class BenchmarkFusionTestTemplate:
 
         self.common(f, (a, b))
 
-    @torch._inductor.config.patch(max_autotune_gemm_backends="TRITON")
+    @unittest.skipIf(
+        not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
+    )
+    @config.patch(max_autotune_gemm_backends="TRITON")
     def test_avoid_register_spilling(self):
-        if self.device != "cuda":
-            raise unittest.SkipTest("CUDA only")
+        if self.device != GPU_TYPE:
+            raise unittest.SkipTest("GPU only")
 
         from torch.nn.functional import gelu
 
@@ -153,8 +160,8 @@ class BenchmarkFusionTestTemplate:
 
             return curr
 
-        m = torch.nn.Linear(2048, 2048, bias=True).half().cuda()
-        inp = torch.rand([2048, 2048]).half().cuda()
+        m = torch.nn.Linear(2048, 2048, bias=True).half().to(GPU_TYPE)
+        inp = torch.rand([2048, 2048]).half().to(GPU_TYPE)
 
         with torch.no_grad():
             foo_c = torch.compile(mode="max-autotune-no-cudagraphs")(foo)
@@ -162,7 +169,7 @@ class BenchmarkFusionTestTemplate:
             _, out_code = run_and_get_code(foo_c, m, inp)
 
             # occasionally, CI will make this one kernel. just skip in this case
-            if not out_code[0].count("def triton_") == 2:
+            if out_code[0].count("def triton_") != 2:
                 return
 
             # should be multiple triton invocations
@@ -170,9 +177,10 @@ class BenchmarkFusionTestTemplate:
                 ".run", 2, exactly=True
             ).run(out_code[0])
 
-        with config.patch(
-            {"benchmark_fusion": False, "epilogue_fusion": False}
-        ), torch.no_grad():
+        with (
+            config.patch({"benchmark_fusion": False, "epilogue_fusion": False}),
+            torch.no_grad(),
+        ):
             torch._dynamo.reset()
 
             foo_c = torch.compile(mode="max-autotune-no-cudagraphs")(foo)
@@ -181,19 +189,63 @@ class BenchmarkFusionTestTemplate:
 
         for c in out_code[0], out_code2[0]:
             FileCheck().check("async_compile.wait").check("DeviceGuard").check_count(
-                "empty_strided_cuda", 2, exactly=True
-            ).check("return").run(c)
+                f"empty_strided_{GPU_TYPE}", 1, exactly=True
+            ).check_regex("buf[0-9]* = buf[0-9]*; del buf[0-9]*").check("return").run(c)
+
+    def test_tield_kernel_fusion(self):
+        def f(x):
+            y = realize(x + x.t())
+            return y + 1
+
+        x = torch.randn(1024, 1024, device=self.device)
+        # Disable lowp check due to non-deterministic kernel fusion strategies affecting fp16 precision.
+        self.common(f, (x,), check_lowp=False)
 
 
-if HAS_CUDA and not TEST_WITH_ASAN:
+if HAS_GPU_AND_TRITON:
 
-    class BenchmarkFusionCudaTest(TestCase):
-        common = check_model_cuda
-        device = "cuda"
+    class BenchmarkFusionGpuTest(TestCase):
+        common = check_model_gpu
+        device = GPU_TYPE
 
-    copy_tests(BenchmarkFusionTestTemplate, BenchmarkFusionCudaTest, "cuda")
+    copy_tests(BenchmarkFusionTestTemplate, BenchmarkFusionGpuTest, GPU_TYPE)
 
-    class BenchmarkMultiTemplateFusionCudaTest(InductorTestCase):
+    class BenchmarkingTest(TestCase):
+        @unittest.skipIf(
+            getattr(torch, GPU_TYPE).device_count() < 2,
+            "The test need at least 2 devices",
+        )
+        @skip_if_cpp_wrapper("This tests triton scheduling directly")
+        def test_benchmark_on_non_zero_device(self):
+            hit_count = 0
+            with getattr(torch, GPU_TYPE).device(f"{GPU_TYPE}:0"):
+
+                @torch.compile
+                def relu(x):
+                    return realize(x.relu()) + x
+
+                x = torch.randn(int(16e6), device=f"{GPU_TYPE}:1")
+
+                orig_benchmark_codegened_module = (
+                    TritonScheduling.benchmark_codegened_module
+                )
+
+                def benchmark_codegened_module(*args, **kwargs):
+                    nonlocal hit_count
+                    hit_count += 1
+                    ms, path = orig_benchmark_codegened_module(*args, **kwargs)
+                    self.assertTrue(ms > 0)
+                    return ms, path
+
+                with unittest.mock.patch.object(
+                    TritonScheduling,
+                    "benchmark_codegened_module",
+                    benchmark_codegened_module,
+                ):
+                    relu(x)
+                self.assertTrue(hit_count > 0)
+
+    class BenchmarkMultiTemplateFusionGpuTest(InductorTestCase):
         @classmethod
         def setUpClass(cls):
             super().setUpClass()
@@ -203,7 +255,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
                     {
                         "benchmark_kernel": True,
                         "benchmark_fusion": True,
-                        "benchmark_multi_templates": True,
+                        "benchmark_template_fusion": True,
                     }
                 )
             )
@@ -212,6 +264,11 @@ if HAS_CUDA and not TEST_WITH_ASAN:
         def tearDownClass(cls):
             cls._stack.close()
             super().tearDownClass()
+
+        def setUp(self):
+            super().setUp()
+            if not is_big_gpu():
+                return self.skipTest("Need a big GPU to run max_autotune=True")
 
         def _equivalent_output_code_impl(self, size, first_dim=None, activation=True):
             def foo(m, inp):
@@ -223,16 +280,14 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             foo_c = torch.compile(mode="max-autotune-no-cudagraphs")(foo)
             first_dim = first_dim if first_dim is not None else size
 
-            m = torch.nn.Linear(size, size, bias=True).half().cuda()
-            inp = torch.rand([first_dim, size]).half().cuda()
+            m = torch.nn.Linear(size, size, bias=True).half().to(GPU_TYPE)
+            inp = torch.rand([first_dim, size]).half().to(GPU_TYPE)
 
             with torch.no_grad():
                 res, code = run_and_get_code(foo_c, m, inp)
 
             torch._dynamo.reset()
-            with unittest.mock.patch.object(
-                torch._inductor.config, "benchmark_multi_templates", False
-            ):
+            with config.patch(benchmark_template_fusion=False):
                 foo_c = torch.compile(mode="max-autotune-no-cudagraphs")(foo)
                 with torch.no_grad():
                     res2, code2 = run_and_get_code(foo_c, m, inp)
@@ -240,36 +295,35 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertEqual(res, res2, atol=1e-4, rtol=1.1)
             return code, code2
 
-        @fresh_inductor_cache()
-        @torch._inductor.config.patch(max_autotune_gemm_backends="TRITON")
+        @fresh_cache()
+        @config.patch(
+            {
+                "max_autotune_gemm_backends": "TRITON",
+                "benchmark_template_fusion": False,
+            }
+        )
         def test_equivalent_template_code(self):
             code, code2 = self._equivalent_output_code_impl(256)
             for out_code in [code, code2]:
-                FileCheck().check("def call").check_count(
-                    "empty_strided_cuda", 1, exactly=True
-                ).check("triton_tem_fused_relu_0.run").check_count(
-                    "del", 3, exactly=True
-                ).check(
-                    "return"
-                ).run(
-                    out_code[0]
-                )
+                FileCheck().check(get_func_call()).check_count(
+                    "empty_strided", 1, exactly=True
+                ).check("triton_tem_fused_addmm_relu_t_0").check_count(
+                    ".reset()" if config.cpp_wrapper else "del", 3, exactly=True
+                ).check("" if config.cpp_wrapper else "return").run(out_code[0])
 
-        @fresh_inductor_cache()
-        @torch._inductor.config.patch(max_autotune_gemm_backends="ATEN")
+        @fresh_cache()
+        @config.patch(max_autotune_gemm_backends="ATEN")
         def test_equivalent_extern_code(self):
             torch._dynamo.reset()
 
             code, code2 = self._equivalent_output_code_impl(512, 1, False)
 
             for out_code in [code, code2]:
-                FileCheck().check("def call").check_count(
-                    "empty_strided_cuda", 1, exactly=True
-                ).check("extern_kernels.").check_count("del", 3, exactly=True).check(
-                    "return"
-                ).run(
-                    out_code[0]
-                )
+                FileCheck().check(get_func_call()).check_count(
+                    "empty_strided", 1, exactly=True
+                ).check("" if config.cpp_wrapper else "extern_kernels.").check_count(
+                    ".reset()" if config.cpp_wrapper else "del", 3, exactly=True
+                ).check("" if config.cpp_wrapper else "return").run(out_code[0])
 
         def test_changed_layout(self):
             # cat addmm planning will change layout - make sure propagated
@@ -283,9 +337,9 @@ if HAS_CUDA and not TEST_WITH_ASAN:
                 )
 
             args = [
-                torch.randn(4, 4, device="cuda"),
-                torch.randn(4, 4, device="cuda"),
-                torch.randn(4, 4, device="cuda"),
+                torch.randn(4, 4, device=GPU_TYPE),
+                torch.randn(4, 4, device=GPU_TYPE),
+                torch.randn(4, 4, device=GPU_TYPE),
             ]
 
             expected = fn(*args)
@@ -293,6 +347,84 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertEqual(expected, actual)
 
             torch._dynamo.reset()
+
+        def _check_tma_store_view_epilogue_fuses(self):
+            # TMA-store choices tile the output 2D over (M, N). This epilogue
+            # views the (384, 512) output as (256, 3, 256), which that tiling
+            # can't split, so fusing it into a TMA-store choice raises CantSplit
+            # while the other choices fuse fine.
+            def f(a, b, bias):
+                return (a @ b).view(256, 3, 256) * bias.view(3, 1)
+
+            a = torch.randn(384, 256, device=GPU_TYPE, dtype=torch.float16)
+            b = torch.randn(256, 512, device=GPU_TYPE, dtype=torch.float16)
+            bias = torch.randn(3, device=GPU_TYPE, dtype=torch.float16)
+
+            out, code = run_and_get_code(torch.compile(f), a, b, bias)
+            self.assertEqual(out, f(a, b, bias), atol=1e-1, rtol=1e-2)
+            FileCheck().check("triton_tem_fused").check_count(
+                "@triton.jit", 1, exactly=True
+            ).run(code[0])
+
+        @unittest.skipIf(
+            not has_triton_cuda_tma_device(), "Needs TMA-store template choices"
+        )
+        @fresh_cache()
+        @config.patch(
+            {
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "triton.enable_persistent_tma_matmul": True,
+                "triton.enable_template_tma_store": True,
+                "multi_kernel_hints": [64],
+            }
+        )
+        def test_multi_kernel_hints_skips_cant_split_choice(self):
+            self._check_tma_store_view_epilogue_fuses()
+
+        @unittest.skipIf(
+            not has_triton_cuda_tma_device(), "Needs TMA-store template choices"
+        )
+        @fresh_cache()
+        @config.patch(
+            {
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "triton.enable_persistent_tma_matmul": True,
+                "triton.enable_template_tma_store": True,
+                "max_template_fusion_benchmarked_choices": 1,
+            }
+        )
+        def test_cant_split_choice_not_counted_as_benchmarked(self):
+            # Rank the TMA-store choices first, so the one benchmarked slot goes
+            # to a choice whose fused kernel raises CantSplit.
+            orig_generate = TritonTemplate.generate
+            orig_choice_timings = MultiTemplateBuffer.choice_timings
+            tma_store_choices = []
+
+            def generate(self, *args, **kwargs):
+                choice = orig_generate(self, *args, **kwargs)
+                if choice is not None and kwargs.get("tma_store", False):
+                    choice._test_tma_store = True
+                    tma_store_choices.append(choice)
+                return choice
+
+            def choice_timings(self, hint_override=None):
+                timings = orig_choice_timings(self, hint_override)
+                ranked = sorted(timings.items(), key=lambda kv: kv[1])
+                return {
+                    c: 1.0 if getattr(c, "_test_tma_store", False) else 1.0 + 1e-6 * i
+                    for i, (c, _) in enumerate(ranked, 1)
+                }
+
+            with (
+                unittest.mock.patch.object(TritonTemplate, "generate", generate),
+                unittest.mock.patch.object(
+                    MultiTemplateBuffer, "choice_timings", choice_timings
+                ),
+            ):
+                self._check_tma_store_view_epilogue_fuses()
+            self.assertTrue(tma_store_choices)
 
 
 if HAS_CPU and not torch.backends.mps.is_available():
@@ -306,5 +438,5 @@ if HAS_CPU and not torch.backends.mps.is_available():
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
-    if HAS_CPU or HAS_CUDA:
+    if HAS_CPU or HAS_GPU_AND_TRITON:
         run_tests()

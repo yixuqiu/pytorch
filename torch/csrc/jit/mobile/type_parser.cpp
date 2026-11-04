@@ -1,12 +1,11 @@
 #include <torch/csrc/jit/mobile/type_parser.h>
 
-#include <queue>
-
 #include <ATen/core/jit_type.h>
 #include <ATen/core/type_factory.h>
-#include <c10/util/string_view.h>
 #include <torch/csrc/jit/frontend/parser_constants.h>
 #include <torch/custom_class.h>
+#include <array>
+#include <string_view>
 
 using torch::jit::valid_single_char_tokens;
 
@@ -21,11 +20,7 @@ static constexpr const char* kTypeTorchbindCustomClass =
 static constexpr const char* kTypeNamedTuple = "NamedTuple";
 
 bool isSpecialChar(char a) {
-  for (const char* c = valid_single_char_tokens; *c; c++) {
-    if (a == *c)
-      return true;
-  }
-  return false;
+  return std::strchr(valid_single_char_tokens, a);
 }
 } // namespace
 
@@ -38,11 +33,11 @@ TypeParser::TypeParser(std::vector<std::string>& pythonStrs)
     : start_(0), pythonStrs_(pythonStrs) {}
 
 // For the Python string list parsing, the order of the Python string matters.
-// In bytecode, the order of the type list correspondings to the order of
+// In bytecode, the order of the type list corresponds to the order of
 // instruction. In nested type, the lowest level type will be at the beginning
 // of the type list. It is possible to parse it without worrying about
 // ordering, but it also introduces 1) extra cost to process nested type to
-// the correct order 2) lost the benifit that the instruction order is likely
+// the correct order 2) lost the benefit that the instruction order is likely
 // problematic if type list parsing fails.
 std::vector<TypePtr> TypeParser::parseList() {
   std::vector<TypePtr> typePtrs;
@@ -122,7 +117,7 @@ TypePtr TypeParser::parseNonSimple(const std::string& token) {
       }
     }
     expect("]");
-    return DynamicTypeFactory::create<TupleType>(std::move(types));
+    return DynamicTypeFactory::create<TupleType>(types);
   }
   return nullptr;
 }
@@ -138,7 +133,7 @@ TypePtr TypeParser::parse() {
     }
     contained_types_.insert(token);
     return simpleTypeIt->second;
-  } else if (getNonSimpleType().find(token) != getNonSimpleType().end()) {
+  } else if (getNonSimpleType().contains(token)) {
     contained_types_.insert(token);
     return parseNonSimple(token);
   } else if (token == "__torch__") {
@@ -164,7 +159,6 @@ TypePtr TypeParser::parse() {
         " is not supported in the parser, ",
         "or the token is in wrong format.");
   }
-  return nullptr;
 }
 
 // NamedTuple custom type will be following structure:
@@ -184,9 +178,8 @@ TypePtr TypeParser::parse() {
 //         ]
 //     ]"
 TypePtr TypeParser::parseNamedTuple(const std::string& qualified_name) {
-  std::vector<c10::string_view> field_names;
+  std::vector<std::string_view> field_names;
   std::vector<TypePtr> field_types;
-  std::string ns;
   expect(",");
   expect("[");
   while (cur() != "]") {
@@ -195,7 +188,7 @@ TypePtr TypeParser::parseNamedTuple(const std::string& qualified_name) {
     expect(",");
     TypePtr field_type = parse();
     field_names.emplace_back(field_name);
-    field_types.emplace_back(field_type);
+    field_types.emplace_back(std::move(field_type));
     expect("]");
     if (cur() == ",") {
       next();
@@ -213,7 +206,7 @@ TypePtr TypeParser::parseNamedTuple(const std::string& qualified_name) {
 //   ]
 // ]"
 TypePtr TypeParser::parseCustomType() {
-  c10::string_view token = cur();
+  std::string_view token = cur();
   std::string qualified_name = "__torch__.";
   qualified_name.reserve(qualified_name.size() + token.size());
   qualified_name.append(token.begin(), token.end());
@@ -250,13 +243,12 @@ TypePtr TypeParser::parseCustomType() {
       TORCH_CHECK(
           false, "Can't find definition for the type: ", qualified_name);
     }
-    return nullptr;
   }
 }
 
 TypePtr TypeParser::parseTorchbindClassType() {
-  static constexpr std::array<const char*, 4> expected_atoms = {
-      "torch", ".", "classes", "."};
+  static constexpr auto expected_atoms =
+      std::to_array<std::string_view>({"torch", ".", "classes", "."});
   for (const auto& atom : expected_atoms) {
     expect(atom);
   }
@@ -272,8 +264,8 @@ TypePtr TypeParser::parseTorchbindClassType() {
   return torch::getCustomClass(customClassName);
 }
 
-void TypeParser::expect(const char* s) {
-  c10::string_view token = cur();
+void TypeParser::expect(std::string_view s) {
+  std::string_view token = cur();
   TORCH_CHECK(
       token == s,
       "Error when parsing type ",
@@ -285,10 +277,10 @@ void TypeParser::expect(const char* s) {
   advance();
 }
 
-// c10::string_view::operator== calls memcmp to compare against the target
+// std::string_view::operator== calls memcmp to compare against the target
 // string; we can do better if we specialize for a single character.
 void TypeParser::expectChar(char c) {
-  c10::string_view token = cur();
+  std::string_view token = cur();
   TORCH_CHECK(
       token.size() == 1 && token[0] == c,
       "Error when parsing type ",
@@ -306,25 +298,25 @@ void TypeParser::lex() {
     ++start_;
   if (start_ < pythonStr_.size()) {
     if (isSpecialChar(pythonStr_[start_])) {
-      next_token_ = c10::string_view(pythonStr_.data() + start_++, 1);
+      next_token_ = std::string_view(pythonStr_.data() + start_++, 1);
     } else { // A word
       size_t end = start_;
       for (; end < pythonStr_.size() && !isSpecialChar(pythonStr_[end]) &&
            pythonStr_[end] != ' ';
            ++end)
         ;
-      next_token_ = c10::string_view(pythonStr_.data() + start_, end - start_);
+      next_token_ = std::string_view(pythonStr_.data() + start_, end - start_);
       start_ = end;
     }
   }
 }
 
-c10::string_view TypeParser::nextView() {
+std::string_view TypeParser::nextView() {
   TORCH_CHECK(
       !next_token_.empty(),
       "Empty token queue in mobile type parser.",
       "Check the format of the type string and make sure it's correct.");
-  c10::string_view token = cur();
+  std::string_view token = cur();
   advance();
   return token;
 }
@@ -339,7 +331,7 @@ void TypeParser::advance() {
   lex();
 }
 
-C10_NODISCARD c10::string_view TypeParser::cur() const {
+[[nodiscard]] std::string_view TypeParser::cur() const {
   return next_token_;
 }
 

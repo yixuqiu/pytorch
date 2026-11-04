@@ -1,32 +1,148 @@
-cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
-#cmake_policy(SET CMP0022 NEW)
-#cmake_policy(SET CMP0023 NEW)
+# PyTorch build overview
+#
+# This file is the entry point of the native build. It is normally driven by
+# scikit-build-core through `pip install -e . -v --no-build-isolation`
+# (`spin develop`) rather than by invoking cmake directly; the exception is the
+# standalone libtorch build in tools/build_libtorch.py. The stages below appear
+# in the order they are executed in this file.
+#
+# 1. Bootstrap: forward the toolchain env vars needed before project() (cross
+#    compilation), call project() with the version from version.txt, then
+#    cmake/EnvVarForwarding.cmake turns the remaining build env vars into CMake
+#    cache variables. That module is the reference for the environment
+#    variables that configure the build: look there first for an env var to
+#    set, and document new ones there. The exceptions are third-party locations
+#    such as MKLROOT or ROCM_PATH and a handful of niche flags, which are read
+#    directly where they are used.
+# 2. Pre-build (cmake/PreBuildSteps.cmake): initialize and verify the git
+#    submodules, and fetch the pinned NCCL for distributed CUDA builds.
+# 3. Options: declare every build knob (USE_*, BUILD_*). An option added here
+#    must also be added to cmake/Summary.cmake.
+# 4. Dependencies (cmake/Dependencies.cmake): find or build the third-party
+#    libraries and set up the accelerator toolchains (CUDA/ROCm/XPU). The
+#    global compile and link flags are resolved inline right after.
+# 5. Code generation, all driven from caffe2/CMakeLists.txt: cmake/Codegen.cmake
+#    runs torchgen over native_functions.yaml to emit the ATen operator headers
+#    and sources, and tools/setup_helpers/generate_code.py emits the autograd
+#    and Python binding sources. The .pyi stubs are generated later, in
+#    torch/CMakeLists.txt.
+# 6. Main build: add_subdirectory() of torch/headeronly, c10 and caffe2 (which
+#    in turn adds torch/). This builds c10, torch_cpu, the per-accelerator
+#    torch_cuda/torch_hip/torch_xpu, the umbrella torch library and
+#    torch_python, plus the C++ tests; those subdirectories also carry the
+#    install rules for the headers and libraries.
+# 7. Export and extras: generate the Caffe2Config.cmake / Caffe2Targets.cmake
+#    files that downstream C++ projects consume, then the optional binaries/
+#    and JNI bindings, which link against the libraries built above.
+# 8. Python packaging: cmake/FileMirroring.cmake copies sources into
+#    torchgen/packaged and into the torch/ subpackages that need files vendored
+#    out of third_party/, cmake/PackageData.cmake installs the non-Python
+#    package data (stubs, headers, templates) into torch/, and
+#    cmake/PostBuildSteps.cmake merges compile_commands.json and registers the
+#    install-time fixups (TORCH_STABLE_ONLY header wrapping, Windows runtime
+#    DLL and macOS OpenMP bundling).
+# 9. Summary (cmake/Summary.cmake): print the resolved configuration.
 
-# Use compiler ID "AppleClang" instead of "Clang" for XCode.
-# Not setting this sometimes makes XCode C compiler gets detected as "Clang",
-# even when the C++ one is detected as "AppleClang".
-cmake_policy(SET CMP0010 NEW)
-cmake_policy(SET CMP0025 NEW)
+cmake_minimum_required(VERSION 3.27 FATAL_ERROR)
 
-# Enables CMake to set LTO on compilers other than Intel.
-cmake_policy(SET CMP0069 NEW)
-# Enable the policy for CMake subprojects.
-# protobuf currently causes issues
-#set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
-
-# Suppress warning flags in default MSVC configuration.  It's not
-# mandatory that we do this (and we don't if cmake is old), but it's
-# nice when it's possible, and it's possible on our Windows configs.
-cmake_policy(SET CMP0092 NEW)
+cmake_policy(SET CMP0126 OLD)
+# Don't remove the FindCUDA module
+cmake_policy(SET CMP0146 OLD)
 
 # Prohibit in-source builds
 if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
-message(FATAL_ERROR "In-source build are not supported")
+  message(FATAL_ERROR "In-source build are not supported")
 endif()
 
+# Cross-compilation is configured by CMAKE_SYSTEM_NAME / CMAKE_SYSTEM_PROCESSOR,
+# which must be set before project() so CMake enters cross-compile mode and
+# reports the target architecture. The general environment-variable forwarding
+# in cmake/EnvVarForwarding.cmake runs after project() and skips variables that
+# are already defined, so project() would otherwise set these to the host values
+# and the target values passed via the environment would be lost. Forward just
+# the toolchain-determining variables here, before project().
+foreach(_cross_var
+    CMAKE_SYSTEM_NAME
+    CMAKE_SYSTEM_PROCESSOR
+    CMAKE_C_COMPILER
+    CMAKE_CXX_COMPILER
+    CMAKE_SYSROOT
+    CMAKE_TOOLCHAIN_FILE)
+  if(DEFINED ENV{${_cross_var}} AND NOT DEFINED ${_cross_var})
+    set(${_cross_var} "$ENV{${_cross_var}}")
+  endif()
+endforeach()
 
 # ---[ Project and semantic versioning.
-project(Torch CXX C)
+# When built via scikit-build-core, these are set automatically.
+# Provide fallbacks for standalone cmake invocations.
+if(NOT DEFINED SKBUILD_PROJECT_NAME)
+  set(SKBUILD_PROJECT_NAME "torch")
+endif()
+if(NOT DEFINED SKBUILD_PROJECT_VERSION)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/version.txt" SKBUILD_PROJECT_VERSION)
+  string(STRIP "${SKBUILD_PROJECT_VERSION}" SKBUILD_PROJECT_VERSION)
+  # version.txt may contain PEP 440 pre-release suffixes like "a0" that are
+  # not valid CMake version components. Strip everything after the last digit
+  # group so project(VERSION ...) still works.
+  string(REGEX MATCH "^[0-9]+\\.[0-9]+(\\.[0-9]+)?" SKBUILD_PROJECT_VERSION "${SKBUILD_PROJECT_VERSION}")
+endif()
+project(${SKBUILD_PROJECT_NAME}
+        VERSION ${SKBUILD_PROJECT_VERSION}
+        LANGUAGES CXX C)
+
+# When built via scikit-build-core, Python_EXECUTABLE is already set.
+# For standalone cmake invocations, find it via find_package.
+find_package(Python COMPONENTS Interpreter REQUIRED)
+
+# ---[ Where the Python packages go.
+# scikit-build-core exports each wheel tree to CMake as SKBUILD_<TREE>_DIR, and
+# wheel.install-dir picks which one becomes CMAKE_INSTALL_PREFIX. We set it to
+# "torch" so the C++ distribution lands at torch/lib and torch/include, as the
+# install rpath and torch/__init__.py both require; the prefix therefore sits
+# one level below platlib, and the Python-side install rules address
+# SKBUILD_PLATLIB_DIR directly instead of reaching it through the prefix.
+#
+# Those rules are guarded on SKBUILD, so a build scikit-build-core does not
+# drive (libtorch, tools/build_libtorch.py, downstream cmake --install) installs
+# the C++ distribution alone and keeps package data out of a conventional prefix
+# (see gh-191102). SKBUILD is set for every scikit-build-core configure,
+# editable installs included, where platlib is a per-build staging directory.
+#
+# The extension modules resolve the C++ tree through an $ORIGIN/lib install
+# rpath and torch/__init__.py resolves bin/ and lib/ off its own __file__, so
+# the prefix has to be the torch package directory. Enforce it rather than let
+# a mismatch produce an install that only fails at import time.
+if(SKBUILD)
+  get_filename_component(_torch_pkg_dir "${SKBUILD_PLATLIB_DIR}/torch" ABSOLUTE)
+  get_filename_component(_torch_prefix "${CMAKE_INSTALL_PREFIX}" ABSOLUTE)
+  if(NOT _torch_pkg_dir STREQUAL _torch_prefix)
+    message(FATAL_ERROR
+      "CMAKE_INSTALL_PREFIX must be the torch package directory: the "
+      "extension modules load the C++ libraries through an $ORIGIN/lib rpath "
+      "relative to themselves.\n"
+      "  SKBUILD_PLATLIB_DIR  : ${SKBUILD_PLATLIB_DIR}\n"
+      "  expected prefix      : ${_torch_pkg_dir}\n"
+      "  CMAKE_INSTALL_PREFIX : ${_torch_prefix}\n"
+      "Keep wheel.install-dir = \"torch\" in pyproject.toml, which is what "
+      "makes the two agree.")
+  endif()
+  unset(_torch_pkg_dir)
+  unset(_torch_prefix)
+endif()
+
+# Forward environment variables to CMake variables, replicating the behavior
+# previously handled by setup.py / tools/setup_helpers/cmake.py.
+# When built via setup.py, these are already set as -D flags; the module
+# skips variables that are already defined, so it is safe to include
+# unconditionally.
+include(cmake/EnvVarForwarding.cmake)
+
+# Pre-build steps: submodule init, NCCL checkout.
+# When built via setup.py, these are handled by build_deps() in setup.py;
+# the module checks for existing state, so it is safe to include
+# unconditionally.
+include(cmake/PreBuildSteps.cmake)
 
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
   set(LINUX TRUE)
@@ -40,47 +156,58 @@ set(CMAKE_INSTALL_MESSAGE NEVER)
 string(FIND "${CMAKE_CXX_FLAGS}" "-std=c++" env_cxx_standard)
 if(env_cxx_standard GREATER -1)
   message(
-      WARNING "C++ standard version definition detected in environment variable."
-      "PyTorch requires -std=c++17. Please remove -std=c++ settings in your environment.")
+    WARNING
+      "C++ standard version definition detected in environment variable. "
+      "PyTorch requires -std=c++20. Please remove -std=c++ settings in your environment."
+  )
 endif()
-set(CMAKE_CXX_STANDARD 17 CACHE STRING "The C++ standard whose features are requested to build this target.")
-set(CMAKE_C_STANDARD   11 CACHE STRING "The C standard whose features are requested to build this target.")
+set(CMAKE_CXX_STANDARD
+    20
+    CACHE STRING
+          "The C++ standard whose features are requested to build this target.")
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD
+    17
+    CACHE STRING
+          "The C standard whose features are requested to build this target.")
 
 # ---[ Utils
 include(cmake/public/utils.cmake)
 
-# --- [ Check that minimal gcc version is 9.3+
-if(CMAKE_COMPILER_IS_GNUCXX AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.3)
-  message(FATAL_ERROR "GCC-9.3 or newer is required to compile PyTorch, but found ${CMAKE_CXX_COMPILER_VERSION}")
+# --- [ Check that minimal gcc version is 11.3+
+if(CMAKE_COMPILER_IS_GNUCXX AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11.3)
+  message(
+    FATAL_ERROR
+      "GCC-11.3 or newer is required to compile PyTorch, but found ${CMAKE_CXX_COMPILER_VERSION}"
+  )
 endif()
 
-# This define is needed to preserve behavior given anticpated changes to cccl/thrust
-# https://nvidia.github.io/libcudacxx/standard_api/numerics_library/complex.html
-string(APPEND CMAKE_CUDA_FLAGS " -DLIBCUDACXX_ENABLE_SIMPLIFIED_COMPLEX_OPERATIONS")
-
-if(LINUX)
-  include(cmake/CheckAbi.cmake)
-  string(APPEND CMAKE_CXX_FLAGS " -D_GLIBCXX_USE_CXX11_ABI=${GLIBCXX_USE_CXX11_ABI}")
-  string(APPEND CMAKE_CUDA_FLAGS " -D_GLIBCXX_USE_CXX11_ABI=${GLIBCXX_USE_CXX11_ABI}")
-  if(${GLIBCXX_USE_CXX11_ABI} EQUAL 1)
-    set(CXX_STANDARD_REQUIRED ON)
-  else()
-    # Please note this is required in order to ensure compatibility between gcc 9 and gcc 7
-    # This could be removed when all Linux PyTorch binary builds are compiled by the same toolchain again
-    append_cxx_flag_if_supported("-fabi-version=11" CMAKE_CXX_FLAGS)
-  endif()
+# --- [ Check that minimal clang version is 16+
+# Older clangs (e.g. clang-14) fail to compile C++20 ranges adaptors such as
+# `std::views::filter` over associative containers when paired with libstdc++,
+# see https://github.com/pytorch/pytorch/issues/184630. AppleClang uses its
+# own versioning scheme and is excluded from this check.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
+  message(
+    FATAL_ERROR
+      "Clang-16 or newer is required to compile PyTorch, but found ${CMAKE_CXX_COMPILER_VERSION}"
+  )
 endif()
+
+# This define is needed to preserve behavior given anticpated changes to
+# cccl/thrust
+# https://github.com/NVIDIA/cccl/blob/main/docs/libcudacxx/standard_api/numerics_library/complex.rst
+string(APPEND CMAKE_CUDA_FLAGS
+       " -DLIBCUDACXX_ENABLE_SIMPLIFIED_COMPLEX_OPERATIONS")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_LINK_WHAT_YOU_USE TRUE)
 
 # One variable that determines whether the current cmake process is being run
-# with the main Caffe2 library. This is useful for building modules - if
-# modules are built with the main Caffe2 library then one does not need to do
-# find caffe2 in the cmake script. One can usually guard it in some way like
-#    if(NOT CAFFE2_CMAKE_BUILDING_WITH_MAIN_REPO)
-#      find_package(Caffe2 REQUIRED)
-#    endif()
+# with the main Caffe2 library. This is useful for building modules - if modules
+# are built with the main Caffe2 library then one does not need to do find
+# caffe2 in the cmake script. One can usually guard it in some way like if(NOT
+# CAFFE2_CMAKE_BUILDING_WITH_MAIN_REPO) find_package(Caffe2 REQUIRED) endif()
 set(CAFFE2_CMAKE_BUILDING_WITH_MAIN_REPO ON)
 
 # Googletest's cmake files are going to set it on once they are processed. Let's
@@ -94,26 +221,27 @@ if(NOT DEFINED BLAS_SET_BY_USER)
     message(STATUS "Not forcing any particular BLAS to be found")
     set(BLAS_SET_BY_USER FALSE)
   endif()
-  set(BLAS_SET_BY_USER ${BLAS_SET_BY_USER} CACHE STRING "Marks whether BLAS was manually set by user or auto-detected")
+  set(BLAS_SET_BY_USER
+      ${BLAS_SET_BY_USER}
+      CACHE STRING
+            "Marks whether BLAS was manually set by user or auto-detected")
 endif()
 
 # Apple specific
 if(APPLE)
-  # These lines are an attempt to make find_package(cuda) pick up
-  # libcuda.dylib, and not cuda.framework.  It doesn't work all
-  # the time, but it seems to help for some users.
-  # TODO: replace this with a more robust fix
+  # These lines are an attempt to make find_package(cuda) pick up libcuda.dylib,
+  # and not cuda.framework.  It doesn't work all the time, but it seems to help
+  # for some users. TODO: replace this with a more robust fix
   set(CMAKE_FIND_FRAMEWORK LAST)
   set(CMAKE_FIND_APPBUNDLE LAST)
 
   # Get clang version on macOS
-  execute_process( COMMAND ${CMAKE_CXX_COMPILER} --version OUTPUT_VARIABLE clang_full_version_string )
-  string(REGEX REPLACE "Apple (.*) version ([0-9]+\\.[0-9]+).*" "\\2" CLANG_VERSION_STRING ${clang_full_version_string})
-  message( STATUS "CLANG_VERSION_STRING:         " ${CLANG_VERSION_STRING} )
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} --version
+                  OUTPUT_VARIABLE clang_full_version_string)
+  string(REGEX REPLACE "Apple (.*) version ([0-9]+\\.[0-9]+).*" "\\2"
+                       CLANG_VERSION_STRING ${clang_full_version_string})
+  message(STATUS "CLANG_VERSION_STRING:         " ${CLANG_VERSION_STRING})
 
-
-  # RPATH stuff
-  set(CMAKE_MACOSX_RPATH ON)
   if(NOT IOS)
     # Determine if we can link against MPSGraph
     set(MPS_FOUND OFF)
@@ -123,27 +251,40 @@ if(APPLE)
       OUTPUT_VARIABLE _macosx_sdk_version
       OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(_exit_code EQUAL 0)
-        set(_MPS_supported_os_version OFF)
-        if(_macosx_sdk_version VERSION_GREATER_EQUAL 12.3)
-            set(_MPS_supported_os_version ON)
-        endif()
-        message(STATUS "sdk version: ${_macosx_sdk_version}, mps supported: ${_MPS_supported_os_version}")
-        execute_process(
-          COMMAND bash -c "xcrun --sdk macosx --show-sdk-path"
-          OUTPUT_VARIABLE _macosx_sdk_path
-          OUTPUT_STRIP_TRAILING_WHITESPACE)
-        set(_SDK_SEARCH_PATH "${_macosx_sdk_path}/System/Library/Frameworks/")
-        set(_FRAMEWORK_SEARCH_PATH "/System/Library/Frameworks/")
+      set(_MPS_supported_os_version OFF)
+      if(_macosx_sdk_version VERSION_GREATER_EQUAL 12.3)
+        set(_MPS_supported_os_version ON)
+      endif()
+      message(
+        STATUS
+          "sdk version: ${_macosx_sdk_version}, mps supported: ${_MPS_supported_os_version}"
+      )
+      execute_process(
+        COMMAND bash -c "xcrun --sdk macosx --show-sdk-path"
+        OUTPUT_VARIABLE _macosx_sdk_path
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+      set(_SDK_SEARCH_PATH "${_macosx_sdk_path}/System/Library/Frameworks/")
+      set(_FRAMEWORK_SEARCH_PATH "/System/Library/Frameworks/")
 
-        find_library(_MPS_fwrk_path_ NAMES MetalPerformanceShadersGraph MetalPerformanceShaders PATHS ${_FRAMEWORK_SEARCH_PATH} NO_DEFAULT_PATH)
-        find_library(_MPS_sdk_path_ NAMES MetalPerformanceShadersGraph MetalPerformanceShaders PATHS ${_SDK_SEARCH_PATH} NO_DEFAULT_PATH)
+      find_library(
+        _MPS_fwrk_path_
+        NAMES MetalPerformanceShadersGraph MetalPerformanceShaders
+        PATHS ${_FRAMEWORK_SEARCH_PATH}
+        NO_DEFAULT_PATH)
+      find_library(
+        _MPS_sdk_path_
+        NAMES MetalPerformanceShadersGraph MetalPerformanceShaders
+        PATHS ${_SDK_SEARCH_PATH}
+        NO_DEFAULT_PATH)
 
-        if(_MPS_supported_os_version AND _MPS_fwrk_path_ AND _MPS_sdk_path_)
-          set(MPS_FOUND ON)
-          message(STATUS "MPSGraph framework found")
-        else()
-          message(STATUS "MPSGraph framework not found")
-        endif()
+      if(_MPS_supported_os_version
+         AND _MPS_fwrk_path_
+         AND _MPS_sdk_path_)
+        set(MPS_FOUND ON)
+        message(STATUS "MPSGraph framework found")
+      else()
+        message(STATUS "MPSGraph framework not found")
+      endif()
     else()
       message(STATUS "MPS: unable to get MacOS sdk version")
       message(STATUS "MPSGraph framework not found")
@@ -153,172 +294,197 @@ endif()
 
 set(CPU_AARCH64 OFF)
 set(CPU_INTEL OFF)
+set(CPU_POWER OFF)
+set(CPU_RISCV OFF)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(AMD64|x86_64)")
   set(CPU_INTEL ON)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)")
+  # Linux reports "aarch64", macOS "arm64", and native Windows on Arm "ARM64".
+  # CMake MATCHES is case-sensitive, so accept each spelling.
   set(CPU_AARCH64 ON)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64le)")
+  set(CPU_POWER ON)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64)")
+  set(CPU_RISCV ON)
 endif()
 
-
-# For non-supported platforms, turn USE_DISTRIBUTED off by default.
-# It is not tested and likely won't work without additional changes.
+# For non-supported platforms, turn USE_DISTRIBUTED off by default. It is not
+# tested and likely won't work without additional changes.
 if(NOT LINUX AND NOT WIN32)
-  set(USE_DISTRIBUTED OFF CACHE STRING "Use distributed")
-  # On macOS, if USE_DISTRIBUTED is enabled (specified by the user),
-  # then make Gloo build with the libuv transport.
+  set(USE_DISTRIBUTED
+      OFF
+      CACHE STRING "Use distributed")
+  # On macOS, if USE_DISTRIBUTED is enabled (specified by the user), then make
+  # Gloo build with the libuv transport.
   if(APPLE AND USE_DISTRIBUTED)
-    set(USE_LIBUV ON CACHE STRING "")
+    set(USE_LIBUV
+        ON
+        CACHE STRING "")
   endif()
 endif()
 
-# ---[ Options.
-# Note to developers: if you add an option below, make sure you also add it to
-# cmake/Summary.cmake so that the summary prints out the option values.
+# ---[ Options. Note to developers: if you add an option below, make sure you
+# also add it to cmake/Summary.cmake so that the summary prints out the option
+# values.
 include(CMakeDependentOption)
 option(ATEN_NO_TEST "Do not build ATen test binaries" OFF)
 option(BUILD_BINARY "Build C++ binaries" OFF)
-option(BUILD_DOCS "Build Caffe2 documentation" OFF)
-option(BUILD_CUSTOM_PROTOBUF "Build and use Caffe2's own protobuf under third_party" ON)
+option(BUILD_CUSTOM_PROTOBUF
+       "Build and use Caffe2's own protobuf under third_party" ON)
 option(BUILD_PYTHON "Build Python binaries" ON)
-option(BUILD_CAFFE2 "Master flag to build Caffe2" OFF)
 option(BUILD_LITE_INTERPRETER "Master flag to build Lite Interpreter" OFF)
-cmake_dependent_option(
-    BUILD_CAFFE2_OPS "Build Caffe2 operators" ON
-    "BUILD_CAFFE2" OFF)
 option(BUILD_SHARED_LIBS "Build libcaffe2.so" ON)
 cmake_dependent_option(
-    CAFFE2_LINK_LOCAL_PROTOBUF "If set, build protobuf inside libcaffe2.so." ON
-    "BUILD_SHARED_LIBS AND BUILD_CUSTOM_PROTOBUF" OFF)
+  CAFFE2_LINK_LOCAL_PROTOBUF "If set, build protobuf inside libcaffe2.so." ON
+  "BUILD_SHARED_LIBS AND BUILD_CUSTOM_PROTOBUF" OFF)
 cmake_dependent_option(
-    CAFFE2_USE_MSVC_STATIC_RUNTIME "Using MSVC static runtime libraries" ON
-    "NOT BUILD_SHARED_LIBS" OFF)
-option(BUILD_TEST "Build C++ test binaries (need gtest and gbenchmark)" OFF)
+  CAFFE2_USE_MSVC_STATIC_RUNTIME "Using MSVC static runtime libraries" ON
+  "NOT BUILD_SHARED_LIBS" OFF)
+option(BUILD_TEST "Build C++ test binaries (need gtest and gbenchmark)" ON)
 option(BUILD_AOT_INDUCTOR_TEST "Build C++ test binaries for aot-inductor" OFF)
-option(BUILD_STATIC_RUNTIME_BENCHMARK "Build C++ binaries for static runtime benchmarks (need gbenchmark)" OFF)
-option(BUILD_MOBILE_BENCHMARK "Build C++ test binaries for mobile (ARM) targets(need gtest and gbenchmark)" OFF)
-option(BUILD_MOBILE_TEST "Build C++ test binaries for mobile (ARM) targets(need gtest and gbenchmark)" OFF)
+option(BUILD_STATIC_RUNTIME_BENCHMARK
+       "Build C++ binaries for static runtime benchmarks (need gbenchmark)" OFF)
+option(
+  BUILD_MOBILE_BENCHMARK
+  "Build C++ test binaries for mobile (ARM) targets(need gtest and gbenchmark)"
+  OFF)
+option(
+  BUILD_MOBILE_TEST
+  "Build C++ test binaries for mobile (ARM) targets(need gtest and gbenchmark)"
+  OFF)
 option(BUILD_JNI "Build JNI bindings" OFF)
-option(BUILD_MOBILE_AUTOGRAD "Build autograd function in mobile build (in development)" OFF)
-cmake_dependent_option(
-    INSTALL_TEST "Install test binaries if BUILD_TEST is on" ON
-    "BUILD_TEST" OFF)
+option(BUILD_MOBILE_AUTOGRAD
+       "Build autograd function in mobile build (in development)" OFF)
+cmake_dependent_option(INSTALL_TEST "Install test binaries if BUILD_TEST is on"
+                       ON "BUILD_TEST" OFF)
+option(USE_RELATIVE_PATHS "Use relative paths in generated files for ccache friendliness" OFF)
 option(USE_CPP_CODE_COVERAGE "Compile C/C++ with code coverage flags" OFF)
 option(USE_COLORIZE_OUTPUT "Colorize output during compilation" ON)
 option(USE_ASAN "Use Address+Undefined Sanitizers" OFF)
+option(USE_LSAN "Use Leak Sanitizer" OFF)
 option(USE_TSAN "Use Thread Sanitizer" OFF)
-option(USE_CUDA "Use CUDA" ON)
+
+# Track whether USE_CUDA was explicitly set by the user (before option() is called)
+# If USE_CUDA is already defined in cache, it means user explicitly set it
+if(DEFINED CACHE{USE_CUDA})
+  set(_USE_CUDA_EXPLICITLY_SET TRUE)
+else()
+  set(_USE_CUDA_EXPLICITLY_SET FALSE)
+endif()
+
+# CUDA is incompatible with TSAN
+cmake_dependent_option(USE_CUDA "Use CUDA" ON "NOT USE_TSAN" OFF)
+
+# If USE_XPU is already defined in cache, it means user explicitly set it
+if(DEFINED CACHE{USE_XPU})
+  set(_USE_XPU_EXPLICITLY_SET TRUE)
+else()
+  set(_USE_XPU_EXPLICITLY_SET FALSE)
+endif()
+
+option(USE_XPU "Use XPU" ON)
+option(USE_MTIA "Use MTIA" OFF)
 cmake_dependent_option(
-    USE_XPU "Use XPU. Only available on Linux." ON
-    "LINUX" OFF)
-cmake_dependent_option(
-     BUILD_LAZY_CUDA_LINALG "Build cuda linalg ops as separate library" ON "USE_CUDA AND LINUX AND BUILD_PYTHON" OFF)
-cmake_dependent_option(USE_ROCM "Use ROCm" ON "LINUX" OFF)
+  BUILD_LAZY_CUDA_LINALG "Build cuda linalg ops as separate library" ON
+  "USE_CUDA AND LINUX AND BUILD_PYTHON" OFF)
+cmake_dependent_option(USE_ROCM "Use ROCm" ON "LINUX OR WIN32" OFF)
+cmake_dependent_option(USE_ROCM_CK_GEMM "Use ROCm Composable Kernel for GEMMs" ON "USE_ROCM;NOT WIN32" OFF)
+# Single source of truth for the GPU archs Composable Kernel GEMM supports. It
+# drives both the ck_gemm build arch filter (torch_filter_ck_gemm_arches in
+# cmake/public/utils.cmake) and the runtime support check / dispatch, which read
+# it through the generated ATen/ROCmCKGEMMConfig.h. Add a WMMA arch (e.g.
+# gfx1200) here to opt it back in without patching source.
+set(TORCH_CK_GEMM_ARCH_LIST "gfx90a;gfx942;gfx950" CACHE STRING
+    "Semicolon-separated GPU archs Composable Kernel GEMM is built and enabled for")
+cmake_dependent_option(USE_ROCM_CK_SDPA "Use ROCm Composable Kernel for SDPA" ON "USE_ROCM;NOT WIN32" OFF)
+# Off by default because enabling gfx12 adds CK SDPA code generation and compile
+# cost to ROCm builds that already target gfx1200/gfx1201.
+cmake_dependent_option(USE_ROCM_CK_SDPA_GFX12 "Also build ROCm Composable Kernel SDPA for gfx12 (RDNA4)" OFF "USE_ROCM_CK_SDPA" OFF)
 option(CAFFE2_STATIC_LINK_CUDA "Statically link CUDA libraries" OFF)
-cmake_dependent_option(
-    USE_CUDNN "Use cuDNN" ON
-    "USE_CUDA" OFF)
-cmake_dependent_option(
-    USE_STATIC_CUDNN "Use cuDNN static libraries" OFF
-    "USE_CUDNN" OFF)
-cmake_dependent_option(
-    USE_CUSPARSELT "Use cuSPARSELt" ON
-    "USE_CUDA" OFF)
+cmake_dependent_option(USE_CUDNN "Use cuDNN" ON "USE_CUDA" OFF)
+cmake_dependent_option(USE_STATIC_CUDNN "Use cuDNN static libraries" OFF
+                       "USE_CUDNN" OFF)
+cmake_dependent_option(USE_CUSPARSELT "Use cuSPARSELt" ON "USE_CUDA" OFF)
+cmake_dependent_option(USE_HIPSPARSELT "Use hipSPARSELt" ON "USE_ROCM" OFF)
+cmake_dependent_option(USE_CUDSS "Use cuDSS" ON "USE_CUDA" OFF)
+cmake_dependent_option(USE_CUFILE "Use cuFile" ON "USE_CUDA OR USE_ROCM;NOT WIN32" OFF)
 option(USE_FBGEMM "Use FBGEMM (quantized 8-bit server operators)" ON)
 option(USE_KINETO "Use Kineto profiling library" ON)
 option(USE_CUPTI_SO "Use CUPTI as a shared library" ON)
-option(USE_FAKELOWP "Use FakeLowp operators" OFF)
 option(USE_GFLAGS "Use GFLAGS" OFF)
 option(USE_GLOG "Use GLOG" OFF)
 option(USE_LITE_PROTO "Use lite protobuf instead of full." OFF)
 option(USE_MAGMA "Use MAGMA" ON)
-option(USE_METAL "Use Metal for Caffe2 iOS build" ON)
 option(USE_PYTORCH_METAL "Use Metal for PyTorch iOS build" OFF)
 option(USE_PYTORCH_METAL_EXPORT "Export Metal models on MacOSX desktop" OFF)
 option(USE_NATIVE_ARCH "Use -march=native" OFF)
-cmake_dependent_option(
-    USE_MPS "Use MPS for macOS build" ON
-    "MPS_FOUND" OFF)
-cmake_dependent_option(
-    USE_NCCL "Use NCCL" ON
-    "USE_CUDA OR USE_ROCM;UNIX;NOT APPLE" OFF)
-cmake_dependent_option(USE_RCCL "Use RCCL" ON
-    USE_NCCL OFF)
-cmake_dependent_option(
-    USE_STATIC_NCCL "Use static NCCL" OFF
-    "USE_NCCL" OFF)
-cmake_dependent_option(
-    USE_SYSTEM_NCCL "Use system-wide NCCL" OFF
-    "USE_NCCL" OFF)
-option(USE_NNAPI "Use NNAPI" OFF)
+cmake_dependent_option(USE_MPS "Use MPS for macOS build" ON "MPS_FOUND" OFF)
+option(USE_DISTRIBUTED "Use distributed" ON)
+cmake_dependent_option(USE_NCCL "Use NCCL" ON
+                       "USE_DISTRIBUTED;USE_CUDA OR USE_ROCM;UNIX;NOT APPLE" OFF)
+cmake_dependent_option(USE_XCCL "Use XCCL" ON
+                       "USE_XPU;UNIX;NOT APPLE" OFF)
+cmake_dependent_option(USE_RCCL "Use RCCL" ON "USE_NCCL;NOT WIN32" OFF)
+cmake_dependent_option(USE_STATIC_NCCL "Use static NCCL" OFF "USE_NCCL" OFF)
+cmake_dependent_option(USE_SYSTEM_NCCL "Use system-wide NCCL" OFF "USE_NCCL"
+                       OFF)
+# Builds NCCL-EP if true.
+cmake_dependent_option(USE_NCCL_EP "Build NCCL EP library" OFF
+                       "USE_NCCL;USE_CUDA" OFF)
+cmake_dependent_option(USE_NVSHMEM "Use NVSHMEM" ON
+                       "USE_DISTRIBUTED;USE_CUDA OR USE_ROCM;UNIX;NOT APPLE" OFF)
 option(USE_NNPACK "Use NNPACK" ON)
-cmake_dependent_option(
-    USE_NUMA "Use NUMA. Only available on Linux." ON
-    "LINUX" OFF)
-cmake_dependent_option(
-    USE_NVRTC "Use NVRTC. Only available if USE_CUDA is on." OFF
-    "USE_CUDA" OFF)
+cmake_dependent_option(USE_NUMA "Use NUMA. Only available on Linux." ON "LINUX"
+                       OFF)
+cmake_dependent_option(USE_NVRTC "Use NVRTC. Only available if USE_CUDA is on."
+                       ON "USE_CUDA" OFF)
 option(USE_NUMPY "Use NumPy" ON)
-option(USE_OBSERVERS "Use observers module." OFF)
-option(USE_OPENCL "Use OpenCL" OFF)
 option(USE_OPENMP "Use OpenMP for parallel code" ON)
-option(USE_PRECOMPILED_HEADERS "Use pre-compiled headers to accelerate build." OFF)
+option(USE_PRECOMPILED_HEADERS "Use pre-compiled headers to accelerate build."
+       OFF)
 
-option(USE_PROF "Use profiling" OFF)
-option(USE_QNNPACK "Use QNNPACK (quantized 8-bit operators)" ON)
 option(USE_PYTORCH_QNNPACK "Use ATen/QNNPACK (quantized 8-bit operators)" ON)
-option(USE_SNPE "Use Qualcomm's SNPE library" OFF)
+option(USE_EIGEN_SPARSE "Use Eigen Sparse Matrices" OFF)
 option(USE_SYSTEM_EIGEN_INSTALL
     "Use system Eigen instead of the one under third_party" OFF)
-option(USE_TENSORRT "Using Nvidia TensorRT library" OFF)
 cmake_dependent_option(
     USE_VALGRIND "Use Valgrind. Only available on Linux." ON
     "LINUX" OFF)
 
 if(NOT DEFINED USE_VULKAN)
-  cmake_dependent_option(
-      USE_VULKAN "Use Vulkan GPU backend" ON
-      "ANDROID" OFF)
+  cmake_dependent_option(USE_VULKAN "Use Vulkan GPU backend" ON "ANDROID" OFF)
 endif()
 
-option(USE_SLEEF_FOR_ARM_VEC256 "Use sleef for arm" OFF)
-option(USE_SOURCE_DEBUG_ON_MOBILE "Enable " ON)
-option(USE_LITE_INTERPRETER_PROFILER "Enable " ON)
+option(USE_SOURCE_DEBUG_ON_MOBILE "Enable" ON)
+option(USE_LITE_INTERPRETER_PROFILER "Enable" ON)
 option(USE_VULKAN_FP16_INFERENCE "Vulkan - Use fp16 inference" OFF)
-option(USE_VULKAN_RELAXED_PRECISION "Vulkan - Use relaxed precision math in the kernels (mediump)" OFF)
+option(USE_VULKAN_RELAXED_PRECISION
+       "Vulkan - Use relaxed precision math in the kernels (mediump)" OFF)
 # option USE_XNNPACK: try to enable xnnpack by default.
-option(USE_XNNPACK "Use XNNPACK" ON)
-option(USE_ZSTD "Use ZSTD" OFF)
+option(USE_XNNPACK "Use XNNPACK" OFF)
 option(USE_ROCM_KERNEL_ASSERT "Use Kernel Assert for ROCm" OFF)
 # Ensure that an ITT build is the default for x86 CPUs
+cmake_dependent_option(USE_ITT "Use Intel(R) VTune Profiler ITT functionality"
+                       ON "CPU_INTEL" OFF)
+# Ensure that an MKLDNN build is the default for x86 CPUs but optional for
+# AArch64 (dependent on -DUSE_MKLDNN).
 cmake_dependent_option(
-  USE_ITT "Use Intel(R) VTune Profiler ITT functionality" ON
-  "CPU_INTEL" OFF)
-# Ensure that an MKLDNN build is the default for x86 CPUs
-# but optional for AArch64 (dependent on -DUSE_MKLDNN).
-cmake_dependent_option(
-  USE_MKLDNN "Use MKLDNN. Only available on x86, x86_64, and AArch64." "${CPU_INTEL}"
-  "CPU_INTEL OR CPU_AARCH64" OFF)
+  USE_MKLDNN "Use MKLDNN. Only available on x86, x86_64, AArch64, ppc64le and riscv64."
+  "${CPU_INTEL}" "CPU_INTEL OR CPU_AARCH64 OR CPU_POWER OR CPU_RISCV" OFF)
 cmake_dependent_option(
   USE_MKLDNN_ACL "Use Compute Library for the Arm architecture." OFF
   "USE_MKLDNN AND CPU_AARCH64" OFF)
-set(MKLDNN_ENABLE_CONCURRENT_EXEC ${USE_MKLDNN})
-cmake_dependent_option(
-    USE_MKLDNN_CBLAS "Use CBLAS in MKLDNN" OFF
-    "USE_MKLDNN" OFF)
 option(USE_STATIC_MKL "Prefer to link with MKL statically (Unix only)" OFF)
-option(USE_DISTRIBUTED "Use distributed" ON)
 cmake_dependent_option(
-    USE_MPI "Use MPI for Caffe2. Only available if USE_DISTRIBUTED is on." ON
-    "USE_DISTRIBUTED" OFF)
+  USE_MPI "Use MPI for Caffe2. Only available if USE_DISTRIBUTED is on." ON
+  "USE_DISTRIBUTED" OFF)
 cmake_dependent_option(
-    USE_UCC "Use UCC. Only available if USE_DISTRIBUTED is on." OFF
-    "USE_DISTRIBUTED" OFF)
-cmake_dependent_option(
-    USE_SYSTEM_UCC "Use system-wide UCC" OFF
-    "USE_UCC" OFF)
-cmake_dependent_option(
-    USE_C10D_UCC "USE C10D UCC" ON "USE_DISTRIBUTED;USE_UCC" OFF)
+  USE_UCC "Use UCC. Only available if USE_DISTRIBUTED is on." OFF
+  "USE_DISTRIBUTED" OFF)
+cmake_dependent_option(USE_SYSTEM_UCC "Use system-wide UCC" OFF "USE_UCC" OFF)
+cmake_dependent_option(USE_C10D_UCC "USE C10D UCC" ON "USE_DISTRIBUTED;USE_UCC"
+                       OFF)
 cmake_dependent_option(
     USE_GLOO "Use Gloo. Only available if USE_DISTRIBUTED is on." ON
     "USE_DISTRIBUTED" OFF)
@@ -326,47 +492,131 @@ cmake_dependent_option(
   USE_GLOO_WITH_OPENSSL "Use Gloo with OpenSSL. Only available if USE_GLOO is on." OFF
     "USE_GLOO AND LINUX AND NOT INTERN_BUILD_MOBILE" OFF)
 cmake_dependent_option(
+  USE_GLOO_IBVERBS "Use Gloo with ibverbs backend. Only available if USE_GLOO is on." OFF
+    "USE_GLOO AND LINUX AND NOT INTERN_BUILD_MOBILE" OFF)
+cmake_dependent_option(
     USE_C10D_GLOO "USE C10D GLOO" ON "USE_DISTRIBUTED;USE_GLOO" OFF)
 cmake_dependent_option(
     USE_C10D_NCCL "USE C10D NCCL" ON "USE_DISTRIBUTED;USE_NCCL" OFF)
 cmake_dependent_option(
+    USE_C10D_XCCL "USE C10D XCCL" ON "USE_DISTRIBUTED;USE_XCCL" OFF)
+cmake_dependent_option(
     USE_C10D_MPI "USE C10D MPI" ON "USE_DISTRIBUTED;USE_MPI" OFF)
 cmake_dependent_option(
     USE_TENSORPIPE "Use TensorPipe. Only available if USE_DISTRIBUTED is on." ON
-    "USE_DISTRIBUTED" OFF)
-option(USE_TBB "Use TBB (Deprecated)" OFF)
-cmake_dependent_option(
-    USE_SYSTEM_TBB "Use system-provided Intel TBB." OFF "USE_TBB" OFF)
+    "USE_DISTRIBUTED AND NOT WIN32" OFF)
 option(ONNX_ML "Enable traditional ONNX ML API." ON)
 option(HAVE_SOVERSION "Whether to add SOVERSION to the shared objects" OFF)
-option(BUILD_LIBTORCH_CPU_WITH_DEBUG "Enable RelWithDebInfo for libtorch_cpu target only" OFF)
-cmake_dependent_option(USE_CCACHE "Attempt using CCache to wrap the compilation" ON "UNIX" OFF)
+option(BUILD_LIBTORCH_CPU_WITH_DEBUG
+       "Enable RelWithDebInfo for libtorch_cpu target only" OFF)
+cmake_dependent_option(
+  USE_CCACHE "Attempt using [S]CCache to wrap the compilation" ON "UNIX" OFF)
 option(WERROR "Build with -Werror supported by the compiler" OFF)
-option(DEBUG_CUDA "When compiling DEBUG, also attempt to compile CUDA with debug flags (may cause nvcc to OOM)" OFF)
+option(
+  DEBUG_CUDA
+  "When compiling DEBUG, also attempt to compile CUDA with debug flags (may cause nvcc to OOM)"
+  OFF)
 option(USE_COREML_DELEGATE "Use the CoreML backend through delegate APIs" OFF)
-option(USE_PER_OPERATOR_HEADERS "Whether ATen should generate separate headers for each operator" ON)
+option(USE_PER_OPERATOR_HEADERS
+       "Whether ATen should generate separate headers for each operator" ON)
 cmake_dependent_option(
-    BUILD_LAZY_TS_BACKEND "Build the lazy Torchscript backend, not compatible with mobile builds" ON
-    "NOT INTERN_BUILD_MOBILE" OFF)
+  BUILD_LAZY_TS_BACKEND
+  "Build the lazy Torchscript backend, not compatible with mobile builds" ON
+  "NOT INTERN_BUILD_MOBILE" OFF)
+cmake_dependent_option(BUILD_BUNDLE_PTXAS "Bundle PTX into torch/bin folder"
+                       OFF "USE_CUDA" OFF)
 cmake_dependent_option(
-    BUILD_FUNCTORCH "Build Functorch" ON "BUILD_PYTHON" OFF)
-cmake_dependent_option(
-    BUILD_BUNDLE_PTXAS "Bundle PTX into torch/bin fodler" OFF "USE_CUDA" OFF)
+  USE_CMAKE_INSTRUMENTATION
+  "Use cmake-instrumentation to collect build metrics"
+  OFF # disabled by default because it causes CI timeouts
+  "CMAKE_VERSION VERSION_GREATER_EQUAL 4.3"
+  OFF
+)
+if(USE_CMAKE_INSTRUMENTATION)
+  cmake_instrumentation(
+    API_VERSION 1
+    DATA_VERSION 1.0
+    HOOKS postCMakeBuild
+    OPTIONS trace
+    CALLBACK "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_trace_summary.py" --root "${CMAKE_CURRENT_SOURCE_DIR}" --index
+  )
+endif()
+cmake_dependent_option(USE_KLEIDIAI "Use KleidiAI for the ARM CPU & AARCH64 architecture." ON
+                        "CPU_AARCH64" OFF)
+# prioritized text linker, ON by default for AArch64+Linux, option visible to all AArch64, x86 and ppc64le.
+set(USE_PRIORITIZED_TEXT_DEFAULT OFF)
+if(LINUX AND CPU_AARCH64)
+  set(USE_PRIORITIZED_TEXT_DEFAULT ON)
+endif()
+cmake_dependent_option(USE_PRIORITIZED_TEXT_FOR_LD "Use prioritized text linker for ld."
+  "${USE_PRIORITIZED_TEXT_DEFAULT}" "CPU_INTEL OR CPU_AARCH64 OR CPU_POWER" OFF)
 
-option(USE_MIMALLOC "Use mimalloc" OFF)
-# Enable third party mimalloc library to improve memory allocation performance on Windows.
-if(WIN32)
-  set(USE_MIMALLOC ON)
+# LLVM BOLT post-link binary optimization. Visible on AArch64, x86 and ppc64le.
+# Defaults ON for aarch64+linux+CUDA builds that also apply the linker script
+# optimization and a suitable llvm-bolt (>=21) is available. Depends on the
+# linker script because the committed profiles were collected with it enabled.
+function(check_llvm_bolt_version var item)
+  execute_process(COMMAND ${item} --version OUTPUT_VARIABLE _cmd_out)
+  string(REGEX MATCH "[0-9]+\.[0-9]+\.[0-9]+" _bolt_version "${_cmd_out}")
+  if(${_bolt_version} VERSION_LESS 21)
+    set(${var} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+find_program(LLVM_BOLT_EXECUTABLE NAMES llvm-bolt VALIDATOR check_llvm_bolt_version)
+
+set(USE_LLVM_BOLT_DEFAULT OFF)
+if(LINUX AND USE_CUDA AND CPU_AARCH64 AND USE_PRIORITIZED_TEXT_FOR_LD AND LLVM_BOLT_EXECUTABLE)
+  set(USE_LLVM_BOLT_DEFAULT ON)
+endif()
+cmake_dependent_option(USE_LLVM_BOLT "Optimize libraries with LLVM BOLT."
+  "${USE_LLVM_BOLT_DEFAULT}" "CPU_INTEL OR CPU_AARCH64 OR CPU_POWER" OFF)
+set(LLVM_BOLT_PROFILES_DIR "" CACHE PATH
+  "Directory containing LLVM BOLT profiles; empty uses bundled profiles.")
+
+# Enable third party mimalloc library to improve memory allocation performance
+# on Windows and AArch64.
+set(USE_MIMALLOC_DEFAULT OFF)
+if(WIN32 OR (CPU_AARCH64 AND NOT APPLE))
+  set(USE_MIMALLOC_DEFAULT ON)
+endif()
+option(USE_MIMALLOC "Use mimalloc" "${USE_MIMALLOC_DEFAULT}")
+option(USE_MIMALLOC_ON_MKL "Use mimalloc on MKL" OFF)
+if(USE_MIMALLOC_DEFAULT)
+  # Disable OPT flags for mimalloc on aarch64 as it breaks ARMv8.0
+  # See https://github.com/pytorch/pytorch/issues/174344
+  if(CPU_AARCH64)
+    set(MI_NO_OPT_ARCH ON)
+  endif()
+
+  # Not enable USE_MIMALLOC_ON_MKL due to it caused issue:
+  # https://github.com/pytorch/pytorch/issues/138994
+  # Will turn on when we can fix USE_STATIC_MKL lost functionality:
+  # https://github.com/pytorch/pytorch/pull/138996
+  # set(USE_MIMALLOC_ON_MKL ON)
 endif()
 
 if(USE_CCACHE)
   find_program(CCACHE_PROGRAM ccache)
+  find_program(SCCACHE_EXECUTABLE sccache)
+  # torch-xpu-ops consumes CMAKE_SYCL_COMPILER_LAUNCHER directly; this does not
+  # require CMake to provide native SYCL language support.
   if(CCACHE_PROGRAM)
-    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "C compiler launcher")
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "CXX compiler launcher")
-    set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "CUDA compiler launcher")
+    foreach(LANG CXX C CUDA SYCL)
+      set(CMAKE_${LANG}_COMPILER_LAUNCHER
+          "${CCACHE_PROGRAM}"
+          CACHE STRING "${LANG} compiler launcher")
+    endforeach()
+  elseif(SCCACHE_EXECUTABLE)
+    foreach(LANG CXX C CUDA SYCL)
+      set(CMAKE_${LANG}_COMPILER_LAUNCHER
+          "${SCCACHE_EXECUTABLE}"
+          CACHE STRING "${LANG} compiler launcher")
+    endforeach()
   else()
-    message(STATUS "Could not find ccache. Consider installing ccache to speed up compilation.")
+    message(
+      STATUS
+        "Could not find neither ccache nor sccache. Consider installing ccache to speed up compilation."
+    )
   endif()
 endif()
 
@@ -376,6 +626,8 @@ endif()
 if(WIN32)
   set(USE_TENSORPIPE OFF)
   message(WARNING "TensorPipe cannot be used on Windows. Set it to OFF")
+  set(USE_KLEIDIAI OFF)
+  message(WARNING "KleidiAI cannot be used on Windows. Set it to OFF")
 
   if(USE_DISTRIBUTED AND NOT DEFINED ENV{libuv_ROOT})
     find_library(
@@ -388,8 +640,10 @@ if(WIN32)
       set(USE_DISTRIBUTED OFF)
       set(USE_GLOO OFF)
       message(
-        WARNING "Libuv is not installed in current conda env. Set USE_DISTRIBUTED to OFF. "
-        "Please run command 'conda install -c conda-forge libuv=1.39' to install libuv.")
+        WARNING
+          "Libuv is not installed in current conda env. Set USE_DISTRIBUTED to OFF. "
+          "Please run command 'conda install -c conda-forge libuv=1.51' to install libuv."
+      )
     else()
       set(ENV{libuv_ROOT} ${libuv_tmp_LIBRARY}/../../)
     endif()
@@ -397,12 +651,13 @@ if(WIN32)
 endif()
 
 if(USE_GLOO_WITH_OPENSSL)
-  set(USE_TCP_OPENSSL_LOAD ON CACHE STRING "")
+  set(USE_TCP_OPENSSL_LOAD
+      ON
+      CACHE STRING "")
 endif()
 
 # Linux distributions do not want too many embedded sources, in that sense we
-# need to be able to build pytorch with an (almost) empty third_party
-# directory.
+# need to be able to build pytorch with an (almost) empty third_party directory.
 # USE_SYSTEM_LIBS is a shortcut variable to toggle all the # USE_SYSTEM_*
 # variables on. Individual USE_SYSTEM_* variables can be toggled with
 # USE_SYSTEM_LIBS being "OFF".
@@ -418,7 +673,7 @@ option(USE_SYSTEM_FXDIV "Use system-provided fxdiv." OFF)
 option(USE_SYSTEM_BENCHMARK "Use system-provided google benchmark." OFF)
 option(USE_SYSTEM_ONNX "Use system-provided onnx." OFF)
 option(USE_SYSTEM_XNNPACK "Use system-provided xnnpack." OFF)
-option(USE_SYSTEM_ZSTD "Use system-provided zstd." OFF)
+option(USE_SYSTEM_NVTX "Use system-provided nvtx." OFF)
 option(USE_GOLD_LINKER "Use ld.gold to link" OFF)
 if(USE_SYSTEM_LIBS)
   set(USE_SYSTEM_CPUINFO ON)
@@ -437,76 +692,114 @@ if(USE_SYSTEM_LIBS)
   if(USE_NCCL)
     set(USE_SYSTEM_NCCL ON)
   endif()
-  if(USE_TBB)
-    set(USE_SYSTEM_TBB ON)
-  endif()
-  if(USE_ZSTD)
-    set(USE_SYSTEM_ZSTD ON)
-  endif()
+  set(USE_SYSTEM_NVTX ON)
 endif()
 
-# Used when building Caffe2 through setup.py
-option(BUILDING_WITH_TORCH_LIBS "Tell cmake if Caffe2 is being built alongside torch libs" ON)
-
-# /Z7 override option
-# When generating debug symbols, CMake default to use the flag /Zi.
-# However, it is not compatible with sccache. So we rewrite it off.
+# /Z7 override option When generating debug symbols, CMake default to use the
+# flag /Zi. However, it is not compatible with sccache. So we rewrite it off.
 # But some users don't use sccache; this override is for them.
 cmake_dependent_option(
-  MSVC_Z7_OVERRIDE "Work around sccache bug by replacing /Zi and /ZI with /Z7 when using MSVC (if you are not using sccache, you can turn this OFF)" ON
-  "MSVC" OFF)
+  MSVC_Z7_OVERRIDE
+  "Work around sccache bug by replacing /Zi and /ZI with /Z7 when using MSVC (if you are not using sccache, you can turn this OFF)"
+  ON
+  "MSVC"
+  OFF)
 
 if(NOT USE_SYSTEM_ONNX)
-  set(ONNX_NAMESPACE "onnx_torch" CACHE STRING "A namespace for ONNX; needed to build with other frameworks that share ONNX.")
+  set(ONNX_NAMESPACE
+      "onnx_torch"
+      CACHE
+        STRING
+        "A namespace for ONNX; needed to build with other frameworks that share ONNX."
+  )
 else()
-  set(ONNX_NAMESPACE "onnx" CACHE STRING "A namespace for ONNX; needed to build with other frameworks that share ONNX.")
+  set(ONNX_NAMESPACE
+      "onnx"
+      CACHE
+        STRING
+        "A namespace for ONNX; needed to build with other frameworks that share ONNX."
+  )
 endif()
-set(SELECTED_OP_LIST "" CACHE STRING
-    "Path to the yaml file that contains the list of operators to include for custom build. Include all operators by default.")
+set(SELECTED_OP_LIST
+    ""
+    CACHE
+      STRING
+      "Path to the yaml file that contains the list of operators to include for custom build. Include all operators by default."
+)
 option(
-    STATIC_DISPATCH_BACKEND
-    "Name of the backend for which static dispatch code is generated, e.g.: CPU."
-    "")
-option(USE_LIGHTWEIGHT_DISPATCH "Enable codegen unboxing for ATen ops, need to work with static dispatch in order to work properly." OFF)
-if(USE_LIGHTWEIGHT_DISPATCH AND NOT STATIC_DISPATCH_BACKEND)
-  message(FATAL_ERROR "Need to enable static dispatch after enabling USE_LIGHTWEIGHT_DISPATCH.")
-endif()
+  STATIC_DISPATCH_BACKEND
+  "Name of the backend for which static dispatch code is generated, e.g.: CPU."
+  "")
 option(
-  TRACING_BASED
-  "Master flag to build Lite Interpreter with tracing build option"
+  USE_LIGHTWEIGHT_DISPATCH
+  "Enable codegen unboxing for ATen ops, need to work with static dispatch in order to work properly."
   OFF)
-option(BUILD_EXECUTORCH "Master flag to build Executorch" ON)
-# This is a fix for a rare build issue on Ubuntu:
-# symbol lookup error: miniconda3/envs/pytorch-py3.7/lib/libmkl_intel_lp64.so: undefined symbol: mkl_blas_dsyrk
+if(USE_LIGHTWEIGHT_DISPATCH AND NOT STATIC_DISPATCH_BACKEND)
+  message(
+    FATAL_ERROR
+      "Need to enable static dispatch after enabling USE_LIGHTWEIGHT_DISPATCH.")
+endif()
+option(TRACING_BASED
+       "Master flag to build Lite Interpreter with tracing build option" OFF)
+# This is a fix for a rare build issue on Ubuntu: symbol lookup error:
+# miniconda3/envs/pytorch-py3.7/lib/libmkl_intel_lp64.so: undefined symbol:
+# mkl_blas_dsyrk
 # https://software.intel.com/en-us/articles/symbol-lookup-error-when-linking-intel-mkl-with-gcc-on-ubuntu
 if(LINUX)
-  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-as-needed")
+  set(CMAKE_SHARED_LINKER_FLAGS
+      "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-as-needed")
+
+  set(ENV_LDFLAGS "$ENV{LDFLAGS}")
+  string(STRIP "${ENV_LDFLAGS}" ENV_LDFLAGS)
+  # Do not append linker flags passed via env var if they already there
+  if(NOT ${CMAKE_SHARED_LINKER_FLAGS} MATCHES "${ENV_LDFLAGS}")
+     set(CMAKE_SHARED_LINKER_FLAGS
+         "${CMAKE_SHARED_LINKER_FLAGS} ${ENV_LDFLAGS}")
+  endif()
 endif()
 
 if(MSVC)
-  # MSVC by default does not apply the correct __cplusplus version as specified by the C++ standard
-  # because MSVC is not a completely compliant implementation. This option forces MSVC to use the
-  # appropriate value given the requested --std option. This fixes a compilation issue mismatch
-  # between GCC/Clang and MSVC.
+  # MSVC by default does not apply the correct __cplusplus version as specified
+  # by the C++ standard because MSVC is not a completely compliant
+  # implementation. This option forces MSVC to use the appropriate value given
+  # the requested --std option. This fixes a compilation issue mismatch between
+  # GCC/Clang and MSVC.
   #
-  # See:
-  # * https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus?view=msvc-170
+  # See: *
+  # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus?view=msvc-170
   # * https://en.cppreference.com/w/cpp/preprocessor/replace#Predefined_macros
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler  /Zc:__cplusplus")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /Zc:__cplusplus -Xcompiler /Zc:preprocessor")
+
+  # Since VS 2022 17.10 (MSVC 14.40) std::mutex has a constexpr constructor
+  # that zero-initializes the mutex and relies on msvcp140.dll >= 14.40 to
+  # cope with that layout. If an older msvcp140.dll is already loaded in the
+  # process (stale VC redist, or a copy bundled by another package such as
+  # PyQt), the first lock during c10.dll static init faults inside DllMain and
+  # `import torch` fails with WinError 1114. Opt back into the classic
+  # constructor so the wheels work with any 14.x runtime.
+  # See https://github.com/pytorch/pytorch/issues/169429 and
+  # https://github.com/microsoft/STL/issues/4730
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")
 
   set(CMAKE_NINJA_CMCLDEPS_RC OFF)
-  foreach(flag_var
-      CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
-      CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO
-      CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
-      CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
-    # Replace /Zi and /ZI with /Z7
-    if(MSVC_Z7_OVERRIDE)
-      if(${flag_var} MATCHES "/Z[iI]")
-        string(REGEX REPLACE "/Z[iI]" "/Z7" ${flag_var} "${${flag_var}}")
-      endif(${flag_var} MATCHES "/Z[iI]")
-    endif(MSVC_Z7_OVERRIDE)
+  if(MSVC_Z7_OVERRIDE)
+    # CMake set debug flags to use /Z7
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+  endif()
+  foreach(
+    flag_var
+    CMAKE_C_FLAGS
+    CMAKE_C_FLAGS_DEBUG
+    CMAKE_C_FLAGS_RELEASE
+    CMAKE_C_FLAGS_MINSIZEREL
+    CMAKE_C_FLAGS_RELWITHDEBINFO
+    CMAKE_CXX_FLAGS
+    CMAKE_CXX_FLAGS_DEBUG
+    CMAKE_CXX_FLAGS_RELEASE
+    CMAKE_CXX_FLAGS_MINSIZEREL
+    CMAKE_CXX_FLAGS_RELWITHDEBINFO)
 
     if(${CAFFE2_USE_MSVC_STATIC_RUNTIME})
       if(${flag_var} MATCHES "/MD")
@@ -519,12 +812,12 @@ if(MSVC)
     endif()
 
     # /bigobj increases number of sections in .obj file, which is needed to link
-    # against libraries in Python 2.7 under Windows
-    # For Visual Studio generators, if /MP is not added, then we may need
-    # to add /MP to the flags.
+    # against libraries in Python 2.7 under Windows For Visual Studio
+    # generators, if /MP is not added, then we may need to add /MP to the flags.
     # For other generators like ninja, we don't need to add /MP because it is
     # already handled by the generator itself.
-    if(CMAKE_GENERATOR MATCHES "Visual Studio" AND NOT ${flag_var} MATCHES "/MP")
+    if(CMAKE_GENERATOR MATCHES "Visual Studio" AND NOT ${flag_var} MATCHES
+                                                   "/MP")
       set(${flag_var} "${${flag_var}} /MP /bigobj")
     else()
       set(${flag_var} "${${flag_var}} /bigobj")
@@ -532,37 +825,44 @@ if(MSVC)
   endforeach(flag_var)
 
   foreach(flag_var
-      CMAKE_C_FLAGS CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_MINSIZEREL
-      CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_MINSIZEREL)
+          CMAKE_C_FLAGS CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_MINSIZEREL
+          CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_MINSIZEREL)
     if(${flag_var} MATCHES "/Z[iI7]")
       string(REGEX REPLACE "/Z[iI7]" "" ${flag_var} "${${flag_var}}")
     endif()
   endforeach(flag_var)
 
-  foreach(flag_var
-      CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO CMAKE_STATIC_LINKER_FLAGS_RELWITHDEBINFO
-      CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO
-      CMAKE_SHARED_LINKER_FLAGS_DEBUG CMAKE_STATIC_LINKER_FLAGS_DEBUG
-      CMAKE_EXE_LINKER_FLAGS_DEBUG CMAKE_MODULE_LINKER_FLAGS_DEBUG)
+  foreach(
+    flag_var
+    CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO
+    CMAKE_STATIC_LINKER_FLAGS_RELWITHDEBINFO
+    CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO
+    CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO
+    CMAKE_SHARED_LINKER_FLAGS_DEBUG
+    CMAKE_STATIC_LINKER_FLAGS_DEBUG
+    CMAKE_EXE_LINKER_FLAGS_DEBUG
+    CMAKE_MODULE_LINKER_FLAGS_DEBUG)
     # Switch off incremental linking in debug/relwithdebinfo builds
-    if(${flag_var} MATCHES "/INCREMENTAL" AND NOT ${flag_var} MATCHES "/INCREMENTAL:NO")
-      string(REGEX REPLACE "/INCREMENTAL" "/INCREMENTAL:NO" ${flag_var} "${${flag_var}}")
+    if(${flag_var} MATCHES "/INCREMENTAL" AND NOT ${flag_var} MATCHES
+                                              "/INCREMENTAL:NO")
+      string(REGEX REPLACE "/INCREMENTAL" "/INCREMENTAL:NO" ${flag_var}
+                           "${${flag_var}}")
     endif()
   endforeach(flag_var)
 
-  foreach(flag_var
-      CMAKE_SHARED_LINKER_FLAGS CMAKE_STATIC_LINKER_FLAGS
-      CMAKE_EXE_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS)
+  foreach(flag_var CMAKE_SHARED_LINKER_FLAGS CMAKE_STATIC_LINKER_FLAGS
+                   CMAKE_EXE_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS)
     string(APPEND ${flag_var} " /ignore:4049 /ignore:4217 /ignore:4099")
   endforeach(flag_var)
 
-  foreach(flag_var
-      CMAKE_SHARED_LINKER_FLAGS)
-    # https://github.com/pytorch/pytorch/issues/91933: Don't set the manifest filename
-    # explicitly helps fix the linker error when linking torch_python.dll. The manifest
-    # file would still be there in the correct format torch_python.dll.manifest
+  foreach(flag_var CMAKE_SHARED_LINKER_FLAGS)
+    # https://github.com/pytorch/pytorch/issues/91933: Don't set the manifest
+    # filename explicitly helps fix the linker error when linking
+    # torch_python.dll. The manifest file would still be there in the correct
+    # format torch_python.dll.manifest
     if(${flag_var} MATCHES "/MANIFESTFILE:.*\\.manifest")
-      string(REGEX REPLACE "/MANIFESTFILE:.*\\.manifest" "" ${flag_var} "${${flag_var}}")
+      string(REGEX REPLACE "/MANIFESTFILE:.*\\.manifest" "" ${flag_var}
+                           "${${flag_var}}")
     endif()
   endforeach(flag_var)
 
@@ -575,15 +875,27 @@ endif(MSVC)
 
 string(APPEND CMAKE_CUDA_FLAGS " -Xfatbin -compress-all")
 
+# Set linker max-page-size to 64KiB on AArch64 Linux
+# And stub group size to 32MiB to workaround R_AARCH64_CALL26
+# relocation errors
+if(LINUX AND CPU_AARCH64)
+  add_link_options_if_supported("-z,max-page-size=0x10000")
+  add_link_options_if_supported("--stub-group-size=0x2000000")
+endif()
+
 # Set INTERN_BUILD_MOBILE for all mobile builds. Components that are not
-# applicable to mobile are disabled by this variable.
-# Setting `BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN` environment variable can
-# force it to do mobile build with host toolchain - which is useful for testing
-# purpose.
-if(ANDROID OR IOS OR DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN})
+# applicable to mobile are disabled by this variable. Setting
+# `BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN` environment variable can force it
+# to do mobile build with host toolchain - which is useful for testing purpose.
+if(ANDROID
+   OR IOS
+   OR DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN})
   set(INTERN_BUILD_MOBILE ON)
   message(WARNING "INTERN_BUILD_MOBILE is on, disabling BUILD_LAZY_TS_BACKEND")
   set(BUILD_LAZY_TS_BACKEND OFF)
+
+  set(USE_KLEIDIAI OFF)
+  message(WARNING "KleidiAI cannot be used on Mobile builds. Set it to OFF")
 
   # Set -ffunction-sections and -fdata-sections so that each method has its own
   # text section. This allows the linker to remove unused section when the flag
@@ -594,12 +906,11 @@ if(ANDROID OR IOS OR DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN})
   string(APPEND CMAKE_C_FLAGS " -fdata-sections")
 
   # Please note that the use of the following flags is required when linking
-  # against libtorch_cpu.a for mobile builds.
-  # -Wl,--whole-archive -ltorch_cpu -Wl,--no-whole-archive
+  # against libtorch_cpu.a for mobile builds. -Wl,--whole-archive -ltorch_cpu
+  # -Wl,--no-whole-archive
   #
-  # This allows global constructors to be included and run. Global
-  # constructors are used for operator/kernel registration with the
-  # PyTorch Dispatcher.
+  # This allows global constructors to be included and run. Global constructors
+  # are used for operator/kernel registration with the PyTorch Dispatcher.
 
   if(DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN})
     # C10_MOBILE is derived from Android/iOS toolchain macros in
@@ -608,10 +919,10 @@ if(ANDROID OR IOS OR DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN})
   endif()
 
   if(DEFINED ENV{PYTORCH_MOBILE_TRIM_DISPATCH_KEY_SET})
-    # If PYTORCH_MOBILE_TRIM_DISPATCH_KEY_SET is defined (env var),
-    # then define C10_MOBILE_TRIM_DISPATCH_KEYS, which limits the
-    # number of dispatch keys in OperatorEntry::dispatchTable_
-    # to reduce peak memory during library initialization.
+    # If PYTORCH_MOBILE_TRIM_DISPATCH_KEY_SET is defined (env var), then define
+    # C10_MOBILE_TRIM_DISPATCH_KEYS, which limits the number of dispatch keys in
+    # OperatorEntry::dispatchTable_ to reduce peak memory during library
+    # initialization.
     string(APPEND CMAKE_CXX_FLAGS " -DC10_MOBILE_TRIM_DISPATCH_KEYS")
   endif()
 endif()
@@ -623,8 +934,70 @@ if(NOT DEFINED USE_BLAS)
   set(USE_BLAS ON)
 endif()
 
-# Build libtorch mobile library, which contains ATen/TH ops and native support for
-# TorchScript model, but doesn't contain not-yet-unified caffe2 ops;
+# Prioritized Text Linker Optimization
+if(USE_PRIORITIZED_TEXT_FOR_LD)
+  append_cxx_flag_if_supported("-ffunction-sections" CMAKE_CXX_FLAGS)
+  append_cxx_flag_if_supported("-fdata-sections" CMAKE_CXX_FLAGS)
+  append_c_flag_if_supported("-ffunction-sections" CMAKE_C_FLAGS)
+  append_c_flag_if_supported("-fdata-sections" CMAKE_C_FLAGS)
+
+  set(LINKER_SCRIPT_FILE_IN "${CMAKE_SOURCE_DIR}/cmake/prioritized_text.txt")
+  set(LINKER_SCRIPT_FILE_OUT "${CMAKE_SOURCE_DIR}/cmake/linker_script.ld")
+  set(LINKER_SCRIPT_PATH "${CMAKE_SOURCE_DIR}/tools/setup_helpers/generate_linker_script.py")
+  add_custom_command(
+    OUTPUT "${LINKER_SCRIPT_FILE_OUT}"
+    COMMAND ${Python_EXECUTABLE}
+            "${LINKER_SCRIPT_PATH}"
+            --filein "${LINKER_SCRIPT_FILE_IN}"
+            --fout   "${LINKER_SCRIPT_FILE_OUT}"
+    DEPENDS "${LINKER_SCRIPT_PATH}"
+            "${LINKER_SCRIPT_FILE_IN}"
+    VERBATIM
+  )
+  add_custom_target(generate_linker_script DEPENDS "${LINKER_SCRIPT_FILE_OUT}")
+elseif(LINUX AND CPU_AARCH64)
+  message(WARNING [[
+  It is strongly recommend to enable linker script optimization for all AArch64 Linux builds.
+  To do so please export USE_PRIORITIZED_TEXT_FOR_LD=1
+  ]])
+endif()
+
+if(USE_LLVM_BOLT)
+  # In addition to the flags below, BOLT also requires --emit-relocs for the
+  # linker. Since --emit-relocs increases the binary size, we limit the use to
+  # libraries that are actually optimized by BOLT instead of applying globally
+  # (see torch_optimize_layout_if_enabled)
+  list(APPEND _bolt_flags
+    "-fno-plt" # shows a perf boost in NVIDIA internal CI
+    "-fno-reorder-blocks-and-partition" # required by BOLT when using GCC>=8
+  )
+  foreach(_flag IN LISTS _bolt_flags)
+    append_c_flag_if_supported("${_flag}" CMAKE_C_FLAGS)
+    append_cxx_flag_if_supported("${_flag}" CMAKE_CXX_FLAGS)
+  endforeach()
+
+  if(NOT LLVM_BOLT_PROFILES_DIR)
+    # Extract the committed BOLT profiles for the build-time optimization
+    # step (torch_optimize_layout_if_enabled in cmake/public/utils.cmake).
+    set(LLVM_BOLT_PROFILES_DIR "${CMAKE_BINARY_DIR}/bolt_profiles")
+    file(REMOVE_RECURSE "${LLVM_BOLT_PROFILES_DIR}")
+    file(ARCHIVE_EXTRACT INPUT "${PROJECT_SOURCE_DIR}/cmake/bolt_profiles/torch.tar.zst"
+         DESTINATION "${LLVM_BOLT_PROFILES_DIR}")
+  endif()
+
+  add_custom_target(bolt_profile_quality_summary ALL
+    COMMAND "${Python_EXECUTABLE}"
+      "${PROJECT_SOURCE_DIR}/tools/bolt_profile_quality.py"
+      "$<TARGET_PROPERTY:bolt_profile_quality_summary,SCRIPT_ARGS>"
+    COMMENT "Summarizing BOLT profile quality"
+    VERBATIM
+    USES_TERMINAL
+    COMMAND_EXPAND_LISTS
+  )
+endif()
+
+# Build libtorch mobile library, which contains ATen/TH ops and native support
+# for TorchScript model, but doesn't contain not-yet-unified caffe2 ops;
 if(INTERN_BUILD_MOBILE)
   if(NOT BUILD_SHARED_LIBS AND NOT "${SELECTED_OP_LIST}" STREQUAL "")
     string(APPEND CMAKE_CXX_FLAGS " -DNO_EXPORT")
@@ -635,45 +1008,40 @@ if(INTERN_BUILD_MOBILE)
     set(INTERN_DISABLE_AUTOGRAD ON)
   endif()
   set(BUILD_PYTHON OFF)
-  set(BUILD_FUNCTORCH OFF)
-  set(BUILD_CAFFE2_OPS OFF)
   set(USE_DISTRIBUTED OFF)
   set(NO_API ON)
   set(USE_FBGEMM OFF)
-  set(USE_QNNPACK OFF)
   set(INTERN_DISABLE_ONNX ON)
   if(USE_BLAS)
     set(INTERN_USE_EIGEN_BLAS ON)
   else()
     set(INTERN_USE_EIGEN_BLAS OFF)
   endif()
-  # Disable developing mobile interpreter for actual mobile build.
-  # Enable it elsewhere to capture build error.
+  # Disable developing mobile interpreter for actual mobile build. Enable it
+  # elsewhere to capture build error.
   set(INTERN_DISABLE_MOBILE_INTERP ON)
 endif()
 
 # ---[ Version numbers for generated libraries
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS version.txt)
 file(READ version.txt TORCH_DEFAULT_VERSION)
 # Strip trailing newline
 string(REGEX REPLACE "\n$" "" TORCH_DEFAULT_VERSION "${TORCH_DEFAULT_VERSION}")
 if("${TORCH_DEFAULT_VERSION} " STREQUAL " ")
   message(WARNING "Could not get version from base 'version.txt'")
-  # If we can't get the version from the version file we should probably
-  # set it to something non-sensical like 0.0.0
-  set(TORCH_DEFAULT_VERSION, "0.0.0")
+  # If we can't get the version from the version file we should probably set it
+  # to something non-sensical like 0.0.0
+  set(TORCH_DEFAULT_VERSION "0.0.0")
 endif()
-set(TORCH_BUILD_VERSION "${TORCH_DEFAULT_VERSION}" CACHE STRING "Torch build version")
+set(TORCH_BUILD_VERSION
+    "${TORCH_DEFAULT_VERSION}"
+    CACHE STRING "Torch build version" FORCE)
 if(DEFINED ENV{PYTORCH_BUILD_VERSION})
-  set(TORCH_BUILD_VERSION "$ENV{PYTORCH_BUILD_VERSION}"
-    CACHE STRING "Torch build version" FORCE)
-endif()
-if(NOT TORCH_BUILD_VERSION)
-  # An empty string was specified so force version to the default
-  set(TORCH_BUILD_VERSION "${TORCH_DEFAULT_VERSION}"
-    CACHE STRING "Torch build version" FORCE)
+  set(TORCH_BUILD_VERSION
+      "$ENV{PYTORCH_BUILD_VERSION}"
+      CACHE STRING "Torch build version" FORCE)
 endif()
 caffe2_parse_version_str(TORCH ${TORCH_BUILD_VERSION})
-caffe2_parse_version_str(CAFFE2 ${TORCH_BUILD_VERSION})
 set(TORCH_SOVERSION "${TORCH_VERSION_MAJOR}.${TORCH_VERSION_MINOR}")
 
 # ---[ CMake scripts + modules
@@ -688,32 +1056,53 @@ enable_testing()
 
 # ---[ Build variables set within the cmake tree
 include(cmake/BuildVariables.cmake)
-set(CAFFE2_ALLOWLIST "" CACHE STRING "A allowlist file of files that one should build.")
+set(CAFFE2_ALLOWLIST
+    ""
+    CACHE STRING "A allowlist file of files that one should build.")
 
 # Set default build type
 if(NOT CMAKE_BUILD_TYPE)
-    message(STATUS "Build type not set - defaulting to Release")
-    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build from: Debug Release RelWithDebInfo MinSizeRel Coverage." FORCE)
+  message(STATUS "Build type not set - defaulting to Release")
+  set(CMAKE_BUILD_TYPE
+      "Release"
+      CACHE
+        STRING
+        "Choose the type of build from: Debug Release RelWithDebInfo MinSizeRel Coverage."
+        FORCE)
 endif()
 
 # The below means we are cross compiling for arm64 or x86_64 on MacOSX
-if(NOT IOS AND CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_OSX_ARCHITECTURES MATCHES "^(x86_64|arm64)$")
+if(NOT IOS
+   AND CMAKE_SYSTEM_NAME STREQUAL "Darwin"
+   AND CMAKE_OSX_ARCHITECTURES MATCHES "^(x86_64|arm64)$")
   set(CROSS_COMPILING_MACOSX TRUE)
-  # We need to compile a universal protoc to not fail protobuf build
-  # We set CMAKE_TRY_COMPILE_TARGET_TYPE to STATIC_LIBRARY (vs executable) to succeed the cmake compiler check for cross-compiling
-  set(protoc_build_command "./scripts/build_host_protoc.sh --other-flags -DCMAKE_OSX_ARCHITECTURES=\"x86_64;arm64\" -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_C_COMPILER_WORKS=1 -DCMAKE_CXX_COMPILER_WORKS=1")
-  # We write to a temp scriptfile because CMake COMMAND dislikes double quotes in commands
-  file(WRITE ${PROJECT_SOURCE_DIR}/tmp_protoc_script.sh "#!/bin/bash\n${protoc_build_command}")
-  file(COPY ${PROJECT_SOURCE_DIR}/tmp_protoc_script.sh DESTINATION ${PROJECT_SOURCE_DIR}/scripts/ FILE_PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ)
-  execute_process(COMMAND ./scripts/tmp_protoc_script.sh
-                  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-                  RESULT_VARIABLE BUILD_HOST_PROTOC_RESULT)
-  file(REMOVE ${PROJECT_SOURCE_DIR}/tmp_protoc_script.sh ${PROJECT_SOURCE_DIR}/scripts/tmp_protoc_script.sh)
+  # We need to compile a universal protoc to not fail protobuf build We set
+  # CMAKE_TRY_COMPILE_TARGET_TYPE to STATIC_LIBRARY (vs executable) to succeed
+  # the cmake compiler check for cross-compiling
+  set(protoc_build_command
+      "./scripts/build_host_protoc.sh --other-flags -DCMAKE_OSX_ARCHITECTURES=\"x86_64;arm64\" -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_C_COMPILER_WORKS=1 -DCMAKE_CXX_COMPILER_WORKS=1 -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+  )
+  # We write to a temp scriptfile because CMake COMMAND dislikes double quotes
+  # in commands
+  file(WRITE ${PROJECT_SOURCE_DIR}/tmp_protoc_script.sh
+       "#!/bin/bash\n${protoc_build_command}")
+  file(
+    COPY ${PROJECT_SOURCE_DIR}/tmp_protoc_script.sh
+    DESTINATION ${PROJECT_SOURCE_DIR}/scripts/
+    FILE_PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ)
+  execute_process(
+    COMMAND ./scripts/tmp_protoc_script.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    RESULT_VARIABLE BUILD_HOST_PROTOC_RESULT)
+  file(REMOVE ${PROJECT_SOURCE_DIR}/tmp_protoc_script.sh
+       ${PROJECT_SOURCE_DIR}/scripts/tmp_protoc_script.sh)
   if(NOT BUILD_HOST_PROTOC_RESULT EQUAL "0")
     message(FATAL_ERROR "Could not compile universal protoc.")
   endif()
-  set(PROTOBUF_PROTOC_EXECUTABLE "${PROJECT_SOURCE_DIR}/build_host_protoc/bin/protoc")
-  set(CAFFE2_CUSTOM_PROTOC_EXECUTABLE "${PROJECT_SOURCE_DIR}/build_host_protoc/bin/protoc")
+  set(PROTOBUF_PROTOC_EXECUTABLE
+      "${PROJECT_SOURCE_DIR}/build_host_protoc/bin/protoc")
+  set(CAFFE2_CUSTOM_PROTOC_EXECUTABLE
+      "${PROJECT_SOURCE_DIR}/build_host_protoc/bin/protoc")
 endif()
 
 # ---[ Misc checks to cope with various compiler modes
@@ -722,9 +1111,14 @@ include(cmake/MiscCheck.cmake)
 # External projects
 include(ExternalProject)
 
-# ---[ Dependencies
-# ---[ FBGEMM doesn't work on x86 32bit and CMAKE_SYSTEM_PROCESSOR thinks its 64bit
-if(USE_FBGEMM AND ((CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" AND CMAKE_SIZEOF_VOID_P EQUAL 4) OR CMAKE_SYSTEM_PROCESSOR STREQUAL "x86"))
+# ---[ Dependencies ---[ FBGEMM doesn't work on x86 32bit and
+# CMAKE_SYSTEM_PROCESSOR thinks its 64bit
+if(USE_FBGEMM AND (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64|aarch64)$"
+                   OR CMAKE_SIZEOF_VOID_P EQUAL 4))
+  message(WARNING
+    "64-bit x86 or aarch64 required for FBGEMM. "
+    "Not compiling with FBGEMM. "
+    "Turn this warning off by USE_FBGEMM=OFF.")
   set(USE_FBGEMM OFF)
 endif()
 
@@ -735,16 +1129,15 @@ if(MSVC)
   append_cxx_flag_if_supported("/utf-8" CMAKE_CXX_FLAGS)
 endif()
 
-# Note for ROCM platform:
-# 1. USE_ROCM is always ON until include(cmake/Dependencies.cmake)
-# 2. USE_CUDA will become OFF during re-configuration
-# Truth Table:
-# CUDA 1st pass: USE_CUDA=True;USE_ROCM=True, FLASH evaluates to ON by default
-# CUDA 2nd pass: USE_CUDA=True;USE_ROCM=False, FLASH evaluates to ON by default
-# ROCM 1st pass: USE_CUDA=True;USE_ROCM=True, FLASH evaluates to ON by default
-# ROCM 2nd pass: USE_CUDA=False;USE_ROCM=True, FLASH evaluates to ON by default
-# CPU 1st pass: USE_CUDA=False(Cmd Option);USE_ROCM=True, FLASH evaluates to OFF by default
-# CPU 2nd pass: USE_CUDA=False(Cmd Option);USE_ROCM=False, FLASH evaluates to OFF by default
+# Note for ROCM platform: 1. USE_ROCM is always ON until
+# include(cmake/Dependencies.cmake) 2. USE_CUDA will become OFF during
+# re-configuration Truth Table: CUDA 1st pass: USE_CUDA=True;USE_ROCM=True,
+# FLASH evaluates to ON by default CUDA 2nd pass: USE_CUDA=True;USE_ROCM=False,
+# FLASH evaluates to ON by default ROCM 1st pass: USE_CUDA=True;USE_ROCM=True,
+# FLASH evaluates to ON by default ROCM 2nd pass: USE_CUDA=False;USE_ROCM=True,
+# FLASH evaluates to ON by default CPU 1st pass: USE_CUDA=False(Cmd
+# Option);USE_ROCM=True, FLASH evaluates to OFF by default CPU 2nd pass:
+# USE_CUDA=False(Cmd Option);USE_ROCM=False, FLASH evaluates to OFF by default
 # Thus we cannot tell ROCM 2nd pass and CPU 1st pass
 #
 # The only solution is to include(cmake/Dependencies.cmake), and defer the
@@ -755,50 +1148,96 @@ include(cmake/Dependencies.cmake)
 cmake_dependent_option(
   USE_FLASH_ATTENTION
   "Whether to build the flash_attention kernel for scaled dot product attention.\
-  Will be disabled if not supported by the platform" ON
-  "USE_CUDA OR USE_ROCM;NOT MSVC" OFF)
+  Will be disabled if not supported by the platform"
+  ON
+  "USE_CUDA OR USE_ROCM"
+  OFF)
 
-# We are currenlty not using alibi attention for Flash
-# So we disable this feature by default
-# We dont currently document this feature because we don't
-# Suspect users building from source will need this
-add_definitions(-DFLASHATTENTION_DISABLE_ALIBI)
+# Flash Attention needs sm80+; disable it if no resolved arch reaches that.
+if(USE_FLASH_ATTENTION AND USE_CUDA AND NOT USE_ROCM)
+  string(REPLACE " " ";" _flash_attn_archs "${NVCC_FLAGS_EXTRA_readable}")
+  set(_flash_attn_has_sm80 OFF)
+  foreach(_arch IN LISTS _flash_attn_archs)
+    if(_arch MATCHES "^(sm|compute)_([0-9]+)" AND CMAKE_MATCH_2 GREATER_EQUAL 80)
+      set(_flash_attn_has_sm80 ON)
+    endif()
+  endforeach()
+  if(_flash_attn_archs AND NOT _flash_attn_has_sm80)
+    message(STATUS
+      "Disabling USE_FLASH_ATTENTION: it needs a CUDA architecture >= 8.0, "
+      "but the resolved CUDA architectures are '${_flash_attn_archs}'")
+    set(USE_FLASH_ATTENTION OFF)
+  endif()
+endif()
 
-# CAVEAT: Again, do not check USE_ROCM here
-# Flash Attention2 will error while building for sm52 while Mem Eff Attention won't
+IF(USE_ROCM AND ("gfx942" IN_LIST PYTORCH_ROCM_ARCH OR "gfx950" IN_LIST PYTORCH_ROCM_ARCH))
+  message(WARNING "Setting USE_MSLK for gfx942/gfx950 to ON by default, doing ROCM build")
+  set(USE_MSLK_DEFAULT ON)
+elseif(USE_CUDA AND "$ENV{TORCH_CUDA_ARCH_LIST}" MATCHES "10.0" AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND NOT WIN32)
+  message(STATUS "Setting USE_MSLK to ON by default , doing CUDA build for SM100a")
+  set(USE_MSLK_DEFAULT ON)
+else()
+  set(USE_MSLK_DEFAULT OFF)
+endif()
+
+cmake_dependent_option(
+  USE_MSLK
+  "Whether to build MSLK quantized GEMM kernels.\
+  Will be disabled if not supported by the platform"
+  ${USE_MSLK_DEFAULT}
+  "(USE_CUDA AND NOT MSVC) OR USE_ROCM"
+  OFF)
+
+
+# CAVEAT: Again, Flash Attention2 will error while building for sm52 while Mem
+# Eff Attention won't
 cmake_dependent_option(
   USE_MEM_EFF_ATTENTION
   "Enable memory-efficient attention for scaled dot product attention.\
   Will be disabled if not supported by the platform" ON
-  "USE_CUDA" OFF)
+  "USE_CUDA OR USE_ROCM" OFF)
+
+#
+# Cannot be put into Dependencies.cmake due circular dependency:
+# USE_FLASH_ATTENTION -> USE_ROCM -> Dependencies.cmake -> aotriton.cmake
+#
+if(USE_ROCM)
+  if(USE_FLASH_ATTENTION OR USE_MEM_EFF_ATTENTION)
+    include(cmake/External/aotriton.cmake)
+  endif()
+endif()
 
 if(DEBUG_CUDA)
   string(APPEND CMAKE_CUDA_FLAGS_DEBUG " -lineinfo")
   string(APPEND CMAKE_CUDA_FLAGS_RELWITHDEBINFO " -lineinfo")
-  # CUDA-12.1 crashes when trying to compile with --source-in-ptx
-  # See https://github.com/pytorch/pytorch/issues/102372#issuecomment-1572526893
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.1)
-    string(APPEND CMAKE_CUDA_FLAGS_DEBUG " --source-in-ptx")
-    string(APPEND CMAKE_CUDA_FLAGS_RELWITHDEBINFO " --source-in-ptx")
-  endif()
 endif(DEBUG_CUDA)
-
 
 if(USE_FBGEMM)
   string(APPEND CMAKE_CXX_FLAGS " -DUSE_FBGEMM")
 endif()
 
-if(USE_QNNPACK)
-  string(APPEND CMAKE_CXX_FLAGS " -DUSE_QNNPACK")
+if(USE_MSLK)
+  string(APPEND CMAKE_CXX_FLAGS " -DUSE_MSLK")
 endif()
 
 if(USE_PYTORCH_QNNPACK)
   string(APPEND CMAKE_CXX_FLAGS " -DUSE_PYTORCH_QNNPACK")
 endif()
 
-if(USE_SLEEF_FOR_ARM_VEC256)
+# Enable sleef on macOS with Apple silicon by default
+if((${CMAKE_SYSTEM_NAME} STREQUAL "Darwin") AND ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64"))
+  message(STATUS "Running on macOS with Apple silicon")
   string(APPEND CMAKE_CXX_FLAGS " -DAT_BUILD_ARM_VEC256_WITH_SLEEF")
+  add_compile_definitions(AT_BUILD_ARM_VEC256_WITH_SLEEF)
 endif()
+
+# Enable sleef on Arm(R) architecture by default (except Android)
+if((NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Android")
+  AND("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "aarch64"))
+  string(APPEND CMAKE_CXX_FLAGS " -DAT_BUILD_ARM_VEC256_WITH_SLEEF")
+  add_compile_definitions(AT_BUILD_ARM_VEC256_WITH_SLEEF)
+endif()
+
 
 if(USE_XNNPACK)
   string(APPEND CMAKE_CXX_FLAGS " -DUSE_XNNPACK")
@@ -849,17 +1288,20 @@ endif()
 # ---[ Allowlist file if allowlist is specified
 include(cmake/Allowlist.cmake)
 
-# ---[ Set link flag, handle additional deps for gcc 4.8 and above
-if(CMAKE_COMPILER_IS_GNUCXX AND NOT ANDROID)
-  message(STATUS "GCC ${CMAKE_CXX_COMPILER_VERSION}: Adding gcc and gcc_s libs to link line")
-  list(APPEND Caffe2_DEPENDENCY_LIBS gcc_s gcc)
-endif()
-
-# ---[ Build flags
-# Re-include to override append_cxx_flag_if_supported from third_party/FBGEMM
+# ---[ Build flags Re-include to override append_cxx_flag_if_supported from
+# third_party/FBGEMM
 include(cmake/public/utils.cmake)
+if(USE_COLORIZE_OUTPUT)
+  set(CMAKE_COLOR_DIAGNOSTICS ON)
+endif()
 if(NOT MSVC)
   string(APPEND CMAKE_CXX_FLAGS " -O2 -fPIC")
+
+  # This prevents use of `c10::optional`, `c10::nullopt` etc within the codebase
+  string(APPEND CMAKE_CXX_FLAGS " -DC10_NODEPRECATED")
+  string(APPEND CMAKE_CUDA_FLAGS " -DC10_NODEPRECATED")
+  string(APPEND CMAKE_OBJCXX_FLAGS " -DC10_NODEPRECATED")
+
   # Eigen fails to build with some versions, so convert this to a warning
   # Details at http://eigen.tuxfamily.org/bz/show_bug.cgi?id=1459
   string(APPEND CMAKE_CXX_FLAGS " -Wall")
@@ -870,26 +1312,26 @@ if(NOT MSVC)
   append_cxx_flag_if_supported("-Werror=range-loop-construct" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Werror=bool-operation" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wnarrowing" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-missing-field-initializers" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-type-limits" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-array-bounds" CMAKE_CXX_FLAGS)
+  append_cxx_flag_if_supported("-Wno-missing-field-initializers"
+                               CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wno-unknown-pragmas" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wno-unused-parameter" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-unused-function" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-unused-result" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wno-strict-overflow" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wno-strict-aliasing" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wno-stringop-overflow" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wvla-extension" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wsuggest-override" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wnewline-eof" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Winconsistent-missing-override" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Winconsistent-missing-destructor-override" CMAKE_CXX_FLAGS)
+  append_cxx_flag_if_supported("-Winconsistent-missing-override"
+                               CMAKE_CXX_FLAGS)
+  append_cxx_flag_if_supported("-Winconsistent-missing-destructor-override"
+                               CMAKE_CXX_FLAGS)
   if("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
     string(APPEND CMAKE_CXX_FLAGS " -Wno-pass-failed")
   endif()
   if(CMAKE_COMPILER_IS_GNUCXX)
-    # Suppress "The ABI for passing parameters with 64-byte alignment has changed in GCC 4.6"
+    # Suppress "The ABI for passing parameters with 64-byte alignment has
+    # changed in GCC 4.6"
     string(APPEND CMAKE_CXX_FLAGS " -Wno-psabi")
   endif()
 
@@ -901,43 +1343,31 @@ if(NOT MSVC)
       message(WARNING "Refusing to use gold when USE_MPI=1")
     else()
       execute_process(
-        COMMAND
-        "${CMAKE_C_COMPILER}" -fuse-ld=gold -Wl,--version
-         ERROR_QUIET
-         OUTPUT_VARIABLE LD_VERSION)
+        COMMAND "${CMAKE_C_COMPILER}" -fuse-ld=gold -Wl,--version
+        ERROR_QUIET
+        OUTPUT_VARIABLE LD_VERSION)
       if(NOT "${LD_VERSION}" MATCHES "GNU gold")
-        message(WARNING "USE_GOLD_LINKER was set but ld.gold isn't available, turning it off")
+        message(
+          WARNING
+            "USE_GOLD_LINKER was set but ld.gold isn't available, turning it off"
+        )
         set(USE_GOLD_LINKER OFF)
       else()
         message(STATUS "ld.gold is available, using it to link")
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=gold")
-        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=gold")
-        set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -fuse-ld=gold")
+        set(CMAKE_SHARED_LINKER_FLAGS
+            "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=gold")
+        set(CMAKE_MODULE_LINKER_FLAGS
+            "${CMAKE_MODULE_LINKER_FLAGS} -fuse-ld=gold")
       endif()
     endif()
   endif()
 
-  append_cxx_flag_if_supported("-Wno-error=pedantic" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wno-error=old-style-cast" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-error=inconsistent-missing-override" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-error=inconsistent-missing-destructor-override" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wconstant-conversion" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-invalid-partial-specialization" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-aligned-allocation-unavailable" CMAKE_CXX_FLAGS)
-  append_cxx_flag_if_supported("-Wno-missing-braces" CMAKE_CXX_FLAGS)
+  append_cxx_flag_if_supported("-Wno-aligned-allocation-unavailable"
+                               CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Qunused-arguments" CMAKE_CXX_FLAGS)
-
-  if(${USE_COLORIZE_OUTPUT})
-    # Why compiler checks are necessary even when `try_compile` is used
-    # Because of the bug in ccache that can incorrectly identify `-fcolor-diagnostics`
-    # As supported by GCC, see https://github.com/ccache/ccache/issues/740 (for older ccache)
-    # and https://github.com/ccache/ccache/issues/1275 (for newer ones)
-    if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-      append_cxx_flag_if_supported("-fdiagnostics-color=always" CMAKE_CXX_FLAGS)
-    else()
-      append_cxx_flag_if_supported("-fcolor-diagnostics" CMAKE_CXX_FLAGS)
-    endif()
-  endif()
 
   append_cxx_flag_if_supported("-faligned-new" CMAKE_CXX_FLAGS)
 
@@ -947,15 +1377,42 @@ if(NOT MSVC)
       set(WERROR FALSE)
     endif()
   endif()
-  append_cxx_flag_if_supported("-Wno-unused-but-set-variable" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Wno-maybe-uninitialized" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-fstandalone-debug" CMAKE_CXX_FLAGS_DEBUG)
-  string(APPEND CMAKE_CXX_FLAGS_DEBUG " -fno-omit-frame-pointer -O0")
-  string(APPEND CMAKE_LINKER_FLAGS_DEBUG " -fno-omit-frame-pointer -O0")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    if(CMAKE_BUILD_TYPE MATCHES Debug)
+      message(WARNING "Applying -Og optimization for aarch64 GCC debug build to workaround ICE")
+    endif()
+    string(APPEND CMAKE_CXX_FLAGS_DEBUG " -fno-omit-frame-pointer -Og")
+  else()
+    string(APPEND CMAKE_CXX_FLAGS_DEBUG " -fno-omit-frame-pointer -O0")
+  endif()
+  # aarch64 C++ stack unwinding uses frame-pointer chain walking, so frame
+  # pointers must be present in all build types.  The cost is negligible on
+  # aarch64 (31 GPRs vs x86-64's 16, so dedicating x29 rarely spills).
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    append_cxx_flag_if_supported("-fno-omit-frame-pointer" CMAKE_CXX_FLAGS)
+  endif()
   append_cxx_flag_if_supported("-fno-math-errno" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-fno-trapping-math" CMAKE_CXX_FLAGS)
   append_cxx_flag_if_supported("-Werror=format" CMAKE_CXX_FLAGS)
+  if(CMAKE_COMPILER_IS_GNUCXX AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+    append_cxx_flag_if_supported("-Wno-dangling-reference" CMAKE_CXX_FLAGS)
+    append_cxx_flag_if_supported("-Wno-error=dangling-reference" CMAKE_CXX_FLAGS)
+  endif()
+  if(CMAKE_COMPILER_IS_GNUCXX AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+    # Suppress GCC's warning without changing the value of
+    # std::hardware_destructive_interference_size in public headers.
+    append_cxx_flag_if_supported("-Wno-interference-size" CMAKE_CXX_FLAGS)
+  endif()
+  # needed for compat with newer versions of clang that use C++20 mangling rules
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 18)
+    append_cxx_flag_if_supported("-fclang-abi-compat=17" CMAKE_CXX_FLAGS)
+  endif()
 else()
+  # Define export functions for AOTI.
+  add_compile_definitions(EXPORT_AOTI_FUNCTIONS)
+
   # skip unwanted includes from windows.h
   add_compile_definitions(WIN32_LEAN_AND_MEAN)
   # Windows SDK broke compatibility since version 25131, but introduced this
@@ -963,8 +1420,8 @@ else()
   add_compile_definitions(_UCRT_LEGACY_INFINITY)
   # disable min/max macros
   add_compile_definitions(NOMINMAX)
-  # Turn off these warnings on Windows.
-  # destructor was implicitly defined as delete
+  # Turn off these warnings on Windows. destructor was implicitly defined as
+  # delete
   append_cxx_flag_if_supported("/wd4624" CMAKE_CXX_FLAGS)
   # unknown pragma
   append_cxx_flag_if_supported("/wd4068" CMAKE_CXX_FLAGS)
@@ -984,67 +1441,46 @@ else()
   append_cxx_flag_if_supported("/wd4273" CMAKE_CXX_FLAGS)
 endif()
 
-
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-  include(CheckCSourceCompiles)
-  check_c_source_compiles("#include <arm_neon.h>
-int main() {
-  float a[] = {1.0, 1.0};
-  float32x4x2_t v;
-  v.val[0] = vcombine_f32 (vcreate_f32 (0UL), vcreate_f32 (0UL));
-  v.val[1] = vcombine_f32 (vcreate_f32 (0UL), vcreate_f32 (0UL));
-  vst1q_f32_x2(a, v);
-  return 0;
-}" HAS_VST1)
-
-  if(NOT HAS_VST1)
-    string(APPEND CMAKE_CXX_FLAGS " -DMISSING_ARM_VST1")
-  endif()
-endif()
-
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-  include(CheckCSourceCompiles)
-  check_c_source_compiles("#include <arm_neon.h>
-int main() {
-  float a[] = {1.0, 1.0};
-  vld1q_f32_x2(a);
-  return 0;
-}" HAS_VLD1)
-
-  if(NOT HAS_VLD1)
-    string(APPEND CMAKE_CXX_FLAGS " -DMISSING_ARM_VLD1")
-  endif()
-endif()
-
-
 # Add code coverage flags to supported compilers
 if(USE_CPP_CODE_COVERAGE)
   if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-    string(APPEND CMAKE_C_FLAGS  " --coverage -fprofile-abs-path")
-    string(APPEND CMAKE_CXX_FLAGS  " --coverage -fprofile-abs-path")
+    string(APPEND CMAKE_C_FLAGS " --coverage -fprofile-abs-path")
+    string(APPEND CMAKE_CXX_FLAGS " --coverage -fprofile-abs-path")
+    string(APPEND CMAKE_OBJCXX_FLAGS " --coverage -fprofile-abs-path")
   elseif("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
-    string(APPEND CMAKE_C_FLAGS  " -fprofile-instr-generate -fcoverage-mapping")
+    string(APPEND CMAKE_C_FLAGS " -fprofile-instr-generate -fcoverage-mapping")
     string(APPEND CMAKE_CXX_FLAGS " -fprofile-instr-generate -fcoverage-mapping")
+    string(APPEND CMAKE_OBJCXX_FLAGS " -fprofile-instr-generate -fcoverage-mapping")
   else()
-    message(ERROR "Code coverage for compiler ${CMAKE_CXX_COMPILER_ID} is unsupported")
+    message(
+      FATAL_ERROR
+      "Code coverage for compiler ${CMAKE_CXX_COMPILER_ID} is unsupported")
   endif()
 
 endif()
 
 if(APPLE)
-    if(USE_MPS)
-      string(APPEND CMAKE_OBJCXX_FLAGS " -DUSE_MPS -fno-objc-arc")
-      string(APPEND CMAKE_CXX_FLAGS " -DUSE_MPS")
-      string(APPEND CMAKE_SHARED_LINKER_FLAGS " -weak_framework Foundation -weak_framework MetalPerformanceShaders -weak_framework MetalPerformanceShadersGraph -weak_framework Metal")
-      # To suppress MPSGraph availability warnings
-      append_cxx_flag_if_supported("-Wno-unguarded-availability-new" CMAKE_OBJCXX_FLAGS)
-    endif()
-    append_cxx_flag_if_supported("-Wno-unused-private-field" CMAKE_CXX_FLAGS)
-    append_cxx_flag_if_supported("-Wno-missing-braces" CMAKE_CXX_FLAGS)
+  if(USE_MPS)
+    string(APPEND CMAKE_OBJCXX_FLAGS " -DUSE_MPS -fno-objc-arc")
+    string(APPEND CMAKE_CXX_FLAGS " -DUSE_MPS")
+    string(
+      APPEND
+      CMAKE_SHARED_LINKER_FLAGS
+      " -weak_framework Foundation -weak_framework MetalPerformanceShaders -weak_framework MetalPerformanceShadersGraph -weak_framework Metal -weak_framework IOKit"
+    )
+    # To suppress MPSGraph availability warnings
+    append_cxx_flag_if_supported("-Wno-unguarded-availability-new"
+                                 CMAKE_OBJCXX_FLAGS)
+  endif()
+  append_cxx_flag_if_supported("-Wno-missing-braces" CMAKE_CXX_FLAGS)
 endif()
 
 if(EMSCRIPTEN)
-  string(APPEND CMAKE_CXX_FLAGS " -Wno-implicit-function-declaration -DEMSCRIPTEN -s DISABLE_EXCEPTION_CATCHING=0")
+  string(
+    APPEND
+    CMAKE_CXX_FLAGS
+    " -Wno-implicit-function-declaration -DEMSCRIPTEN -s DISABLE_EXCEPTION_CATCHING=0"
+  )
 endif()
 
 append_cxx_flag_if_supported("-Wno-stringop-overflow" CMAKE_CXX_FLAGS)
@@ -1063,15 +1499,13 @@ if(NOT APPLE AND UNIX)
   list(APPEND Caffe2_DEPENDENCY_LIBS dl)
 endif()
 
-# Prefix path to Caffe2 headers.
-# If a directory containing installed Caffe2 headers was inadvertently
-# added to the list of include directories, prefixing
+# Prefix path to Caffe2 headers. If a directory containing installed Caffe2
+# headers was inadvertently added to the list of include directories, prefixing
 # PROJECT_SOURCE_DIR means this source tree always takes precedence.
 include_directories(BEFORE ${PROJECT_SOURCE_DIR})
 
-# Prefix path to generated Caffe2 headers.
-# These need to take precedence over their empty counterparts located
-# in PROJECT_SOURCE_DIR.
+# Prefix path to generated Caffe2 headers. These need to take precedence over
+# their empty counterparts located in PROJECT_SOURCE_DIR.
 include_directories(BEFORE ${PROJECT_BINARY_DIR})
 
 include_directories(BEFORE ${PROJECT_SOURCE_DIR}/aten/src/)
@@ -1082,143 +1516,102 @@ if(USE_MIMALLOC)
   set(MI_BUILD_SHARED OFF)
   set(MI_BUILD_OBJECT OFF)
   set(MI_BUILD_TESTS OFF)
-  add_definitions(-DUSE_MIMALLOC)
+  add_compile_definitions(USE_MIMALLOC)
   add_subdirectory(third_party/mimalloc)
   include_directories(third_party/mimalloc/include)
 endif()
 
+if(USE_MIMALLOC AND USE_MIMALLOC_ON_MKL)
+  add_compile_definitions(USE_MIMALLOC_ON_MKL)
+endif()
+
 # ---[ Main build
+add_subdirectory(torch/headeronly)  # headeronly headers
 add_subdirectory(c10)
 add_subdirectory(caffe2)
 
-# --[ Documentation
-if(BUILD_DOCS)
-  # check if Doxygen is installed
-  find_package(Doxygen)
-  if(DOXYGEN_FOUND)
-    message("Generating documentation")
-
-    set(DOXYGEN_C_IN ${CMAKE_CURRENT_SOURCE_DIR}/docs/caffe2/.Doxyfile-c)
-    set(DOXYGEN_C_OUT ${CMAKE_CURRENT_SOURCE_DIR}/docs/caffe2/Doxyfile-c)
-    set(DOXYGEN_P_IN ${CMAKE_CURRENT_SOURCE_DIR}/docs/caffe2/.Doxyfile-python)
-    set(DOXYGEN_P_OUT ${CMAKE_CURRENT_SOURCE_DIR}/docs/caffe2/Doxyfile-python)
-
-    if(EXISTS ${CMAKE_CURRENT_BINARY_DIR}/docs)
-      file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/docs)
-    endif()
-
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/docs)
-    configure_file(${DOXYGEN_C_IN} ${DOXYGEN_C_OUT} @ONLY)
-    configure_file(${DOXYGEN_P_IN} ${DOXYGEN_P_OUT} @ONLY)
-
-    add_custom_target(doc_doxygen_c ALL
-        COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_C_OUT}
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        COMMENT "Generating C++ API documentation with Doxygen"
-        VERBATIM)
-
-    add_custom_target(doc_doxygen_python ALL
-        COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_P_OUT}
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        COMMENT "Generating Python API documentation with Doxygen"
-        VERBATIM)
-  else()
-    message(FATAL_ERROR "Doxygen needs to be installed to generate the documentation")
-  endif()
-endif()
-
-# ---[ CMake related files
-# Uninistall option.
+# ---[ CMake related files Uninstall option.
 if(NOT TARGET caffe2_uninstall)
   configure_file(
-      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cmake_uninstall.cmake.in
-      ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake
-      IMMEDIATE @ONLY)
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cmake_uninstall.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake IMMEDIATE @ONLY)
 
-  add_custom_target(caffe2_uninstall
-      COMMAND ${CMAKE_COMMAND} -P
-      ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
+  add_custom_target(
+    caffe2_uninstall COMMAND ${CMAKE_COMMAND} -P
+                             ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
 endif()
 
-# ---[ Make configuration files for cmake to allow dependent libraries
-# easier access to Caffe2.
+# ---[ Make configuration files for cmake to allow dependent libraries easier
+# access to Caffe2.
 
-if((NOT USE_GLOG) OR (NOT USE_GFLAGS) OR BUILD_CUSTOM_PROTOBUF)
-  message(WARNING
-      "Generated cmake files are only fully tested if one builds "
-      "with system glog, gflags, and protobuf. Other settings may "
-      "generate files that are not well tested.")
+if((NOT USE_GLOG)
+   OR(NOT USE_GFLAGS)
+   OR BUILD_CUSTOM_PROTOBUF)
+  message(WARNING "Generated cmake files are only fully tested if one builds "
+                  "with system glog, gflags, and protobuf. Other settings may "
+                  "generate files that are not well tested.")
 endif()
 
-if(USE_CUDA OR USE_ROCM)
-  # TODO: check if we should include other cuda dependency libraries
-  # to the interface as well.
 
-endif()
-
-# Note(jiayq): when building static libraries, all PRIVATE dependencies
-# will also become interface libraries, and as a result if there are any
-# dependency libraries that are not exported, the following install export
-# script will fail. As a result, we will only provide the targets cmake
-# files for shared lib installation. For more info, read:
+# Note(jiayq): when building static libraries, all PRIVATE dependencies will
+# also become interface libraries, and as a result if there are any dependency
+# libraries that are not exported, the following install export script will
+# fail. As a result, we will only provide the targets cmake files for shared lib
+# installation. For more info, read:
 # https://cmake.org/pipermail/cmake/2016-May/063400.html
 if(BUILD_SHARED_LIBS)
-  configure_file(
-      ${PROJECT_SOURCE_DIR}/cmake/Caffe2Config.cmake.in
-      ${PROJECT_BINARY_DIR}/Caffe2Config.cmake
-      @ONLY)
-  install(FILES
-      ${PROJECT_BINARY_DIR}/Caffe2Config.cmake
+  configure_file(${PROJECT_SOURCE_DIR}/cmake/Caffe2Config.cmake.in
+                 ${PROJECT_BINARY_DIR}/Caffe2Config.cmake @ONLY)
+  install(
+    FILES ${PROJECT_BINARY_DIR}/Caffe2Config.cmake
+    DESTINATION share/cmake/Caffe2
+    COMPONENT dev)
+  install(
+    FILES ${PROJECT_SOURCE_DIR}/cmake/public/cuda.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/xpu.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/glog.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/gflags.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/mkl.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/mkldnn.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/protobuf.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/utils.cmake
+          ${PROJECT_SOURCE_DIR}/cmake/public/LoadHIP.cmake
+    DESTINATION share/cmake/Caffe2/public
+    COMPONENT dev)
+  install(
+    DIRECTORY ${PROJECT_SOURCE_DIR}/cmake/Modules_CUDA_fix
+    DESTINATION share/cmake/Caffe2/
+    COMPONENT dev)
+  install(
+    FILES ${PROJECT_SOURCE_DIR}/cmake/Modules/FindCUDAToolkit.cmake
+    DESTINATION share/cmake/Caffe2/
+    COMPONENT dev)
+  install(
+    FILES ${PROJECT_SOURCE_DIR}/cmake/Modules/FindCUSPARSELT.cmake
+    DESTINATION share/cmake/Caffe2/
+    COMPONENT dev)
+  install(
+    FILES ${PROJECT_SOURCE_DIR}/cmake/Modules/FindCUDSS.cmake
+    DESTINATION share/cmake/Caffe2/
+    COMPONENT dev)
+  install(
+    FILES ${PROJECT_SOURCE_DIR}/cmake/Modules/FindSYCLToolkit.cmake
+    DESTINATION share/cmake/Caffe2/
+    COMPONENT dev)
+  if(NOT BUILD_LIBTORCHLESS)
+    install(
+      EXPORT Caffe2Targets
       DESTINATION share/cmake/Caffe2
-      COMPONENT dev)
-  install(FILES
-      ${PROJECT_SOURCE_DIR}/cmake/public/cuda.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/xpu.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/glog.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/gflags.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/mkl.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/mkldnn.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/protobuf.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/utils.cmake
-      ${PROJECT_SOURCE_DIR}/cmake/public/LoadHIP.cmake
-      DESTINATION share/cmake/Caffe2/public
-      COMPONENT dev)
-  install(DIRECTORY
-      ${PROJECT_SOURCE_DIR}/cmake/Modules_CUDA_fix
-      DESTINATION share/cmake/Caffe2/
-      COMPONENT dev)
-  install(FILES
-      ${PROJECT_SOURCE_DIR}/cmake/Modules/FindCUDAToolkit.cmake
-      DESTINATION share/cmake/Caffe2/
-      COMPONENT dev)
-  install(FILES
-      ${PROJECT_SOURCE_DIR}/cmake/Modules/FindCUSPARSELT.cmake
-      DESTINATION share/cmake/Caffe2/
-      COMPONENT dev)
-  install(FILES
-      ${PROJECT_SOURCE_DIR}/cmake/Modules/FindSYCLToolkit.cmake
-      DESTINATION share/cmake/Caffe2/
-      COMPONENT dev)
-
-  install(EXPORT Caffe2Targets DESTINATION share/cmake/Caffe2
       FILE Caffe2Targets.cmake
       COMPONENT dev)
+  endif()
 else()
-  message(WARNING
-      "Generated cmake files are only available when building "
-      "shared libs.")
+  message(WARNING "Generated cmake files are only available when building "
+                  "shared libs.")
 endif()
 
-# ---[ Modules
-# If master flag for buildling Caffe2 is disabled, we also disable the
-# build for Caffe2 related operator modules.
-if(BUILD_CAFFE2)
-  add_subdirectory(modules)
-endif()
-
-# ---[ Binaries
-# Binaries will be built after the Caffe2 main libraries and the modules
-# are built. For the binaries, they will be linked to the Caffe2 main
+# ---[ Binaries Binaries will be built after the Caffe2 main libraries and the
+# modules are built. For the binaries, they will be linked to the Caffe2 main
 # libraries, as well as all the modules that are built with Caffe2 (the ones
 # built in the previous Modules section above).
 if(BUILD_BINARY)
@@ -1235,38 +1628,63 @@ if(BUILD_JNI)
   add_subdirectory(android/pytorch_android)
 endif()
 
-include(cmake/Summary.cmake)
-caffe2_print_configuration_summary()
-
-if(BUILD_FUNCTORCH)
-  add_subdirectory(functorch)
-endif()
-
 # Parse custom debug info
 if(DEFINED USE_CUSTOM_DEBINFO)
-    string(REPLACE ";" " " SOURCE_FILES "${USE_CUSTOM_DEBINFO}")
-    message(STATUS "Source files with custom debug infos: ${SOURCE_FILES}")
+  string(REPLACE ";" " " SOURCE_FILES "${USE_CUSTOM_DEBINFO}")
+  message(STATUS "Source files with custom debug infos: ${SOURCE_FILES}")
 
-    string(REGEX REPLACE " +" ";" SOURCE_FILES_LIST "${SOURCE_FILES}")
+  string(REGEX REPLACE " +" ";" SOURCE_FILES_LIST "${SOURCE_FILES}")
 
-    # Set the COMPILE_FLAGS property for each source file
-    foreach(SOURCE_FILE ${SOURCE_FILES_LIST})
-        # We have to specify the scope here. We do this by specifying the
-        # targets we care about and caffe2/ for all test targets defined there
-        set(ALL_PT_TARGETS "torch_python;c10;torch_cpu;torch")
-        set_source_files_properties(${SOURCE_FILE} DIRECTORY "caffe2/" TARGET_DIRECTORY ${ALL_PT_TARGETS} PROPERTIES COMPILE_FLAGS "-g")
-    endforeach()
+  # Add debug info for each source file
+  foreach(SOURCE_FILE ${SOURCE_FILES_LIST})
+    # We have to specify the scope here. We do this by specifying the targets we
+    # care about and caffe2/ for all test targets defined there
+    if(BUILD_LIBTORCHLESS)
+      caffe2_update_option(USE_CUDA OFF)
+      set(ALL_PT_TARGETS "torch_python;${C10_LIB};${TORCH_CPU_LIB};${TORCH_LIB}")
+    else()
+      # @todo test if we can remove this
+      set(ALL_PT_TARGETS "torch_python;c10;torch_cpu;torch")
+    endif()
+    set_property(SOURCE ${SOURCE_FILE}
+      DIRECTORY "caffe2/" TARGET_DIRECTORY ${ALL_PT_TARGETS}
+      APPEND PROPERTY COMPILE_OPTIONS "-g")
+  endforeach()
 
-    # Link everything with debug info when any file is in debug mode
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -g")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -g")
+  # Link everything with debug info when any file is in debug mode
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -g")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -g")
 endif()
 
 # Bundle PTXAS if needed
 if(BUILD_BUNDLE_PTXAS AND USE_CUDA)
-   if(NOT EXISTS "${PROJECT_SOURCE_DIR}/build/bin/ptxas")
-     message(STATUS "Copying PTXAS into the bin folder")
-     file(COPY "${CUDAToolkit_BIN_DIR}/ptxas" DESTINATION "${PROJECT_BINARY_DIR}")
-   endif()
-   install(PROGRAMS "${PROJECT_BINARY_DIR}/ptxas" DESTINATION "${CMAKE_INSTALL_BINDIR}")
+  message(STATUS "Copying PTXAS into the bin folder")
+  file(COPY "${CUDAToolkit_BIN_DIR}/ptxas"
+       DESTINATION "${PROJECT_BINARY_DIR}")
+  install(PROGRAMS "${PROJECT_BINARY_DIR}/ptxas"
+          DESTINATION "${CMAKE_INSTALL_BINDIR}")
 endif()
+
+if(SKBUILD)
+  # File mirroring: copy source files into torchgen/packaged/, vendored
+  # inductor templates, and symlink-replacement copies.  Previously handled
+  # by setup.py.
+  include(cmake/FileMirroring.cmake)
+
+  # Package data: install non-Python data files (type stubs, templates,
+  # headers, etc.) into the torch package.  Previously declared via
+  # setup.py package_data.
+  include(cmake/PackageData.cmake)
+
+  # setuptools-era top_level.txt; without it importlib.metadata.packages_distributions()
+  # stats every RECORD entry to infer top-level names. Keep in sync with
+  # [tool.scikit-build.wheel] packages in pyproject.toml.
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/top_level.txt" "functorch\ntorch\ntorchgen\n")
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/top_level.txt"
+    DESTINATION "${SKBUILD_METADATA_DIR}")
+endif()
+
+include(cmake/PostBuildSteps.cmake)
+
+include(cmake/Summary.cmake)
+caffe2_print_configuration_summary()

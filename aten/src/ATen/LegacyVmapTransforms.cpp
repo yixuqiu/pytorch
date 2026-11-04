@@ -1,6 +1,4 @@
 #include <ATen/LegacyVmapTransforms.h>
-#include <ATen/ATen.h>
-#include <ATen/core/IListRef.h>
 #include <c10/util/irange.h>
 
 namespace at {
@@ -35,7 +33,7 @@ static Tensor permuteBatchDimsToFront(BatchedTensorImpl* batched) {
     if (is_bdim[ptr]) {
       continue;
     }
-    permutation[idx++] = ptr;
+    permutation[idx++] = static_cast<int64_t>(ptr);
   }
   return physical_tensor.permute(permutation);
 }
@@ -49,7 +47,7 @@ VmapPhysicalView MultiBatchVmapTransform::logicalToPhysical(const Tensor& logica
 }
 
 int64_t VmapPhysicalView::numBatchDims() const {
-  return levels_.count();
+  return static_cast<int64_t>(levels_.count());
 }
 
 int64_t VmapPhysicalView::numLogicalDims() const {
@@ -67,7 +65,7 @@ VmapDimVector VmapPhysicalView::getPhysicalDims(OptionalIntArrayRef opt_logical_
       result.push_back(maybe_wrap_dim(dim, logical_ndim) + numBatchDims());
     }
   } else {
-    for (int64_t dim = 0; dim < logical_ndim; dim++) {
+    for (const auto dim : c10::irange(logical_ndim)) {
       result.push_back(dim + numBatchDims());
     }
   }
@@ -90,6 +88,7 @@ VmapDimVector VmapPhysicalView::getPhysicalShape(IntArrayRef logical_shape) cons
 
 static BatchDims computeFrontBatchDimsFromLevels(std::bitset<kVmapNumLevels> levels_bitset) {
   BatchDims bdims;
+  bdims.reserve(levels_bitset.count());
   int64_t dim = 0;
   for (const auto level : c10::irange(kVmapNumLevels)) {
     if (!levels_bitset[level]) {
@@ -202,7 +201,7 @@ MultiBatchVmapTransform::logicalToPhysical(ITensorListRef logical_tensors) {
   // batch dims have been moved to the front of the tensor. Any previously
   // non-existing batch dims get added to the tensors as new dimensions of size 1.
   std::vector<Tensor> physical_tensors;
-  int64_t num_batch_dims = collective_levels.count();
+  auto num_batch_dims = collective_levels.count();
   for (const auto& logical_tensor : logical_tensors) {
     auto requested_example_dim = /*logical_dim*/logical_tensor.dim();
     auto physical_tensor = alignBatchDimsAtFront(

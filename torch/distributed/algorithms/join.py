@@ -1,12 +1,15 @@
+# mypy: allow-untyped-defs
 import warnings
 from abc import ABC, abstractmethod
 from types import TracebackType
-from typing import Any, List, NamedTuple, Optional, Type
+from typing import Any, NamedTuple
 
 import torch
 import torch.distributed as dist
 
-__all__ = ['JoinHook', 'Joinable', 'Join']
+
+__all__ = ["JoinHook", "Joinable", "Join"]
+
 
 class JoinHook:
     r"""
@@ -25,7 +28,6 @@ class JoinHook:
 
         Training iteration i.e., in one forward pass, backward pass, and optimizer step.
         """
-        ...
 
     def post_hook(self, is_last_joiner: bool) -> None:
         r"""
@@ -37,7 +39,6 @@ class JoinHook:
             is_last_joiner (bool): ``True`` if the rank is one of the last to
                 join; ``False`` otherwise.
         """
-        ...
 
 
 class Joinable(ABC):
@@ -52,7 +53,7 @@ class Joinable(ABC):
     """
 
     @abstractmethod
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self._join_config = _JoinConfig.construct_disabled_join_config()
 
@@ -96,11 +97,8 @@ class _JoinConfig(NamedTuple):
         e.g. if the caller is not in a join context manager.
         """
         return _JoinConfig(
-            enable=False,
-            throw_on_early_termination=False,
-            is_first_joinable=False
+            enable=False, throw_on_early_termination=False, is_first_joinable=False
         )
-
 
 
 class Join:
@@ -167,7 +165,7 @@ class Join:
 
     def __init__(
         self,
-        joinables: List[Joinable],
+        joinables: list[Joinable],
         enable: bool = True,
         throw_on_early_termination: bool = False,
         **kwargs,
@@ -175,7 +173,9 @@ class Join:
         if len(joinables) == 0:
             raise ValueError("The join context manager requires at least one joinable")
         self._joinables = joinables
-        self._join_hooks = [joinable.join_hook(**kwargs) for joinable in self._joinables]
+        self._join_hooks = [
+            joinable.join_hook(**kwargs) for joinable in self._joinables
+        ]
         self._enable = enable
         self._throw_on_early_termination = throw_on_early_termination
         self._set_joinable_configs()
@@ -183,13 +183,14 @@ class Join:
 
     def _set_joinable_configs(self) -> None:
         r"""Set the :class:`_JoinConfig` of each participating :class:`Joinable`."""
-        assert len(self._joinables) > 0
+        if len(self._joinables) <= 0:
+            raise AssertionError
         is_first_joinable = True
         for joinable in self._joinables:
             joinable._join_config = _JoinConfig(
                 enable=self._enable,
                 throw_on_early_termination=self._throw_on_early_termination,
-                is_first_joinable=is_first_joinable
+                is_first_joinable=is_first_joinable,
             )
             is_first_joinable = False
 
@@ -210,25 +211,27 @@ class Join:
         """
         process_group = None
         device = None
+        # pyrefly: ignore [bad-assignment]
         for joinable in self._joinables:
             if process_group is None:
                 process_group = joinable.join_process_group
             elif process_group != joinable.join_process_group:
-                raise ValueError("Using join context manager with multiple process groups")
+                raise ValueError(
+                    "Using join context manager with multiple process groups"
+                )
             if device is None:
                 device = joinable.join_device
         self._process_group = process_group
         self._rank = dist.get_rank(self._process_group)
         self._device = device
 
-    def __enter__(self):
-        ...
+    def __enter__(self): ...
 
     def __exit__(
         self,
-        type: Optional[Type[BaseException]],
-        value: Optional[BaseException],
-        traceback: Optional[TracebackType]
+        type: type[BaseException] | None,
+        value: BaseException | None,
+        traceback: TracebackType | None,
     ):
         r"""
         Repeatedly runs the main hooks until all processes join; then, runs the post-hooks.
@@ -255,7 +258,8 @@ class Join:
                     f"{self._rank} has at least {WARN_THRESHOLD} "
                     f"fewer inputs than other currently-active ranks. "
                     "This level of skew could lead to performance "
-                    "degradation during training."
+                    "degradation during training.",
+                    stacklevel=2,
                 )
             # Shadow the all-reduce in non-joined processes
             num_nonjoined_procs = self._get_num_nonjoined_procs()
@@ -317,9 +321,11 @@ class Join:
             manager that the process has not yet joined if ``joinable`` is the
             first one passed into the context manager; ``None`` otherwise.
         """
-        assert hasattr(joinable, "_join_config"), \
-            f"Check that the {type(joinable)} constructor calls the " \
-            "``Joinable`` constructor"
+        if not hasattr(joinable, "_join_config"):
+            raise AssertionError(
+                f"Check that the {type(joinable)} constructor calls the "
+                "``Joinable`` constructor"
+            )
 
         join_config = joinable._join_config
         # First joinable is responsible for the collective communications

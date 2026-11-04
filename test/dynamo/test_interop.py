@@ -1,10 +1,15 @@
 # Owner(s): ["module: dynamo"]
-import torch
+from functools import wraps
 
+import torch
 import torch._dynamo.test_case
 import torch._dynamo.testing
-import torch.onnx.operators
-from torch._dynamo.testing import same
+from torch._dynamo import allow_in_graph
+
+
+device_type = (
+    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cpu"
+)
 
 
 def fn(a, b):
@@ -13,11 +18,14 @@ def fn(a, b):
 
 class InteropTests(torch._dynamo.test_case.TestCase):
     def _common(self, fn):
-        inputs = [torch.randn(10), torch.randn(10)]
+        inputs = [
+            torch.randn(10, device=device_type),
+            torch.randn(10, device=device_type),
+        ]
         ref = fn(*inputs)
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         res = opt_fn(*inputs)
-        self.assertTrue(same(ref, res))
+        self.assertEqual(ref, res)
 
     def test_fx_fn(self):
         fx_fn = torch.fx.symbolic_trace(fn)
@@ -28,14 +36,26 @@ class InteropTests(torch._dynamo.test_case.TestCase):
         self._common(lambda a, b: script_fn(a, b) + 1)
 
     def test_trace_fn(self):
-        trace_fn = torch.jit.trace(fn, [torch.zeros(10), torch.zeros(10)])
+        trace_fn = torch.jit.trace(
+            fn,
+            [torch.zeros(10, device=device_type), torch.zeros(10, device=device_type)],
+        )
         self._common(lambda a, b: trace_fn(a, b) + 1)
 
+    def test_staticmethod_script_fn(self):
+        class Foo:
+            @staticmethod
+            @torch.jit.script
+            def _g(a):
+                return a**2
+
+            def g(self, a, b):
+                return self._g(a) + b
+
+        foo = Foo()
+        self._common(lambda a, b: foo.g(a, b) + 1)
+
     def test_vmap_in_graph(self):
-        from functools import wraps
-
-        from torch._dynamo import allow_in_graph
-
         def traceable(f):
             f = allow_in_graph(f)
 
@@ -46,7 +66,7 @@ class InteropTests(torch._dynamo.test_case.TestCase):
             return wrapper
 
         cnts = torch._dynamo.testing.CompileCounter()
-        x = torch.randn(3, 5, 3)
+        x = torch.randn(3, 5, 3, device=device_type)
 
         def fn(x):
             return torch.vmap(torch.Tensor.t)(x)

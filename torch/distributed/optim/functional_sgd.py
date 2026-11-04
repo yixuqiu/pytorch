@@ -1,13 +1,17 @@
-from typing import Dict, List, Optional
+# mypy: allow-untyped-defs
 
 import torch
 import torch.optim._functional as F
-
 from torch import Tensor
+from torch.distributed.optim._deprecation_warning import (
+    _scripted_functional_optimizer_deprecation_warning,
+)
 
-__all__: List[str] = []
 
-# Define a TorchScript compatible Functional SGD Optimizer
+__all__: list[str] = []
+
+
+# Define a Functional SGD Optimizer
 # where we use these optimizer in a functional way.
 # Instead of using the `param.grad` when updating parameters,
 # we explicitly allow the distributed optimizer pass gradients to
@@ -16,11 +20,10 @@ __all__: List[str] = []
 # parameters without data traces on accumulating to the same .grad.
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
-@torch.jit.script
 class _FunctionalSGD:
     def __init__(
         self,
-        params: List[Tensor],
+        params: list[Tensor],
         lr: float = 1e-2,
         momentum: float = 0.0,
         dampening: float = 0.0,
@@ -31,6 +34,7 @@ class _FunctionalSGD:
         fused: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         self.defaults = {
             "lr": lr,
             "momentum": momentum,
@@ -41,7 +45,7 @@ class _FunctionalSGD:
         self.maximize = maximize
         self.foreach = foreach
         self.fused = fused
-        self.state = torch.jit.annotate(Dict[torch.Tensor, Dict[str, torch.Tensor]], {})
+        self.state = torch.jit.annotate(dict[torch.Tensor, dict[str, torch.Tensor]], {})
 
         if len(params) == 0 and not _allow_empty_param_list:
             raise ValueError("optimizer got an empty parameter list")
@@ -50,7 +54,7 @@ class _FunctionalSGD:
         # param group as it's not a common use case.
         self.param_group = {"params": params}
 
-    def step_param(self, param: Tensor, grad: Optional[Tensor]):
+    def step_param(self, param: Tensor, grad: Tensor | None):
         """Similar to self.step, but operates on a single parameter and
         its gradient.
         """
@@ -61,7 +65,7 @@ class _FunctionalSGD:
         dampening = self.defaults["dampening"]
         lr = self.defaults["lr"]
         params = [param]
-        momentum_buffer_list: List[Optional[Tensor]] = []
+        momentum_buffer_list: list[Tensor | None] = []
         grads = []
 
         has_sparse_grad = False
@@ -100,11 +104,11 @@ class _FunctionalSGD:
         if momentum_buffer is not None:
             state["momentum_buffer"] = momentum_buffer
 
-    def step(self, gradients: List[Optional[Tensor]]):
+    def step(self, gradients: list[Tensor | None]):
         params = self.param_group["params"]
         params_with_grad = []
         grads = []
-        momentum_buffer_list: List[Optional[Tensor]] = []
+        momentum_buffer_list: list[Tensor | None] = []
         lr = self.defaults["lr"]
         weight_decay = self.defaults["weight_decay"]
         momentum = self.defaults["momentum"]

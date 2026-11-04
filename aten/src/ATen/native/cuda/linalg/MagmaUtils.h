@@ -1,5 +1,6 @@
 #pragma once
 #include <ATen/cuda/CUDAConfig.h>
+#include <optional>
 
 #if AT_MAGMA_ENABLED()
 #include <magma_types.h>
@@ -33,6 +34,21 @@ struct MAGMAQueue {
       handle,
       at::cuda::getCurrentCUDASparseHandle(),
       &magma_queue_);
+    try {
+      // MAGMA sets the handle stream during queue creation, which resets its
+      // workspace on CUDA. Bind the ATen workspace after queue initialization.
+      handle_.emplace(at::cuda::getCurrentCUDABlasHandleWithWorkspace());
+#if !defined(USE_ROCM)
+      TORCH_CUDABLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+#endif
+    } catch (...) {
+#if !defined(USE_ROCM)
+      (void)cublasSetMathMode(handle, original_math_mode);
+#endif
+      magma_queue_destroy(magma_queue_);
+      handle_.reset();
+      throw;
+    }
   }
 
   // Getter
@@ -50,6 +66,9 @@ struct MAGMAQueue {
   }
 
  private:
+  // MAGMA borrows the cuBLAS handle until queue destruction, so keep its
+  // workspace scope alive for the same lifetime.
+  std::optional<at::cuda::CUDABlasHandleWithWorkspace> handle_;
   magma_queue_t magma_queue_;
 #if !defined(USE_ROCM)
   cublasMath_t original_math_mode;
@@ -59,7 +78,7 @@ struct MAGMAQueue {
 static inline magma_int_t magma_int_cast(int64_t value, const char* varname) {
   auto result = static_cast<magma_int_t>(value);
   if (static_cast<int64_t>(result) != value) {
-    AT_ERROR("magma: The value of ", varname, "(", (long long)value,
+    TORCH_CHECK(false, "magma: The value of ", varname, "(", (long long)value,
              ") is too large to fit into a magma_int_t (", sizeof(magma_int_t), " bytes)");
   }
   return result;

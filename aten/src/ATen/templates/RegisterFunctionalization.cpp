@@ -4,10 +4,11 @@
 #include <ATen/core/LegacyTypeDispatch.h>
 #include <ATen/EmptyTensor.h>
 #include <ATen/FunctionalTensorWrapper.h>
-#include <ATen/FunctionalInverses.h>
+#include <ATen/ViewMetaClasses.h>
 #include <ATen/MemoryOverlap.h>
 #include <torch/library.h>
 
+#include <c10/util/env.h>
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Operators.h>
 #include <ATen/NativeFunctions.h>
@@ -30,6 +31,9 @@ namespace functionalization {
 // Exclude any modes: the purpose of calling into meta kernels is only as an implementation
 // detail to perform shape inference, and we don't want any modal keys to run.
 // Specifically, we want to prevent functionalization and Python modes from running.
+// Fake is excluded because an active C++ FakeTensorMode puts Fake in the TLS
+// include set. The shape check calls the op on to_meta() tensors to run the
+// Meta kernel; without excluding Fake, the Fake fallback would intercept it.
 constexpr auto exclude_keys_for_meta_dispatch =
     c10::functorch_transforms_ks |
     c10::DispatchKeySet({
@@ -37,7 +41,7 @@ constexpr auto exclude_keys_for_meta_dispatch =
         c10::DispatchKey::FuncTorchDynamicLayerFrontMode,
         c10::DispatchKey::Python,
         c10::DispatchKey::PreDispatch,
-
+        c10::DispatchKey::Fake,
     });
 
 // Helper around at::has_internal_overlap.
@@ -56,15 +60,15 @@ inline bool has_internal_overlap_helper(const at::Tensor t) {
 inline Tensor to_meta(const Tensor& t) {
     if (!t.defined()) return t;
     return at::native::empty_strided_meta_symint(t.sym_sizes(), t.sym_strides(),
-/*dtype=*/c10::make_optional(t.scalar_type()), /*layout=*/c10::make_optional(t.layout()),
-/*device=*/c10::make_optional(c10::Device(kMeta)), /*pin_memory=*/c10::nullopt);
+/*dtype=*/t.scalar_type(), /*layout=*/t.layout(),
+/*device=*/c10::Device(kMeta), /*pin_memory=*/std::nullopt);
 }
 
-inline c10::optional<Tensor> to_meta(const c10::optional<Tensor>& t) {
+inline std::optional<Tensor> to_meta(const std::optional<Tensor>& t) {
   if (t.has_value()) {
-    return c10::make_optional<Tensor>(to_meta(*t));
+    return to_meta(*t);
   }
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 inline std::vector<Tensor> to_meta(at::ITensorListRef t_list) {
@@ -79,8 +83,10 @@ inline std::vector<Tensor> to_meta(at::ITensorListRef t_list) {
 inline c10::List<Tensor> to_meta(const c10::List<Tensor>& t_list) {
   c10::List<Tensor> outputs;
   outputs.reserve(t_list.size());
-  for (const auto i : c10::irange(t_list.size())) {
-    outputs.push_back(to_meta(t_list[i]));
+  // Named explicitly: the proxy converts to Tensor, tying to_meta(const
+  // Tensor&) against to_meta(ITensorListRef) (constructible from one Tensor).
+  for (const Tensor& t_list_elem : t_list) {
+    outputs.push_back(to_meta(t_list_elem));
   }
   return outputs;
 }
@@ -88,10 +94,15 @@ inline c10::List<Tensor> to_meta(const c10::List<Tensor>& t_list) {
 inline c10::List<::std::optional<Tensor>> to_meta(const c10::List<::std::optional<Tensor>>& t_list) {
   c10::List<::std::optional<Tensor>> outputs;
   outputs.reserve(t_list.size());
-  for (const auto i : c10::irange(t_list.size())) {
-    outputs.push_back(to_meta(t_list[i]));
+  for (const ::std::optional<Tensor>& t_list_elem : t_list) {
+    outputs.push_back(to_meta(t_list_elem));
   }
   return outputs;
+}
+
+static bool disable_meta_reference() {
+  static auto env = c10::utils::get_env("TORCH_DISABLE_FUNCTIONALIZATION_META_REFERENCE");
+  return env == "1";
 }
 
 

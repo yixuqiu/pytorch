@@ -1,25 +1,28 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/Context.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/native/Resize.h>
 #include <ATen/native/ResizeCommon.h>
-#include <ATen/NamedTensorUtils.h>
 #include <ATen/TensorSubclassLikeUtils.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/resize_as_native.h>
+#include <ATen/ops/resize_as_sparse_native.h>
 #include <ATen/ops/resize_native.h>
 #include <ATen/ops/resize.h>
 #include <ATen/ops/_resize_output.h>
 #include <ATen/ops/_resize_output_native.h>
 #endif
 
+#include <c10/util/overflows.h>
+
 namespace at::native {
 
 // Returns true if resize is necessary
 template <typename T>
-bool _resize_output_check(const Tensor& output, ArrayRef<T> shape) {
+static bool _resize_output_check(const Tensor& output, ArrayRef<T> shape) {
   // Tests for resizing of tensors with one or more elements
   if (at::symint::sizes<T>(output).equals(shape)) {
     return false;
@@ -54,7 +57,7 @@ static void native_resize_(const Tensor& output, SymIntArrayRef shape) {
 }
 
 template <typename T>
-bool _resize_output(const Tensor& output, ArrayRef<T> shape) {
+static bool _resize_output(const Tensor& output, ArrayRef<T> shape) {
   if (_resize_output_check<T>(output, shape)) {
     // avoid a redispatch for cpu and cuda.
     // TODO: when resize_cuda_ is re-written to be unified with resize_,
@@ -104,11 +107,6 @@ void resize_bytes_cpu(StorageImpl* storage, size_t size_bytes) {
   storage->set_nbytes(size_bytes);
 }
 
-// Call the sparse implementation in SparseTensor.cpp directly.
-// A dynamic dispatch here is NOT necessary, so I didn't put
-// this function in native_functions.yaml
-const Tensor& resize_as_sparse_(const Tensor& self, const Tensor& src);
-
 // TODO(VitalyFedyunin): Move it to HTML docs.
 //
 // Strides of the output tensor of `resize_as_` operator is defined by input
@@ -136,7 +134,7 @@ const Tensor& resize_as_sparse_(const Tensor& self, const Tensor& src);
 const Tensor& resize_as_(
     const Tensor& self,
     const Tensor& the_template,
-    c10::optional<MemoryFormat> optional_memory_format) {
+    std::optional<MemoryFormat> optional_memory_format) {
   if (self.is_sparse() && the_template.is_sparse()) {
     TORCH_CHECK(
         !optional_memory_format.has_value(),
@@ -152,7 +150,6 @@ const Tensor& resize_as_(
     }
     self.unsafeGetTensorImpl()->empty_tensor_restride(memory_format);
   }
-  namedinference::propagate_names(result, the_template);
   return result;
 }
 
@@ -194,7 +191,7 @@ static void _maybe_resize_storage(TensorImpl* self, c10::SymInt new_size_bytes) 
 }
 
 template <typename T>
-TensorImpl* _resize_impl_(
+static TensorImpl* _resize_impl_(
     TensorImpl* self,
     ArrayRef<T> size,
     at::OptionalArrayRef<T> stride,
@@ -231,35 +228,33 @@ TensorImpl* resize_impl_cpu_(
   return _resize_impl_(self, size, stride, resize_storage);
 }
 
-static TensorImpl* resize_impl_meta_(
-    TensorImpl* self,
-    c10::SymIntArrayRef size,
-    at::OptionalSymIntArrayRef stride,
-    bool resize_storage = true) {
-  return _resize_impl_(self, size, stride, resize_storage);
-}
-
 template <typename T>
-const Tensor& _resize_(
+static const Tensor& _resize_(
     const Tensor& self,
     ArrayRef<T> size,
-    c10::optional<MemoryFormat> optional_memory_format) {
+    std::optional<MemoryFormat> optional_memory_format) {
   auto* self_ = self.unsafeGetTensorImpl();
-  int64_t old_storage_nbytes = self_->unsafe_storage() ? self_->unsafe_storage().sym_nbytes().maybe_as_int().value_or(-1) : 0;
-  // NOLINTNEXTLINE(bugprone-argument-comment)
-  _resize_impl_<T>(self_, size, /*strides=*/c10::nullopt, true);
+  auto maybe_old_storage_nbytes_to_fill_resize = [&]() -> std::optional<int64_t> {
+    if (!at::globalContext().deterministicAlgorithms() ||
+        !at::globalContext().deterministicFillUninitializedMemory()) {
+      return std::nullopt;
+    }
+    if (!self_->unsafe_storage()) {
+      return 0;
+    }
+    return self_->unsafe_storage().sym_nbytes().maybe_as_int();
+  }();
+  _resize_impl_<T>(self_, size, /*stride=*/std::nullopt, true);
   if (optional_memory_format.has_value()) {
-    auto memory_format =
-        optional_memory_format.value();
+    auto memory_format = optional_memory_format.value();
     TORCH_CHECK(
         memory_format != MemoryFormat::Preserve,
         "Unsupported memory format",
         memory_format);
     self_->empty_tensor_restride(memory_format);
   }
-  // See Note [Enabling Deterministic Operations]
-  if (C10_UNLIKELY(at::globalContext().deterministicAlgorithms() && at::globalContext().deterministicFillUninitializedMemory() && old_storage_nbytes != -1)) {
-    at::native::fill_resize_deterministic_(self, old_storage_nbytes);
+  if (C10_UNLIKELY(maybe_old_storage_nbytes_to_fill_resize.has_value())) {
+    at::native::fill_resize_deterministic_(self, *maybe_old_storage_nbytes_to_fill_resize);
   }
   return self;
 }
@@ -267,22 +262,18 @@ const Tensor& _resize_(
 const Tensor& resize_(
     const Tensor& self,
     IntArrayRef size,
-    c10::optional<MemoryFormat> optional_memory_format) {
-  if (self.has_names()) {
-    return resize_named_tensor_(self, size, optional_memory_format);
-  }
+    std::optional<MemoryFormat> optional_memory_format) {
   return _resize_(self, size, optional_memory_format);
 }
 
 const Tensor& resize__symint(
     const Tensor& self,
     c10::SymIntArrayRef size,
-    c10::optional<MemoryFormat> optional_memory_format) {
-  TORCH_INTERNAL_ASSERT(!self.has_names())
+    std::optional<MemoryFormat> optional_memory_format) {
   return _resize_(self, size, optional_memory_format);
 }
 
-void resize_bytes_nocuda(const Storage& storage, c10::SymInt newsize) {
+void resize_bytes_nocuda(const Storage& storage, const c10::SymInt& newsize) {
   // handles all devices except cuda (which needs to be in a different .so)
   c10::DeviceType device_type = storage.device_type();
   if (device_type == at::kCPU) {
@@ -290,9 +281,9 @@ void resize_bytes_nocuda(const Storage& storage, c10::SymInt newsize) {
   } else if (device_type == at::kMeta) {
     at::native::resize_bytes_meta(storage.unsafeGetStorageImpl(), newsize);
   } else if (device_type == at::kPrivateUse1) {
-    at::GetPrivateUse1HooksInterface()->resizePrivateUse1Bytes(
+    at::detail::getPrivateUse1Hooks().resizePrivateUse1Bytes(
         storage, newsize.expect_int());
-  } else if (device_type == at::kXPU || device_type == at::kHPU) {
+  } else if (device_type == at::kXPU || device_type == at::kHPU || device_type == at::kMTIA) {
     ptrdiff_t size_bytes_i = newsize.expect_int();
     TORCH_CHECK(
         !c10::overflows<int64_t>(size_bytes_i),

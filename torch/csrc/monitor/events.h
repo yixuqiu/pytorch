@@ -8,8 +8,7 @@
 #include <c10/macros/Macros.h>
 #include <variant>
 
-namespace torch {
-namespace monitor {
+namespace torch::monitor {
 
 // data_value_t is the type for Event data values.
 using data_value_t = std::variant<std::string, double, int64_t, bool>;
@@ -36,7 +35,7 @@ struct TORCH_API Event {
   std::unordered_map<std::string, data_value_t> data;
 };
 
-TORCH_API inline bool operator==(const Event& lhs, const Event& rhs) {
+inline bool operator==(const Event& lhs, const Event& rhs) {
   return lhs.name == rhs.name && lhs.timestamp == rhs.timestamp &&
       lhs.data == rhs.data;
 }
@@ -57,7 +56,7 @@ class TORCH_API EventHandler {
 };
 
 // logEvent calls each registered event handler with the event. This method can
-// be called from concurrently from multiple threads.
+// be called concurrently from multiple threads.
 TORCH_API void logEvent(const Event& e);
 
 // registerEventHandler registers an EventHandler so it receives any logged
@@ -69,5 +68,4 @@ TORCH_API void registerEventHandler(std::shared_ptr<EventHandler> p);
 // shared_ptr.
 TORCH_API void unregisterEventHandler(const std::shared_ptr<EventHandler>& p);
 
-} // namespace monitor
-} // namespace torch
+} // namespace torch::monitor

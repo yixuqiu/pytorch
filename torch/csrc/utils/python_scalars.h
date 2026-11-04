@@ -7,21 +7,17 @@
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/utils/python_numbers.h>
 
-namespace torch {
-namespace utils {
+namespace torch::utils {
 
 template <typename T>
 inline T unpackIntegral(PyObject* obj, const char* type) {
-#if PY_VERSION_HEX >= 0x030a00f0
   // In Python-3.10 floats can no longer be silently converted to integers
   // Keep backward compatible behavior for now
   if (PyFloat_Check(obj)) {
     return c10::checked_convert<T>(THPUtils_unpackDouble(obj), type);
   }
-  return c10::checked_convert<T>(THPUtils_unpackLong(obj), type);
-#else
-  return static_cast<T>(THPUtils_unpackLong(obj));
-#endif
+  // Still range checked; unsigned targets retain their historical signed wrap.
+  return c10::unsafe_wrapping_convert<T>(THPUtils_unpackLong(obj), type);
 }
 
 inline void store_scalar(void* data, at::ScalarType scalarType, PyObject* obj) {
@@ -66,6 +62,11 @@ inline void store_scalar(void* data, at::ScalarType scalarType, PyObject* obj) {
           (c10::complex<at::Half>)static_cast<c10::complex<float>>(
               THPUtils_unpackComplexDouble(obj));
       break;
+    case at::kBComplex32:
+      *(c10::complex<at::BFloat16>*)data =
+          (c10::complex<at::BFloat16>)static_cast<c10::complex<float>>(
+              THPUtils_unpackComplexDouble(obj));
+      break;
     case at::kComplexFloat:
       *(c10::complex<float>*)data =
           (c10::complex<float>)THPUtils_unpackComplexDouble(obj);
@@ -80,6 +81,7 @@ inline void store_scalar(void* data, at::ScalarType scalarType, PyObject* obj) {
       *(at::BFloat16*)data =
           at::convert<at::BFloat16, double>(THPUtils_unpackDouble(obj));
       break;
+    // TODO(#146647): simplify below with macros
     case at::kFloat8_e5m2:
       *(at::Float8_e5m2*)data =
           at::convert<at::Float8_e5m2, double>(THPUtils_unpackDouble(obj));
@@ -96,8 +98,16 @@ inline void store_scalar(void* data, at::ScalarType scalarType, PyObject* obj) {
       *(at::Float8_e4m3fnuz*)data =
           at::convert<at::Float8_e4m3fnuz, double>(THPUtils_unpackDouble(obj));
       break;
+    case at::kFloat8_e8m0fnu:
+      *(at::Float8_e8m0fnu*)data =
+          at::convert<at::Float8_e8m0fnu, double>(THPUtils_unpackDouble(obj));
+      break;
+    case at::kFloat8_e5m3fnu:
+      *(at::Float8_e5m3fnu*)data =
+          at::convert<at::Float8_e5m3fnu, double>(THPUtils_unpackDouble(obj));
+      break;
     default:
-      throw std::runtime_error("invalid type");
+      TORCH_CHECK(false, "store_scalar: invalid type");
   }
 }
 
@@ -130,6 +140,10 @@ inline PyObject* load_scalar(const void* data, at::ScalarType scalarType) {
       auto data_ = reinterpret_cast<const c10::complex<at::Half>*>(data);
       return PyComplex_FromDoubles(data_->real(), data_->imag());
     }
+    case at::kBComplex32: {
+      auto data_ = reinterpret_cast<const c10::complex<at::BFloat16>*>(data);
+      return PyComplex_FromDoubles(data_->real(), data_->imag());
+    }
     case at::kComplexFloat: {
       auto data_ = reinterpret_cast<const c10::complex<float>*>(data);
       return PyComplex_FromDoubles(data_->real(), data_->imag());
@@ -138,10 +152,13 @@ inline PyObject* load_scalar(const void* data, at::ScalarType scalarType) {
       return PyComplex_FromCComplex(
           *reinterpret_cast<Py_complex*>((c10::complex<double>*)data));
     case at::kBool:
-      return PyBool_FromLong(*(bool*)data);
+      // Don't use bool*, since it may take out-of-range byte as bool.
+      // Instead, we cast explicitly to avoid ASAN error.
+      return PyBool_FromLong(static_cast<bool>(*(uint8_t*)data));
     case at::kBFloat16:
       return PyFloat_FromDouble(
           at::convert<double, at::BFloat16>(*(at::BFloat16*)data));
+    // TODO(#146647): simplify below with macros
     case at::kFloat8_e5m2:
       return PyFloat_FromDouble(
           at::convert<double, at::Float8_e5m2>(*(at::Float8_e5m2*)data));
@@ -154,10 +171,15 @@ inline PyObject* load_scalar(const void* data, at::ScalarType scalarType) {
     case at::kFloat8_e4m3fnuz:
       return PyFloat_FromDouble(at::convert<double, at::Float8_e4m3fnuz>(
           *(at::Float8_e4m3fnuz*)data));
+    case at::kFloat8_e8m0fnu:
+      return PyFloat_FromDouble(
+          at::convert<double, at::Float8_e8m0fnu>(*(at::Float8_e8m0fnu*)data));
+    case at::kFloat8_e5m3fnu:
+      return PyFloat_FromDouble(
+          at::convert<double, at::Float8_e5m3fnu>(*(at::Float8_e5m3fnu*)data));
     default:
-      throw std::runtime_error("invalid type");
+      TORCH_CHECK(false, "load_scalar: invalid type");
   }
 }
 
-} // namespace utils
-} // namespace torch
+} // namespace torch::utils

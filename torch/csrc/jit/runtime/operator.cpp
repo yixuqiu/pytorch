@@ -1,11 +1,11 @@
 #include <torch/csrc/jit/runtime/operator.h>
 
-#include <ATen/ATen.h>
 #include <ATen/core/interned_strings.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/frontend/edit_distance.h>
 
 #include <queue>
+#include <shared_mutex>
 #include <utility>
 #include <vector>
 
@@ -16,7 +16,7 @@ using OperatorMap =
     std::unordered_map<Symbol, std::vector<std::shared_ptr<Operator>>>;
 struct OperatorRegistry {
  private:
-  std::mutex lock;
+  std::shared_mutex lock;
   OperatorMap operators;
   // list of operators whose schema have not yet been parsed, and must
   // be registered before any call to lookup an operator
@@ -39,11 +39,8 @@ struct OperatorRegistry {
   // registered a second time. Registering an op multiple times is
   // fragile because it might depend on static initialization order
   // which one is picked at runtime.
-#ifdef C10_MOBILE
-  std::unordered_set<c10::OperatorName> registered_operator_names;
-#endif
 
-  // XXX - caller must be holding lock
+  // XXX - caller must be holding exclusive lock
   void registerPendingOperators() {
     for (const auto& op : to_register) {
       Symbol sym = Symbol::fromQualString(op->schema().name());
@@ -53,17 +50,22 @@ struct OperatorRegistry {
     to_register.clear();
   }
 
+  // Flush any pending registrations if needed, acquiring exclusive lock only
+  // when necessary. Returns with no lock held.
+  void ensurePendingOperatorsFlushed() {
+    {
+      std::shared_lock<std::shared_mutex> reader(lock);
+      if (to_register.empty()) {
+        return;
+      }
+    }
+    std::unique_lock<std::shared_mutex> writer(lock);
+    registerPendingOperators();
+  }
+
  public:
   void registerOperator(Operator&& op) {
-    std::lock_guard<std::mutex> guard(lock);
-#ifdef C10_MOBILE
-    TORCH_INTERNAL_ASSERT(
-        0 == registered_operator_names.count(op.schema().operator_name()),
-        "Tried to register operator \"",
-        op.schema(),
-        "\" to JIT but the operator name was already registered before. Please add or change the overload name.");
-    registered_operator_names.insert(op.schema().operator_name());
-#endif
+    std::unique_lock<std::shared_mutex> guard(lock);
     to_register.push_back(std::make_shared<Operator>(std::move(op)));
   }
 
@@ -71,15 +73,7 @@ struct OperatorRegistry {
     Symbol sym = Symbol::fromQualString(schema.name());
     auto sig = canonicalSchemaString(schema);
 
-    std::lock_guard<std::mutex> guard(lock);
-#ifdef C10_MOBILE
-    TORCH_INTERNAL_ASSERT(
-        1 == registered_operator_names.count(schema.operator_name()),
-        "Tried to remove operator ",
-        schema,
-        " from JIT but it wasn't found.");
-    registered_operator_names.erase(schema.operator_name());
-#endif
+    std::unique_lock<std::shared_mutex> guard(lock);
     // Try removing from pending operators list first
     auto pending_it = to_register.begin();
     while (pending_it != to_register.end() && (*pending_it)->schema() != schema)
@@ -119,20 +113,25 @@ struct OperatorRegistry {
   }
 
   const std::shared_ptr<Operator>& lookupByLiteral(const char* name) {
-    std::lock_guard<std::mutex> guard(lock);
+    // Fast path: shared lock when no pending registrations and literal is
+    // already cached. This is the common steady-state case.
+    {
+      std::shared_lock<std::shared_mutex> reader(lock);
+      if (to_register.empty()) {
+        auto it = operators_by_sig_literal.find(name);
+        if (it != operators_by_sig_literal.end()) {
+          return it->second;
+        }
+      }
+    }
+    // Slow path: exclusive lock to flush pending operators and/or populate
+    // the literal cache.
+    std::unique_lock<std::shared_mutex> writer(lock);
     registerPendingOperators();
     auto it = operators_by_sig_literal.find(name);
     if (it == operators_by_sig_literal.end()) {
       auto op_ptr_it =
           operators_by_sig.find(canonicalSchemaString(parseSchema(name)));
-      // Handy debugging code that dumps all operators we know about on mismatch
-#if 0
-      if (op_ptr_it == operators_by_sig.end()) {
-        for (auto & entry : operators_by_sig) {
-          std::cout << entry.first << std::endl;
-        }
-      }
-#endif
       TORCH_CHECK(
           op_ptr_it != operators_by_sig.end(),
           "Couldn't find an operator for ",
@@ -144,18 +143,31 @@ struct OperatorRegistry {
   }
 
   const std::vector<std::shared_ptr<Operator>>& getOperators(Symbol name) {
-    std::lock_guard<std::mutex> guard(lock);
-    registerPendingOperators();
+    // Fast path: shared lock when no pending registrations.
     static std::vector<std::shared_ptr<Operator>> empty;
+    {
+      std::shared_lock<std::shared_mutex> reader(lock);
+      if (to_register.empty()) {
+        auto it = operators.find(name);
+        if (it != operators.end()) {
+          return it->second;
+        }
+        return empty;
+      }
+    }
+    // Slow path: exclusive lock to flush pending operators.
+    std::unique_lock<std::shared_mutex> writer(lock);
+    registerPendingOperators();
     auto it = operators.find(name);
-    if (it != operators.end())
+    if (it != operators.end()) {
       return it->second;
+    }
     return empty;
   }
 
   std::vector<Symbol> findSimilarOperators(Symbol input_op) {
-    std::lock_guard<std::mutex> guard(lock);
-    registerPendingOperators();
+    ensurePendingOperatorsFlushed();
+    std::shared_lock<std::shared_mutex> reader(lock);
 
     using EntryPair = std::pair<int64_t, Symbol>;
     auto cmp = [](const EntryPair& lhs, const EntryPair& rhs) {
@@ -181,11 +193,10 @@ struct OperatorRegistry {
   }
 
   const std::vector<std::shared_ptr<Operator>> getAllOperators() {
-    std::lock_guard<std::mutex> guard(lock);
-    registerPendingOperators();
+    ensurePendingOperatorsFlushed();
+    std::shared_lock<std::shared_mutex> reader(lock);
     std::vector<std::shared_ptr<Operator>> values;
-    values.clear();
-    for (auto& kv : operators) {
+    for (const auto& kv : operators) {
       values.insert(values.end(), kv.second.begin(), kv.second.end());
     }
     return values;
@@ -267,8 +278,8 @@ bool printerHasSpecialCaseFor(Symbol sym) {
       c10::namespaces::onnx,
   };
 
-  return handled.count(sym) || unneeded.count(sym) ||
-      !required_namespaces.count(sym.ns());
+  return handled.contains(sym) || unneeded.contains(sym) ||
+      !required_namespaces.contains(sym.ns());
 }
 
 } // anonymous namespace
@@ -348,14 +359,15 @@ bool aliasAnalysisHasSpecialCaseFor(Symbol symbol) {
       prim::AutogradAdd,
   };
 
-  return handled.count(symbol) || purposefully_not_handled.count(symbol);
+  return handled.contains(symbol) || purposefully_not_handled.contains(symbol);
 }
 
 void registerOperator(Operator&& op) {
   if (op.schema().is_varret()) {
     Symbol s = Symbol::fromQualString(op.schema().name());
     if (!printerHasSpecialCaseFor(s)) {
-      AT_ERROR(
+      TORCH_CHECK(
+          false,
           "Missing special case in python printer for non-schematized"
           " operator ",
           op.schema().name(),
@@ -363,7 +375,8 @@ void registerOperator(Operator&& op) {
     }
     if (aliasAnalysisHasSpecialCaseFor(s) &&
         op.aliasAnalysisKind() == AliasAnalysisKind::CONSERVATIVE) {
-      AT_ERROR(
+      TORCH_CHECK(
+          false,
           "Conflict in special casing in alias analysis for non-schematized"
           " operator ",
           op.schema().name(),
@@ -371,7 +384,8 @@ void registerOperator(Operator&& op) {
     }
     if (aliasAnalysisHasSpecialCaseFor(s) &&
         op.aliasAnalysisKind() == AliasAnalysisKind::FROM_SCHEMA) {
-      AT_ERROR(
+      TORCH_CHECK(
+          false,
           "The operator ",
           op.schema().name(),
           " is special cased and cannot use explicit alias analysis.");

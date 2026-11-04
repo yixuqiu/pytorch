@@ -24,7 +24,7 @@ namespace at::native {
 namespace {
 
 template <typename scalar_t>
-static void adaptive_avg_pool3d_out_frame(
+void adaptive_avg_pool3d_out_frame(
     const scalar_t* input_p,
     scalar_t* output_p,
     int64_t sizeD,
@@ -42,19 +42,19 @@ static void adaptive_avg_pool3d_out_frame(
     for (const auto d : c10::irange(start, end)) {
       /* loop over output */
       for (const auto ot : c10::irange(osizeT)) {
-        int istartT = start_index(ot, osizeT, isizeT);
-        int iendT = end_index(ot, osizeT, isizeT);
-        int kT = iendT - istartT;
+        auto istartT = start_index(ot, osizeT, isizeT);
+        auto iendT = end_index(ot, osizeT, isizeT);
+        auto kT = iendT - istartT;
 
         for (const auto oh : c10::irange(osizeH)) {
-          int istartH = start_index(oh, osizeH, isizeH);
-          int iendH = end_index(oh, osizeH, isizeH);
-          int kH = iendH - istartH;
+          auto istartH = start_index(oh, osizeH, isizeH);
+          auto iendH = end_index(oh, osizeH, isizeH);
+          auto kH = iendH - istartH;
 
           for (const auto ow : c10::irange(osizeW)) {
-            int istartW = start_index(ow, osizeW, isizeW);
-            int iendW = end_index(ow, osizeW, isizeW);
-            int kW = iendW - istartW;
+            auto istartW = start_index(ow, osizeW, isizeW);
+            auto iendW = end_index(ow, osizeW, isizeW);
+            auto kW = iendW - istartW;
 
             /* local pointers */
             const scalar_t* ip = input_p + d * istrideD + istartT * istrideT +
@@ -87,26 +87,7 @@ void adaptive_avg_pool3d_out_cpu_template(
     Tensor& output,
     Tensor const& input,
     IntArrayRef output_size) {
-  TORCH_CHECK(output_size.size() == 3, "adaptive_avg_pool3d: output_size must be 3");
-
-  for (const auto i : c10::irange(1, input.ndimension())) {
-    TORCH_CHECK(
-        input.size(i) > 0,
-        "adaptive_avg_pool3d(): Expected input to have non-zero size for non-batch dimensions, "
-        "but input has sizes ",
-        input.sizes(),
-        " with dimension ",
-        i,
-        " being "
-        "empty");
-  }
-
-  TORCH_CHECK(
-      (input.ndimension() == 4 || input.ndimension() == 5),
-      "adaptive_avg_pool3d(): Expected 4D or 5D tensor, but got ",
-      input.sizes());
-  TORCH_CHECK(input.dtype() == output.dtype(),
-      "expected dtype ", input.dtype(), " for `output` but got dtype ", output.dtype());
+  adaptive_avg_pool_check(input, output, output_size, /*pooling_dims=*/3, "adaptive_avg_pool3d()");
 
   /* sizes */
   int64_t sizeD = input.size(-4);
@@ -129,7 +110,7 @@ void adaptive_avg_pool3d_out_cpu_template(
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16,
         input.scalar_type(), "adaptive_avg_pool3d_cpu", [&] {
           auto input_data = input.const_data_ptr<scalar_t>();
-          auto output_data = output.data_ptr<scalar_t>();
+          auto output_data = output.mutable_data_ptr<scalar_t>();
           adaptive_avg_pool3d_out_frame<scalar_t>(
               input_data,
               output_data,
@@ -152,7 +133,7 @@ void adaptive_avg_pool3d_out_cpu_template(
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16,
         input.scalar_type(), "adaptive_avg_pool3d_cpu", [&] {
           auto input_data = input.const_data_ptr<scalar_t>();
-          auto output_data = output.data_ptr<scalar_t>();
+          auto output_data = output.mutable_data_ptr<scalar_t>();
           at::parallel_for(0, n, 1, [&](int64_t start, int64_t end) {
             for (const auto b : c10::irange(start, end)) {
               adaptive_avg_pool3d_out_frame<scalar_t>(
@@ -176,7 +157,7 @@ void adaptive_avg_pool3d_out_cpu_template(
 }
 
 template <typename scalar_t>
-static void adaptive_avg_pool3d_backward_out_frame(
+void adaptive_avg_pool3d_backward_out_frame(
     scalar_t* gradInput_p,
     const scalar_t* gradOutput_p,
     int64_t sizeD,
@@ -193,19 +174,19 @@ static void adaptive_avg_pool3d_backward_out_frame(
 
       /* calculate average */
       for (const auto ot : c10::irange(osizeT)) {
-        int istartT = start_index(ot, osizeT, isizeT);
-        int iendT = end_index(ot, osizeT, isizeT);
-        int kT = iendT - istartT;
+        auto istartT = start_index(ot, osizeT, isizeT);
+        auto iendT = end_index(ot, osizeT, isizeT);
+        auto kT = iendT - istartT;
 
         for (const auto oh : c10::irange(osizeH)) {
-          int istartH = start_index(oh, osizeH, isizeH);
-          int iendH = end_index(oh, osizeH, isizeH);
-          int kH = iendH - istartH;
+          auto istartH = start_index(oh, osizeH, isizeH);
+          auto iendH = end_index(oh, osizeH, isizeH);
+          auto kH = iendH - istartH;
 
           for (const auto ow : c10::irange(osizeW)) {
-            int istartW = start_index(ow, osizeW, isizeW);
-            int iendW = end_index(ow, osizeW, isizeW);
-            int kW = iendW - istartW;
+            auto istartW = start_index(ow, osizeW, isizeW);
+            auto iendW = end_index(ow, osizeW, isizeW);
+            auto kW = iendW - istartW;
 
             scalar_t grad_delta =
                 gradOutput_p_d[ot * osizeH * osizeW + oh * osizeW + ow] / kT /
@@ -234,7 +215,8 @@ Tensor& adaptive_avg_pool3d_backward_out_cpu_template(
   /* get contiguous gradOutput */
   auto gradOutput = gradOutput_.contiguous();
 
-  adaptive_pool_empty_output_check(gradOutput_, "adaptive_avg_pool3d_backward");
+  adaptive_avg_pool_backward_check(
+      gradInput, gradOutput_, input, /*pooling_dims=*/3, "adaptive_avg_pool3d_backward()");
 
   /* sizes */
   int64_t sizeD = input.size(-4);
@@ -250,7 +232,7 @@ Tensor& adaptive_avg_pool3d_backward_out_cpu_template(
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16,
         input.scalar_type(), "adaptive_avg_pool3d_backward_cpu", [&] {
           /* get raw pointers */
-          scalar_t* gradInput_data = gradInput.data_ptr<scalar_t>();
+          scalar_t* gradInput_data = gradInput.mutable_data_ptr<scalar_t>();
           const scalar_t* gradOutput_data = gradOutput.const_data_ptr<scalar_t>();
 
           adaptive_avg_pool3d_backward_out_frame<scalar_t>(
@@ -270,7 +252,7 @@ Tensor& adaptive_avg_pool3d_backward_out_cpu_template(
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16,
         input.scalar_type(), "adaptive_avg_pool3d_backward_cpu", [&] {
           /* get raw pointers */
-          scalar_t* gradInput_data = gradInput.data_ptr<scalar_t>();
+          scalar_t* gradInput_data = gradInput.mutable_data_ptr<scalar_t>();
           const scalar_t* gradOutput_data = gradOutput.const_data_ptr<scalar_t>();
           at::parallel_for(0, n, 1, [&](int64_t start, int64_t end) {
             for (const auto b : c10::irange(start, end)) {
@@ -310,10 +292,10 @@ Tensor adaptive_avg_pool3d_symint(Tensor const& input, SymIntArrayRef output_siz
   TORCH_CHECK(output_size.size() == 3, "adaptive_avg_pool3d: output_size must be 3");
   TORCH_CHECK(
         (output_size[0] >= 0 && output_size[1] >= 0 && output_size[2] >= 0),
-        "adaptive_avg_pool2d: elements of output_size must be greater than or equal to 0 ",
+        "adaptive_avg_pool3d: elements of output_size must be greater than or equal to 0 ",
         "but received {", output_size[0], ", ", output_size[1], ",", output_size[2], "}");
 
-  if (output_size[0] == 1 && output_size[1] == 1 && output_size[2] == 1 && !input.is_xpu()) {
+  if (output_size[0] == 1 && output_size[1] == 1 && output_size[2] == 1) {
     // in this case, adaptive pooling is just computing mean over hw
     // dimensions, which can be done more efficiently
     Tensor out = input.mean({-1, -2, -3}, /* keepdim = */ true);

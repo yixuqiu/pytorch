@@ -7,12 +7,22 @@ has valid ownership information in a comment header. Valid means:
   - The format of the header follows the pattern "# Owner(s): ["list", "of owner", "labels"]
   - Each owner label actually exists in PyTorch
   - Each owner label starts with "module: " or "oncall: " or is in ACCEPTABLE_OWNER_LABELS
+
+The set of valid labels is a snapshot checked in at LABELS_FILE rather than fetched at
+runtime, so that linting neither needs network access nor breaks when a label is deleted
+upstream. Refresh it with:
+
+  python3 .github/scripts/export_pytorch_labels.py pytorch pytorch \
+      --output-file tools/linter/adapters/pytorch_labels.json
 """
+
+from __future__ import annotations
+
 import argparse
 import json
 from enum import Enum
-from typing import Any, List, NamedTuple, Optional
-from urllib.request import urlopen
+from pathlib import Path
+from typing import NamedTuple
 
 
 LINTER_CODE = "TESTOWNERS"
@@ -26,40 +36,28 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
-    path: Optional[str]
-    line: Optional[int]
-    char: Optional[int]
+    path: str | None
+    line: int | None
+    char: int | None
     code: str
     severity: LintSeverity
     name: str
-    original: Optional[str]
-    replacement: Optional[str]
-    description: Optional[str]
+    original: str | None
+    replacement: str | None
+    description: str | None
 
 
+LABELS_FILE = Path(__file__).parent / "pytorch_labels.json"
+PYTORCH_LABELS = set(json.loads(LABELS_FILE.read_text()))
 # Team/owner labels usually start with "module: " or "oncall: ", but the following are acceptable exceptions
 ACCEPTABLE_OWNER_LABELS = ["NNC", "high priority"]
 OWNERS_PREFIX = "# Owner(s): "
-
-
-def get_pytorch_labels() -> Any:
-    labels = (
-        urlopen("https://ossci-metrics.s3.amazonaws.com/pytorch_labels.json")
-        .read()
-        .decode("utf-8")
-    )
-    return json.loads(labels)
-
-
-PYTORCH_LABELS = get_pytorch_labels()
-# Team/owner labels usually start with "module: " or "oncall: ", but the following are acceptable exceptions
-ACCEPTABLE_OWNER_LABELS = ["NNC", "high priority"]
 GLOB_EXCEPTIONS = ["**/test/run_test.py"]
 
 
 def check_labels(
-    labels: List[str], filename: str, line_number: int
-) -> List[LintMessage]:
+    labels: list[str], filename: str, line_number: int
+) -> list[LintMessage]:
     lint_messages = []
     for label in labels:
         if label not in PYTORCH_LABELS:
@@ -75,7 +73,9 @@ def check_labels(
                     replacement=None,
                     description=(
                         f"{label} is not a PyTorch label "
-                        "(please choose from https://github.com/pytorch/pytorch/labels)"
+                        "(please choose from https://github.com/pytorch/pytorch/labels). "
+                        "If it was added recently, refresh the checked-in label snapshot "
+                        "as described in tools/linter/adapters/testowners_linter.py"
                     ),
                 )
             )
@@ -96,7 +96,7 @@ def check_labels(
                 description=(
                     f"{label} is not an acceptable owner "
                     "(please update to another label or edit ACCEPTABLE_OWNERS_LABELS "
-                    "in tools/linters/adapters/testowners_linter.py"
+                    "in tools/linters/adapters/testowners_linter.py)"
                 ),
             )
         )
@@ -104,7 +104,7 @@ def check_labels(
     return lint_messages
 
 
-def check_file(filename: str) -> List[LintMessage]:
+def check_file(filename: str) -> list[LintMessage]:
     lint_messages = []
     has_ownership_info = False
 

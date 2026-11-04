@@ -1,17 +1,22 @@
 # Owner(s): ["module: onnx"]
 
 """Test the support on onnxscript in PyTorch-ONNX converter with onnxruntime."""
-from typing import List
+
+from typing import Sequence  # noqa: UP035
 
 import onnx_test_common
 import onnxscript
-import torch
 from onnxscript.onnx_types import FLOAT
-from torch.onnx._internal import jit_utils
+
+import torch
+from torch.onnx._internal.torchscript_exporter import jit_utils
 from torch.testing._internal import common_utils
+from torch.testing._internal.common_utils import HardwareClassification
 
 
 class TestONNXScriptRuntime(onnx_test_common._TestONNXRuntime):
+    hw_classification = HardwareClassification.GENERIC
+
     # opset version is
     # 1. local function is supported after opset 15
     # 2. onnx-script requires users to determine opset in local function
@@ -88,7 +93,11 @@ class TestONNXScriptRuntime(onnx_test_common._TestONNXRuntime):
 
         @onnxscript.script(custom_opset)
         def layer_norm(
-            X, axes: List[int], weight: FLOAT[...], bias: FLOAT[...], eps: float
+            X,
+            axes: Sequence[int],
+            weight: FLOAT[...],
+            bias: FLOAT[...],
+            eps: float,
         ):
             mean = op.ReduceMean(X, axes=axes)
             D = X - mean  # op.Sub(X, mean)

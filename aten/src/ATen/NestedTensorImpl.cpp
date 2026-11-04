@@ -1,5 +1,4 @@
 #include <ATen/ATen.h>
-#include <ATen/NamedTensorUtils.h>
 #include <ATen/WrapDimUtils.h>
 #include <ATen/NestedTensorImpl.h>
 #include <c10/core/DispatchKey.h>
@@ -11,6 +10,7 @@
 #include <numeric>
 #include <functional>
 #include <utility>
+#include <c10/util/irange.h>
 
 namespace {
 inline void validate_nested_tensor_metadata(
@@ -71,7 +71,7 @@ c10::DispatchKeySet get_view_key_set(const at::Tensor& base) {
 
 namespace at::native {
 
-inline std::vector<int64_t> construct_opt_sizes(const at::Tensor& sizes) {
+inline static std::vector<int64_t> construct_opt_sizes(const at::Tensor& sizes) {
   // torch.tensor([]) is considered to have `dim() = 1` and `size(0) = 0`
   // torch.nested_tensor([]) should also has `dim() = 1` and `size(0) = 0`
   if (sizes.dim() == 0) {
@@ -116,7 +116,7 @@ at::Tensor construct_nested_strides(const at::Tensor& sizes) {
   at::Tensor strides = sizes.new_empty(sizes.sizes());
   const int64_t* sizes_ptr = sizes.const_data_ptr<int64_t>();
   int64_t* strides_ptr = strides.data_ptr<int64_t>();
-  for (int64_t i = 0; i < sizes.size(0); i++) {
+  for ([[maybe_unused]] const auto _ : c10::irange(sizes.size(0))) {
     strides_ptr[orig_dim - 1] = 1;
     int64_t product = sizes_ptr[orig_dim - 1];
     for (int64_t j = orig_dim - 2; j >= 0; j--) {
@@ -173,14 +173,16 @@ NestedTensorImpl::NestedTensorImpl(
       nested_sizes_(std::move(nested_sizes)),
       nested_strides_(std::move(nested_strides)),
       storage_offsets_(std::move(storage_offsets)),
-      opt_sizes_(c10::nullopt) {
+      opt_sizes_(std::nullopt) {
   C10_LOG_API_USAGE_ONCE("torch.NestedTensor");
   TORCH_WARN_ONCE(
       "The PyTorch API of nested tensors is in prototype stage and will change "
-      "in the near future.");
+      "in the near future. We recommend specifying layout=torch.jagged when constructing "
+      "a nested tensor, as this layout receives active development, has better operator "
+      "coverage, and works with torch.compile.");
   auto storage_device = storage_.device();
   TORCH_INTERNAL_ASSERT(
-      storage_device.is_cpu() || storage_device.is_cuda() || storage_device.is_xpu() || storage_device.is_privateuseone(),
+      storage_device.is_cpu() || storage_device.is_cuda() || storage_device.is_xpu() || storage_device.is_hpu() || storage_device.is_privateuseone(),
       "NestedTensorImpl storage must be either CUDA, CPU, XPU or ", get_privateuse1_backend(), " but got ",
       storage_device);
   validate_nested_tensor_metadata(nested_sizes_, nested_strides_, storage_offsets_);
@@ -209,7 +211,7 @@ NestedTensorImpl::NestedTensorImpl(
 }
 
 // assume contiguous, `nested_strides` and `offsets`
-// can be infered from `nested_sizes`
+// can be inferred from `nested_sizes`
 NestedTensorImpl::NestedTensorImpl(
     const at::Tensor& buffer,
     const at::Tensor& nested_sizes)
@@ -230,20 +232,20 @@ NestedTensorImpl::NestedTensorImpl(
       nested_sizes_(std::move(nested_sizes)),
       nested_strides_(std::move(nested_strides)),
       storage_offsets_(std::move(storage_offsets)),
-      opt_sizes_(c10::nullopt) {
+      opt_sizes_(std::nullopt) {
   validate_nested_tensor_metadata(nested_sizes_, nested_strides_, storage_offsets_);
   refresh_dim();
   set_custom_sizes_strides(c10::TensorImpl::SizesStridesPolicy::CustomSizes);
 }
 
-c10::optional<int64_t> NestedTensorImpl::opt_size(int64_t d) const {
+std::optional<int64_t> NestedTensorImpl::opt_size(int64_t d) const {
   if (C10_UNLIKELY(!opt_sizes_.has_value())) {
     // Cache the metadata to avoid recomputing it each time.
-    opt_sizes_ = c10::make_optional(construct_opt_sizes(nested_sizes_));
+    opt_sizes_ = construct_opt_sizes(nested_sizes_);
   }
   d = at::maybe_wrap_dim(d, dim(), false);
   if ((*opt_sizes_)[d] == -1) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   return (*opt_sizes_)[d];
 }
@@ -271,7 +273,7 @@ c10::SymInt NestedTensorImpl::sym_numel_custom() const {
   return NestedTensorImpl::numel_custom();
 }
 
-bool NestedTensorImpl::is_contiguous_custom(MemoryFormat) const {
+c10::SymBool NestedTensorImpl::sym_is_contiguous_custom(MemoryFormat /*memory_format*/) const {
   return nested_tensor_impl_is_contiguous(this);
 }
 IntArrayRef NestedTensorImpl::sizes_custom() const {
@@ -300,7 +302,7 @@ c10::intrusive_ptr<TensorImpl> NestedTensorImpl::shallow_copy_and_detach_core(
     bool allow_tensor_metadata_change) const {
   if (key_set_.has(DispatchKey::Python) &&
       !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::Python)) {
-    auto r = pyobj_slot_.load_pyobj_interpreter()->detach(this);
+    auto r = (*c10::impl::getGlobalPyInterpreter())->detach(this);
     if (r) {
       r->set_version_counter(std::forward<VariableVersion>(version_counter));
       r->set_allow_tensor_metadata_change(allow_tensor_metadata_change);

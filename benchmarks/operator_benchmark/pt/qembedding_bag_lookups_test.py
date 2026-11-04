@@ -1,11 +1,10 @@
-from typing import Optional
-
 import numpy as np
-import torch
-
-from torch.testing._internal.common_quantization import lengths_to_offsets
 
 import operator_benchmark as op_bench
+
+import torch
+from torch.testing._internal.common_quantization import lengths_to_offsets
+
 
 torch.ops.load_library("//caffe2/torch/fb/sparsenn:sparsenn_operators")
 
@@ -179,10 +178,10 @@ class EmbedddingBag4BitRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
         indices,
         offsets,
         mode: int,
-        per_sample_weights: Optional[torch.Tensor],
+        per_sample_weights: torch.Tensor | None,
         include_last_offset: bool,
         is_pruned_weights: bool,
-        compressed_indices: Optional[torch.Tensor],
+        compressed_indices: torch.Tensor | None,
     ):
         return self.op_func(
             prepacked_weights,
@@ -291,10 +290,10 @@ class EmbedddingBagByteRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
         indices,
         offsets,
         mode: int,
-        per_sample_weights: Optional[torch.Tensor],
+        per_sample_weights: torch.Tensor | None,
         include_last_offset: bool,
         is_pruned_weights: bool,
-        compressed_indices: Optional[torch.Tensor],
+        compressed_indices: torch.Tensor | None,
     ):
         return self.op_func(
             prepacked_weights,

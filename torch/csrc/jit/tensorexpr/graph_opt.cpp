@@ -2,7 +2,6 @@
 
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
 #include <torch/csrc/jit/runtime/symbolic_shape_registry_util.h>
 #include <torch/csrc/jit/tensorexpr/kernel.h>
 
@@ -12,7 +11,7 @@ namespace torch::jit::tensorexpr {
 static Node* moveCatAfterUse(
     Node* cat,
     Node* user,
-    std::shared_ptr<Graph> subgraph) {
+    const std::shared_ptr<Graph>& subgraph) {
   // Example IR:
   //   %1 = ...
   //   %2 = ...
@@ -140,7 +139,7 @@ static bool doesCatPromoteTypes(Node* node) {
 //      - When the cat op promote types, the type of inputs to cat after moving
 //        it user needs to reflect the original type. This is currently not
 //        handled. TODO
-static void moveCatOpToEnd(Node* cat, std::shared_ptr<Graph> subgraph) {
+static void moveCatOpToEnd(Node* cat, const std::shared_ptr<Graph>& subgraph) {
   TORCH_INTERNAL_ASSERT(
       cat->kind() == aten::cat,
       buildErrorMessage("Graph node is not aten::cat."));
@@ -152,7 +151,7 @@ static void moveCatOpToEnd(Node* cat, std::shared_ptr<Graph> subgraph) {
         TORCH_INTERNAL_ASSERT(
             use.user->output()->owningGraph() == subgraph.get(),
             buildErrorMessage(
-                "aten::cat user graph does not math the given subgraph."));
+                "aten::cat user graph does not match the given subgraph."));
         auto new_cat = moveCatAfterUse(cat, use.user, subgraph);
         moveCatOpToEnd(new_cat, subgraph);
       }
@@ -162,7 +161,7 @@ static void moveCatOpToEnd(Node* cat, std::shared_ptr<Graph> subgraph) {
 
 // Moves the users of `aten::cat` ops to its inputs whenever possible
 // in the given subgraph.
-static void moveCatOpsToEnd(std::shared_ptr<Graph> subgraph) {
+static void moveCatOpsToEnd(const std::shared_ptr<Graph>& subgraph) {
   std::vector<Node*> cat_nodes;
   for (Node* n : subgraph->nodes()) {
     if (n->kind() == aten::cat) {
@@ -184,7 +183,7 @@ bool OptimizeCat(const std::shared_ptr<Graph>& graph) {
 
 void annotateInputShapes(
     const std::shared_ptr<Graph>& graph,
-    const std::vector<c10::optional<at::Tensor>>& example_inputs) {
+    const std::vector<std::optional<at::Tensor>>& example_inputs) {
   TORCH_INTERNAL_ASSERT(
       graph->inputs().size() == example_inputs.size(),
       buildErrorMessage("Given inputs do not match the fuser graph inputs."));
@@ -246,13 +245,14 @@ std::vector<int64_t> makeShapesSymbolic(
     }
     std::vector<at::ShapeSymbol> shape_vec = *tt->symbolic_sizes().sizes();
 
-    auto new_sizes = c10::fmap(shape_vec, [&](const at::ShapeSymbol& shape) {
-      auto value = shape.value();
-      if (shape_to_sym_shape.count(value)) {
-        return shape_to_sym_shape.at(value);
-      }
-      return value;
-    });
+    auto new_sizes =
+        c10::fmap(std::move(shape_vec), [&](const at::ShapeSymbol& shape) {
+          auto value = shape.value();
+          if (shape_to_sym_shape.contains(value)) {
+            return shape_to_sym_shape.at(value);
+          }
+          return value;
+        });
     v->setType(tt->withSymbolicShapes(c10::SymbolicShape(new_sizes)));
   }
 
@@ -304,8 +304,8 @@ bool isGraphCompilable(const std::shared_ptr<Graph>& graph) {
 
 static void fixupTypeInfoForValue(
     Value* v,
-    c10::optional<at::ScalarType> scalar_type,
-    c10::optional<at::Device> device) {
+    std::optional<at::ScalarType> scalar_type,
+    std::optional<at::Device> device) {
   Node* n = v->node();
   auto const& t = v->type();
   if (t->kind() != TypeKind::TensorType) {
@@ -339,8 +339,8 @@ static void fixupTypeInfoForValue(
   v->setType(new_tt);
 }
 
-static c10::optional<at::ScalarType> inferScalarType(Node* n) {
-  c10::optional<at::ScalarType> scalar_type;
+static std::optional<at::ScalarType> inferScalarType(Node* n) {
+  std::optional<at::ScalarType> scalar_type;
   for (auto v : n->inputs()) {
     auto const& t = v->type();
     if (t->kind() == TypeKind::TensorType) {
@@ -351,15 +351,15 @@ static c10::optional<at::ScalarType> inferScalarType(Node* n) {
       if (tt->scalarType() && *tt->scalarType() != scalar_type) {
         GRAPH_DEBUG(
             "Inputs of ", n, " have different scalar types, cannot fixup!");
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
   }
   return scalar_type;
 }
 
-static c10::optional<at::Device> inferDevice(Node* n) {
-  c10::optional<at::Device> device;
+static std::optional<at::Device> inferDevice(Node* n) {
+  std::optional<at::Device> device;
   for (auto v : n->inputs()) {
     auto const& t = v->type();
     if (t->kind() == TypeKind::TensorType) {
@@ -369,7 +369,7 @@ static c10::optional<at::Device> inferDevice(Node* n) {
       }
       if (tt->device() && *tt->device() != device) {
         GRAPH_DEBUG("Inputs of ", n, " have different devices, cannot fixup!");
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
   }
@@ -389,13 +389,13 @@ void fixupMissingShapeInfo(const std::shared_ptr<Graph>& graph) {
         return;
       }
       fixupTypeInfoForValue(
-          input, *tt->scalarType(), tt->device() ? *tt->device() : at::kCPU);
+          input, tt->scalarType(), tt->device() ? tt->device() : at::kCPU);
     }
   }
 
   for (auto n : graph->nodes()) {
-    c10::optional<at::ScalarType> scalar_type = inferScalarType(n);
-    c10::optional<at::Device> device = inferDevice(n);
+    std::optional<at::ScalarType> scalar_type = inferScalarType(n);
+    std::optional<at::Device> device = inferDevice(n);
 
     for (auto v : n->outputs()) {
       fixupTypeInfoForValue(v, scalar_type, device);
@@ -432,14 +432,14 @@ static bool trimGraphOnce(const std::shared_ptr<Graph>& graph) {
   bool changed = false;
   for (size_t idx = 0; idx < ret->inputs().size(); idx++) {
     auto v = ret->inputs()[idx];
-    if (graph_inputs.count(v)) {
+    if (graph_inputs.contains(v)) {
       continue;
     }
     // Delete the graph output IDX and add all inputs of the node producing that
     // value to the graph outputs
     graph->eraseOutput(idx);
     for (auto v_ins : v->node()->inputs()) {
-      if (outputs.count(v_ins)) {
+      if (outputs.contains(v_ins)) {
         continue;
       }
       if (v_ins->node()->kind() == prim::Constant) {

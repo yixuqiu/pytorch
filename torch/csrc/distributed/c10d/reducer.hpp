@@ -26,8 +26,8 @@
 
 namespace c10d {
 
-constexpr int kDefaultFirstBucketBytes = int(1024 * 1024);
-constexpr int kDefaultBucketBytesCap = int(25 * 1024 * 1024);
+constexpr int kDefaultFirstBucketBytes = 1024 * 1024;
+constexpr int kDefaultBucketBytesCap = 25 * 1024 * 1024;
 // Collect runtime stats once for every kDDPRuntimeLoggingSampleRate iterations.
 constexpr int kDDPRuntimeLoggingSampleRate = 100;
 
@@ -51,14 +51,18 @@ class TORCH_API Reducer {
   explicit Reducer(
       std::vector<at::Tensor> params,
       std::vector<std::vector<size_t>> bucket_indices,
-      const std::vector<size_t>& per_bucket_size_limits,
       c10::intrusive_ptr<c10d::ProcessGroup> process_group,
       std::vector<bool> expect_sparse_gradients,
       int64_t bucket_bytes_cap,
       bool find_unused_parameters,
       bool gradient_as_bucket_view,
       std::unordered_map<size_t, std::string> param_names,
-      int64_t first_bucket_bytes_cap);
+      int64_t first_bucket_bytes_cap,
+      bool skip_all_reduce_unused_params,
+      bool use_python_reducer,
+      std::vector<int64_t> bucket_bytes_cap_list,
+      bool batched_grad_copy = false,
+      bool lazy_bucket_allocation = false);
 
   ~Reducer() noexcept(false);
 
@@ -103,7 +107,7 @@ class TORCH_API Reducer {
   // been applied.
   void set_optimizer_in_backward() {
     optim_in_backward_ = true;
-  };
+  }
 
   // Runs allreduce or installed communication hook given GradBucket instance.
   c10::intrusive_ptr<c10::ivalue::Future> run_comm_hook(
@@ -137,7 +141,8 @@ class TORCH_API Reducer {
   // Install futures that should be awaited at end of backwards. Currently these
   // are only used by user-defined custom buffer reduction hooks, but can be
   // generalized to any user-originating futures that need to be awaited.
-  void install_futures(c10::List<c10::intrusive_ptr<c10::ivalue::Future>> futs);
+  void install_futures(
+      const c10::List<c10::intrusive_ptr<c10::ivalue::Future>>& futs);
 
   // Returns true if we should rebuild buckets, else false. We only rebuild
   // buckets once after the first iteration and never rebuild them if
@@ -159,7 +164,7 @@ class TORCH_API Reducer {
   // a tensor where index i = 1 if the Variable with that index has been used.
   at::Tensor get_local_used_map_on_device() const;
 
-  // An function for users to set sample_rate of collecting
+  // A function for users to set sample_rate of collecting
   // runtime stats. The time stats will be recorded for the
   // first 10 iterations, after 10 iterations time stats will be
   // recorded once every "sample_rate" training iterations.
@@ -197,6 +202,19 @@ class TORCH_API Reducer {
   // Resets reducer state.
   void reset_state();
 
+  // Requires the caller to manually finalize backward after all buckets are
+  // ready. Cannot be changed after forward while backward is expected or in
+  // progress.
+  void set_manual_finalization_required(bool required);
+
+  // Returns whether the current backward must complete before the caller can
+  // manually finalize it.
+  bool should_finalize_after_backward() const;
+
+  // Validates that manual backward finalization is required and all buckets
+  // are ready, then prepares and finalizes backward.
+  void finalize_backward_manual();
+
  protected:
   // Forward declaration.
   struct Bucket;
@@ -212,11 +230,11 @@ class TORCH_API Reducer {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::vector<bool> expect_sparse_gradients_;
 
-  std::vector<std::shared_ptr<torch::autograd::Node>>
+  std::vector<c10::intrusive_ptr<torch::autograd::Node>>
       grad_accumulators_; // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::unordered_map<torch::autograd::Node*, size_t> gradAccToVariableMap_;
-  std::vector<std::pair<uintptr_t, std::shared_ptr<torch::autograd::Node>>>
+  std::vector<std::pair<uintptr_t, c10::intrusive_ptr<torch::autograd::Node>>>
       hooks_; // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
 
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -232,6 +250,10 @@ class TORCH_API Reducer {
   const bool find_unused_parameters_;
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   const bool gradient_as_bucket_view_;
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  const bool batched_grad_copy_;
+  const bool lazy_bucket_allocation_;
+  bool has_logged_bucket_allocator_{false};
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::vector<size_t> unused_parameters_;
   // Previous iteration's unused params, used for checking if unused parameters
@@ -261,10 +283,10 @@ class TORCH_API Reducer {
   std::weak_ptr<c10d::Logger> logger_;
   // List of futures installed by Reducer::install_futures that should be
   // awaited at the end of backwards pass.
-  c10::optional<c10::List<c10::intrusive_ptr<c10::ivalue::Future>>>
-      installed_futures_{c10::nullopt};
+  std::optional<c10::List<c10::intrusive_ptr<c10::ivalue::Future>>>
+      installed_futures_{std::nullopt};
   // Mixed precision parameter dtype for bucket type checking.
-  c10::optional<c10::ScalarType> mixed_precision_param_dtype_{c10::nullopt};
+  std::optional<c10::ScalarType> mixed_precision_param_dtype_{std::nullopt};
 
   // Work handle for allreduce on local_used_map_
   c10::intrusive_ptr<c10d::Work> local_used_work_;
@@ -278,6 +300,8 @@ class TORCH_API Reducer {
   void mark_bucket_ready(size_t bucket_index);
 
   void finalize_bucket_dense(Bucket& bucket);
+
+  void prepare_for_backward_finalization();
 
   void finalize_backward();
 
@@ -307,14 +331,22 @@ class TORCH_API Reducer {
           GradCallback,
           torch::distributed::autograd::DistAutogradContext::GradCallback>);
 #endif
-  void runGradCallbackForVariable(at::Tensor& variable, GradCallback&& cb);
+  void runGradCallbackForVariable(at::Tensor& variable, const GradCallback& cb);
 
-  // This function is called inside `initialize_buckets()`. It initializes both
-  // `bucket_views_in` and `bucket_views_out` with views for each variable's
-  // gradient into the bucket's flattened `gradients` tensor. Views serve as
-  // entry points to `copy_()` each grad's data in/out of the flattened
-  // `gradients` tensor.
+  // Flushes deferred grad-to-bucket copies for a single bucket when
+  // batched_grad_copy_ is enabled. Called from mark_variable_ready (when
+  // bucket.pending == 0) and from delay_all_reduce (after all variables
+  // are marked ready).
+  void flush_deferred_copies(Bucket& bucket, size_t bucket_index);
+
+  // Initializes views for each variable into the flattened gradient tensor.
   void initialize_bucket_views(Bucket& bucket);
+
+  void initialize_bucket_storage(Bucket& bucket);
+
+  // Parameter gradients retain their bucket views until the optimizer clears
+  // them, so releasing these references does not invalidate visible gradients.
+  void release_bucket_storage();
 
   // This function is called inside `finalize_backward`, it happens only if
   // DDP communication hook was registered to recreate just bucket_views_out
@@ -384,18 +416,30 @@ class TORCH_API Reducer {
     // If no hook is registered, a temporary vanilla allreduce hook is used.
     c10::intrusive_ptr<at::ivalue::Future> future_work;
 
+    // Retained for lazy buckets so finalize_backward can release NCCL's tensor
+    // stash on the autograd thread after communication completes.
+    c10::intrusive_ptr<c10d::Work> allreduce_work;
+
+    // if this bucket contains complex parameters
+    bool is_complex_bucket = false;
+
     // If this bucket should expect a single sparse gradient
     // If `true`, then this implies that `bucket.variables.size() == 1`.
     bool expect_sparse_gradient = false;
 
     // Sparse indices tensor
-    c10::optional<at::Tensor> sparse_tensor_indices = c10::nullopt;
+    std::optional<at::Tensor> sparse_tensor_indices = std::nullopt;
 
     // TODO(@pietern)
     // Memory copies from gradient tensors into the bucket are potentially
     // done on different CUDA streams. We record an event for every copy
     // so that we can synchronize with them prior to kicking off the reduction.
     // std::vector<at::cuda::CUDAEvent> events;
+
+    // Intra-bucket indices of variables whose grad-to-bucket copies are
+    // deferred for batching. Flushed as _foreach_copy_ + flat div_ when
+    // pending == 0. Only used when batched_grad_copy is enabled.
+    std::vector<size_t> deferred_copy_indices;
   };
 
   std::vector<Bucket> buckets_;
@@ -431,6 +475,8 @@ class TORCH_API Reducer {
   // track the number of buckets that have been ready for
   // communication calls like allReduce or communication hooks.
   int num_buckets_ready_;
+  // track the number of buckets that have been reduced.
+  int num_buckets_reduced_;
 
   // Timing information.
   int64_t backward_compute_start_time_ = -1;
@@ -455,6 +501,10 @@ class TORCH_API Reducer {
 
   // Following variables are to help build dynamic bucket order
   bool has_rebuilt_bucket_;
+
+  // When true, the caller must manually finalize backward.
+  bool is_manual_finalization_required_{false};
+
   std::vector<at::Tensor> rebuilt_params_;
   std::vector<int64_t> rebuilt_param_indices_;
   const int64_t bucket_bytes_cap_;
@@ -492,6 +542,8 @@ class TORCH_API Reducer {
 
   bool static_graph_;
 
+  bool skip_all_reduce_unused_params_;
+
   // Key: size_t (index), Value: the number of times that a variable's
   // autograd_hook() should be triggered before marking this variable's grad as
   // ready for communication. Map will not change after 1st iteration.
@@ -505,7 +557,7 @@ class TORCH_API Reducer {
  private:
   // reset counting for buckets before backward starts
   void reset_bucket_counting();
-  // search unused parameters beore backward starts
+  // search unused parameters before backward starts
   void search_unused_parameters(
       const std::vector<torch::autograd::Variable>& outputs);
   void set_divide_factor();
@@ -521,6 +573,9 @@ class TORCH_API Reducer {
   bool dynamic_graph_find_unused();
   bool static_graph_first_iteration();
   bool static_graph_after_first_iteration();
+
+  bool is_unused_bucket(Bucket& bucket);
+  bool should_skip_all_reduce_bucket(Bucket& bucket);
 
   // comm_hook_ is used to access the DDP communication hook if registered.
   std::unique_ptr<CommHookInterface> comm_hook_;
@@ -554,6 +609,11 @@ class TORCH_API Reducer {
   void checkAndRaiseMarkedTwiceError(size_t curVariableIndex);
   // Retrieves parameter corresponding to the given VariableIndex.
   at::Tensor& get_param_from_index(size_t index);
+  // Python reducer keeps C++ reducer initialized. To remove this flag,
+  // we need to refactor the DDP wrapper's initialization.
+  bool use_python_reducer_;
+
+  const std::vector<int64_t> bucket_bytes_cap_list_;
 
   // Cached bucket index to model parameter mapping. Populated after buckets
   // are rebuilt after which this mapping is static.
@@ -576,12 +636,12 @@ compute_bucket_assignment_by_size(
     const std::vector<size_t>& bucket_size,
     const std::vector<bool>& expect_sparse_gradient = {},
     const std::vector<int64_t>& tensor_indices = {},
-    const c10::optional<std::weak_ptr<c10d::Logger>>& logger = {});
+    const std::optional<std::weak_ptr<c10d::Logger>>& logger = {});
 
 // Verify models across all processes are the same as model on rank 0 with
 // respect to no. of params and matching dtype/size/layout.
 TORCH_API void verify_params_across_processes(
     const c10::intrusive_ptr<c10d::ProcessGroup>& process_group,
     const std::vector<at::Tensor>& params,
-    const c10::optional<std::weak_ptr<c10d::Logger>>& logger);
+    const std::optional<std::weak_ptr<c10d::Logger>>& logger);
 } // namespace c10d

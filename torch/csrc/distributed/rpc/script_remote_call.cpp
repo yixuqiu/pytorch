@@ -3,9 +3,7 @@
 
 #include <torch/csrc/jit/serialization/pickle.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 ScriptRemoteCall::ScriptRemoteCall(
     std::shared_ptr<Operator> op,
@@ -67,7 +65,7 @@ c10::intrusive_ptr<Message> ScriptRemoteCall::toMessageImpl() && {
 
 std::unique_ptr<ScriptRemoteCall> ScriptRemoteCall::fromMessage(
     const Message& message) {
-  auto payload = static_cast<const char*>(message.payload().data());
+  auto payload = message.payload().data();
   auto payload_size = message.payload().size();
 
   auto value = jit::unpickle(
@@ -80,6 +78,4 @@ std::unique_ptr<ScriptRemoteCall> ScriptRemoteCall::fromMessage(
   return fromIValues(values);
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

@@ -1,8 +1,10 @@
+# mypy: allow-untyped-defs
 """Provide an API for writing protocol buffers to event files to be consumed by TensorBoard for visualization."""
+from __future__ import annotations
 
 import os
 import time
-from typing import List, Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -49,7 +51,7 @@ class FileWriter:
     training.
     """
 
-    def __init__(self, log_dir, max_queue=10, flush_secs=120, filename_suffix=""):
+    def __init__(self, log_dir, max_queue=10, flush_secs=120, filename_suffix="") -> None:
         """Create a `FileWriter` and an event file.
 
         On construction the writer creates a new event file in `log_dir`.
@@ -80,7 +82,7 @@ class FileWriter:
         """Return the directory where event file will be written."""
         return self.event_writer.get_logdir()
 
-    def add_event(self, event, step=None, walltime=None):
+    def add_event(self, event, step=None, walltime=None) -> None:
         """Add an event to the event file.
 
         Args:
@@ -97,7 +99,7 @@ class FileWriter:
             event.step = int(step)
         self.event_writer.add_event(event)
 
-    def add_summary(self, summary, global_step=None, walltime=None):
+    def add_summary(self, summary, global_step=None, walltime=None) -> None:
         """Add a `Summary` protocol buffer to the event file.
 
         This method wraps the provided summary in an `Event` protocol buffer
@@ -113,7 +115,7 @@ class FileWriter:
         event = event_pb2.Event(summary=summary)
         self.add_event(event, global_step, walltime)
 
-    def add_graph(self, graph_profile, walltime=None):
+    def add_graph(self, graph_profile, walltime=None) -> None:
         """Add a `Graph` and step stats protocol buffer to the event file.
 
         Args:
@@ -132,18 +134,18 @@ class FileWriter:
         event = event_pb2.Event(tagged_run_metadata=trm)
         self.add_event(event, None, walltime)
 
-    def add_onnx_graph(self, graph, walltime=None):
+    def add_onnx_graph(self, graph, walltime=None) -> None:
         """Add a `Graph` protocol buffer to the event file.
 
         Args:
           graph: A `Graph` protocol buffer.
           walltime: float. Optional walltime to override the default (current)
-            _get_file_writerfrom time.time())
+            walltime (from time.time()) seconds after epoch
         """
         event = event_pb2.Event(graph_def=graph.SerializeToString())
         self.add_event(event, None, walltime)
 
-    def flush(self):
+    def flush(self) -> None:
         """Flushes the event file to disk.
 
         Call this method to make sure that all pending events have been written to
@@ -151,14 +153,14 @@ class FileWriter:
         """
         self.event_writer.flush()
 
-    def close(self):
+    def close(self) -> None:
         """Flushes the event file to disk and close the file.
 
         Call this method when you do not need the summary writer anymore.
         """
         self.event_writer.close()
 
-    def reopen(self):
+    def reopen(self) -> None:
         """Reopens the EventFileWriter.
 
         Can be called after `close()` to add more events in the same directory.
@@ -186,7 +188,7 @@ class SummaryWriter:
         max_queue=10,
         flush_secs=120,
         filename_suffix="",
-    ):
+    ) -> None:
         """Create a `SummaryWriter` that will write out events and summaries to the event file.
 
         Args:
@@ -258,35 +260,22 @@ class SummaryWriter:
             v *= 1.1
         self.default_bins = neg_buckets[::-1] + [0] + buckets
 
-    def _check_caffe2_blob(self, item):
-        """
-        Check if the input is a string representing a Caffe2 blob name.
-
-        Caffe2 users have the option of passing a string representing the name of a blob
-        in the workspace instead of passing the actual Tensor/array containing the numeric values.
-        Thus, we need to check if we received a string as input
-        instead of an actual Tensor/array, and if so, we need to fetch the Blob
-        from the workspace corresponding to that name. Fetching can be done with the
-        following:
-
-        from caffe2.python import workspace (if not already imported)
-        workspace.FetchBlob(blob_name)
-        workspace.FetchBlobs([blob_name1, blob_name2, ...])
-        """
-        return isinstance(item, str)
-
     def _get_file_writer(self):
         """Return the default FileWriter instance. Recreates it if closed."""
         if self.all_writers is None or self.file_writer is None:
+            # pyrefly: ignore [bad-assignment]
             self.file_writer = FileWriter(
                 self.log_dir, self.max_queue, self.flush_secs, self.filename_suffix
             )
+            # pyrefly: ignore [bad-assignment, missing-attribute]
             self.all_writers = {self.file_writer.get_logdir(): self.file_writer}
             if self.purge_step is not None:
                 most_recent_step = self.purge_step
+                # pyrefly: ignore [missing-attribute]
                 self.file_writer.add_event(
                     Event(step=most_recent_step, file_version="brain.Event:2")
                 )
+                # pyrefly: ignore [missing-attribute]
                 self.file_writer.add_event(
                     Event(
                         step=most_recent_step,
@@ -301,17 +290,22 @@ class SummaryWriter:
         return self.log_dir
 
     def add_hparams(
-        self, hparam_dict, metric_dict, hparam_domain_discrete=None, run_name=None, global_step=None
-    ):
+        self,
+        hparam_dict,
+        metric_dict,
+        hparam_domain_discrete=None,
+        run_name=None,
+        global_step=None,
+    ) -> None:
         """Add a set of hyperparameters to be compared in TensorBoard.
 
         Args:
             hparam_dict (dict): Each key-value pair in the dictionary is the
-              name of the hyper parameter and it's corresponding value.
+              name of the hyper parameter and its corresponding value.
               The type of the value can be one of `bool`, `string`, `float`,
               `int`, or `None`.
             metric_dict (dict): Each key-value pair in the dictionary is the
-              name of the metric and it's corresponding value. Note that the key used
+              name of the metric and its corresponding value. Note that the key used
               here should be unique in the tensorboard record. Otherwise the value
               you added by ``add_scalar`` will be displayed in hparam plugin. In most
               cases, this is unwanted.
@@ -331,7 +325,7 @@ class SummaryWriter:
 
         Expected result:
 
-        .. image:: _static/img/tensorboard/add_hparam.png
+        .. image:: /_static/img/tensorboard/add_hparam.png
            :scale: 50 %
 
         """
@@ -358,7 +352,7 @@ class SummaryWriter:
         walltime=None,
         new_style=False,
         double_precision=False,
-    ):
+    ) -> None:
         """Add scalar data to summary.
 
         Args:
@@ -380,22 +374,18 @@ class SummaryWriter:
 
         Expected result:
 
-        .. image:: _static/img/tensorboard/add_scalar.png
+        .. image:: /_static/img/tensorboard/add_scalar.png
            :scale: 50 %
 
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_scalar")
-        if self._check_caffe2_blob(scalar_value):
-            from caffe2.python import workspace
-
-            scalar_value = workspace.FetchBlob(scalar_value)
 
         summary = scalar(
             tag, scalar_value, new_style=new_style, double_precision=double_precision
         )
         self._get_file_writer().add_summary(summary, global_step, walltime)
 
-    def add_scalars(self, main_tag, tag_scalar_dict, global_step=None, walltime=None):
+    def add_scalars(self, main_tag, tag_scalar_dict, global_step=None, walltime=None) -> None:
         """Add many scalar data to summary.
 
         Args:
@@ -420,7 +410,7 @@ class SummaryWriter:
 
         Expected result:
 
-        .. image:: _static/img/tensorboard/add_scalars.png
+        .. image:: /_static/img/tensorboard/add_scalars.png
            :scale: 50 %
 
         """
@@ -429,18 +419,15 @@ class SummaryWriter:
         fw_logdir = self._get_file_writer().get_logdir()
         for tag, scalar_value in tag_scalar_dict.items():
             fw_tag = fw_logdir + "/" + main_tag.replace("/", "_") + "_" + tag
-            assert self.all_writers is not None
-            if fw_tag in self.all_writers.keys():
+            if self.all_writers is None:
+                raise AssertionError("self.all_writers is None")
+            if fw_tag in self.all_writers:
                 fw = self.all_writers[fw_tag]
             else:
                 fw = FileWriter(
                     fw_tag, self.max_queue, self.flush_secs, self.filename_suffix
                 )
                 self.all_writers[fw_tag] = fw
-            if self._check_caffe2_blob(scalar_value):
-                from caffe2.python import workspace
-
-                scalar_value = workspace.FetchBlob(scalar_value)
             fw.add_summary(scalar(main_tag, scalar_value), global_step, walltime)
 
     def add_tensor(
@@ -449,7 +436,7 @@ class SummaryWriter:
         tensor,
         global_step=None,
         walltime=None,
-    ):
+    ) -> None:
         """Add tensor data to summary.
 
         Args:
@@ -471,10 +458,6 @@ class SummaryWriter:
 
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_tensor")
-        if self._check_caffe2_blob(tensor):
-            from caffe2.python import workspace
-
-            tensor = torch.tensor(workspace.FetchBlob(tensor))
 
         summary = tensor_proto(tag, tensor)
         self._get_file_writer().add_summary(summary, global_step, walltime)
@@ -487,7 +470,7 @@ class SummaryWriter:
         bins="tensorflow",
         walltime=None,
         max_bins=None,
-    ):
+    ) -> None:
         """Add histogram to summary.
 
         Args:
@@ -495,7 +478,7 @@ class SummaryWriter:
             values (torch.Tensor, numpy.ndarray, or string/blobname): Values to build histogram
             global_step (int): Global step value to record
             bins (str): One of {'tensorflow','auto', 'fd', ...}. This determines how the bins are made. You can find
-              other options in: https://docs.scipy.org/doc/numpy/reference/generated/numpy.histogram.html
+              other options in: https://numpy.org/doc/stable/reference/generated/numpy.histogram.html
             walltime (float): Optional override default walltime (time.time())
               seconds after epoch of event
 
@@ -511,15 +494,11 @@ class SummaryWriter:
 
         Expected result:
 
-        .. image:: _static/img/tensorboard/add_histogram.png
+        .. image:: /_static/img/tensorboard/add_histogram.png
            :scale: 50 %
 
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_histogram")
-        if self._check_caffe2_blob(values):
-            from caffe2.python import workspace
-
-            values = workspace.FetchBlob(values)
         if isinstance(bins, str) and bins == "tensorflow":
             bins = self.default_bins
         self._get_file_writer().add_summary(
@@ -538,7 +517,7 @@ class SummaryWriter:
         bucket_counts,
         global_step=None,
         walltime=None,
-    ):
+    ) -> None:
         """Add histogram with raw data.
 
         Args:
@@ -584,7 +563,7 @@ class SummaryWriter:
 
         Expected result:
 
-        .. image:: _static/img/tensorboard/add_histogram_raw.png
+        .. image:: /_static/img/tensorboard/add_histogram_raw.png
            :scale: 50 %
 
         """
@@ -603,7 +582,7 @@ class SummaryWriter:
 
     def add_image(
         self, tag, img_tensor, global_step=None, walltime=None, dataformats="CHW"
-    ):
+    ) -> None:
         """Add image data to summary.
 
         Note that this requires the ``pillow`` package.
@@ -643,22 +622,18 @@ class SummaryWriter:
 
         Expected result:
 
-        .. image:: _static/img/tensorboard/add_image.png
+        .. image:: /_static/img/tensorboard/add_image.png
            :scale: 50 %
 
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_image")
-        if self._check_caffe2_blob(img_tensor):
-            from caffe2.python import workspace
-
-            img_tensor = workspace.FetchBlob(img_tensor)
         self._get_file_writer().add_summary(
             image(tag, img_tensor, dataformats=dataformats), global_step, walltime
         )
 
     def add_images(
         self, tag, img_tensor, global_step=None, walltime=None, dataformats="NCHW"
-    ):
+    ) -> None:
         """Add batched image data to summary.
 
         Note that this requires the ``pillow`` package.
@@ -691,15 +666,11 @@ class SummaryWriter:
 
         Expected result:
 
-        .. image:: _static/img/tensorboard/add_images.png
+        .. image:: /_static/img/tensorboard/add_images.png
            :scale: 30 %
 
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_images")
-        if self._check_caffe2_blob(img_tensor):
-            from caffe2.python import workspace
-
-            img_tensor = workspace.FetchBlob(img_tensor)
         self._get_file_writer().add_summary(
             image(tag, img_tensor, dataformats=dataformats), global_step, walltime
         )
@@ -714,7 +685,7 @@ class SummaryWriter:
         rescale=1,
         dataformats="CHW",
         labels=None,
-    ):
+    ) -> None:
         """Add image and draw bounding boxes on the image.
 
         Args:
@@ -737,14 +708,6 @@ class SummaryWriter:
             boxes and each 4 elements in a row represents (xmin, ymin, xmax, ymax).
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_image_with_boxes")
-        if self._check_caffe2_blob(img_tensor):
-            from caffe2.python import workspace
-
-            img_tensor = workspace.FetchBlob(img_tensor)
-        if self._check_caffe2_blob(box_tensor):
-            from caffe2.python import workspace
-
-            box_tensor = workspace.FetchBlob(box_tensor)
         if labels is not None:
             if isinstance(labels, str):
                 labels = [labels]
@@ -766,10 +729,10 @@ class SummaryWriter:
     def add_figure(
         self,
         tag: str,
-        figure: Union["Figure", List["Figure"]],
-        global_step: Optional[int] = None,
+        figure: Figure | list[Figure],
+        global_step: int | None = None,
         close: bool = True,
-        walltime: Optional[float] = None
+        walltime: float | None = None,
     ) -> None:
         """Render matplotlib figure into an image and add it to summary.
 
@@ -801,7 +764,7 @@ class SummaryWriter:
                 dataformats="CHW",
             )
 
-    def add_video(self, tag, vid_tensor, global_step=None, fps=4, walltime=None):
+    def add_video(self, tag, vid_tensor, global_step=None, fps=4, walltime=None) -> None:
         """Add video data to summary.
 
         Note that this requires the ``moviepy`` package.
@@ -823,7 +786,7 @@ class SummaryWriter:
 
     def add_audio(
         self, tag, snd_tensor, global_step=None, sample_rate=44100, walltime=None
-    ):
+    ) -> None:
         """Add audio data to summary.
 
         Args:
@@ -837,15 +800,11 @@ class SummaryWriter:
             snd_tensor: :math:`(1, L)`. The values should lie between [-1, 1].
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_audio")
-        if self._check_caffe2_blob(snd_tensor):
-            from caffe2.python import workspace
-
-            snd_tensor = workspace.FetchBlob(snd_tensor)
         self._get_file_writer().add_summary(
             audio(tag, snd_tensor, sample_rate=sample_rate), global_step, walltime
         )
 
-    def add_text(self, tag, text_string, global_step=None, walltime=None):
+    def add_text(self, tag, text_string, global_step=None, walltime=None) -> None:
         """Add text data to summary.
 
         Args:
@@ -864,13 +823,13 @@ class SummaryWriter:
             text(tag, text_string), global_step, walltime
         )
 
-    def add_onnx_graph(self, prototxt):
+    def add_onnx_graph(self, prototxt) -> None:
         torch._C._log_api_usage_once("tensorboard.logging.add_onnx_graph")
         self._get_file_writer().add_onnx_graph(load_onnx_graph(prototxt))
 
     def add_graph(
         self, model, input_to_model=None, verbose=False, use_strict_trace=True
-    ):
+    ) -> None:
         """Add graph data to summary.
 
         Args:
@@ -883,32 +842,10 @@ class SummaryWriter:
                 record your mutable container types (list, dict)
         """
         torch._C._log_api_usage_once("tensorboard.logging.add_graph")
-        if hasattr(model, "forward"):
-            # A valid PyTorch model should have a 'forward' method
-            self._get_file_writer().add_graph(
-                graph(model, input_to_model, verbose, use_strict_trace)
-            )
-        else:
-            # Caffe2 models do not have the 'forward' method
-            from caffe2.proto import caffe2_pb2
-            from caffe2.python import core
-
-            from ._caffe2_graph import (
-                model_to_graph_def,
-                nets_to_graph_def,
-                protos_to_graph_def,
-            )
-
-            if isinstance(model, list):
-                if isinstance(model[0], core.Net):
-                    current_graph = nets_to_graph_def(model)
-                elif isinstance(model[0], caffe2_pb2.NetDef):
-                    current_graph = protos_to_graph_def(model)
-            else:
-                # Handles cnn.CNNModelHelper, model_helper.ModelHelper
-                current_graph = model_to_graph_def(model)
-            event = event_pb2.Event(graph_def=current_graph.SerializeToString())  # type: ignore[possibly-undefined]
-            self._get_file_writer().add_event(event)
+        # A valid PyTorch model should have a 'forward' method
+        self._get_file_writer().add_graph(
+            graph(model, input_to_model, verbose, use_strict_trace)
+        )
 
     @staticmethod
     def _encode(rawstr):
@@ -916,7 +853,7 @@ class SummaryWriter:
         retval = rawstr
         retval = retval.replace("%", f"%{ord('%'):02x}")
         retval = retval.replace("/", f"%{ord('/'):02x}")
-        retval = retval.replace("\\", "%%%02x" % (ord("\\")))
+        retval = retval.replace("\\", "%%%02x" % (ord("\\")))  # noqa: UP031
         return retval
 
     def add_embedding(
@@ -927,7 +864,7 @@ class SummaryWriter:
         global_step=None,
         tag="default",
         metadata_header=None,
-    ):
+    ) -> None:
         """Add embedding projector data to summary.
 
         Args:
@@ -986,27 +923,26 @@ class SummaryWriter:
                     "warning: Embedding dir exists, did you set global_step for add_embedding()?"
                 )
             else:
-                raise Exception(  # noqa: TRY002
+                raise NotADirectoryError(
                     f"Path: `{save_path}` exists, but is a file. Cannot proceed."
                 )
         else:
             fs.makedirs(save_path)
 
         if metadata is not None:
-            assert mat.shape[0] == len(
+            if mat.shape[0] != len(
                 metadata
-            ), "#labels should equal with #data points"
+            ):
+                raise AssertionError("#labels should equal with #data points")
             make_tsv(metadata, save_path, metadata_header=metadata_header)
 
         if label_img is not None:
-            assert (
-                mat.shape[0] == label_img.shape[0]
-            ), "#images should equal with #data points"
+            if mat.shape[0] != label_img.shape[0]:
+                raise AssertionError("#images should equal with #data points")
             make_sprite(label_img, save_path)
 
-        assert (
-            mat.ndim == 2
-        ), "mat should be 2D, where mat.size(0) is the number of data points"
+        if mat.ndim != 2:
+            raise AssertionError("mat should be 2D, where mat.size(0) is the number of data points")
         make_mat(mat, save_path)
 
         # Filesystem doesn't necessarily have append semantics, so we store an
@@ -1018,6 +954,7 @@ class SummaryWriter:
             metadata, label_img, subdir, global_step, tag
         )
         self._projector_config.embeddings.extend([embedding_info])
+
 
         from google.protobuf import text_format
 
@@ -1033,7 +970,7 @@ class SummaryWriter:
         num_thresholds=127,
         weights=None,
         walltime=None,
-    ):
+    ) -> None:
         """Add precision recall curve.
 
         Plotting a precision-recall curve lets you understand your model's
@@ -1086,7 +1023,7 @@ class SummaryWriter:
         num_thresholds=127,
         weights=None,
         walltime=None,
-    ):
+    ) -> None:
         """Add precision recall curve with raw data.
 
         Args:
@@ -1122,7 +1059,7 @@ class SummaryWriter:
 
     def add_custom_scalars_multilinechart(
         self, tags, category="default", title="untitled"
-    ):
+    ) -> None:
         """Shorthand for creating multilinechart. Similar to ``add_custom_scalars()``, but the only necessary argument is *tags*.
 
         Args:
@@ -1140,7 +1077,7 @@ class SummaryWriter:
 
     def add_custom_scalars_marginchart(
         self, tags, category="default", title="untitled"
-    ):
+    ) -> None:
         """Shorthand for creating marginchart.
 
         Similar to ``add_custom_scalars()``, but the only necessary argument is *tags*,
@@ -1156,11 +1093,12 @@ class SummaryWriter:
         torch._C._log_api_usage_once(
             "tensorboard.logging.add_custom_scalars_marginchart"
         )
-        assert len(tags) == 3
+        if len(tags) != 3:
+            raise AssertionError(f"Expected 3 tags, got {len(tags)}.")
         layout = {category: {title: ["Margin", tags]}}
         self._get_file_writer().add_summary(custom_scalars(layout))
 
-    def add_custom_scalars(self, layout):
+    def add_custom_scalars(self, layout) -> None:
         """Create special chart by collecting charts tags in 'scalars'.
 
         NOTE: This function can only be called once for each SummaryWriter() object.
@@ -1193,7 +1131,7 @@ class SummaryWriter:
         config_dict=None,
         global_step=None,
         walltime=None,
-    ):
+    ) -> None:
         """Add meshes or 3D point clouds to TensorBoard.
 
         The visualization is based on Three.js,
@@ -1251,7 +1189,7 @@ class SummaryWriter:
             mesh(tag, vertices, colors, faces, config_dict), global_step, walltime
         )
 
-    def flush(self):
+    def flush(self) -> None:
         """Flushes the event file to disk.
 
         Call this method to make sure that all pending events have been written to
@@ -1262,12 +1200,13 @@ class SummaryWriter:
         for writer in self.all_writers.values():
             writer.flush()
 
-    def close(self):
+    def close(self) -> None:
         if self.all_writers is None:
             return  # ignore double close
         for writer in self.all_writers.values():
             writer.flush()
             writer.close()
+        # pyrefly: ignore [bad-assignment]
         self.file_writer = self.all_writers = None
 
     def __enter__(self):

@@ -7,6 +7,7 @@
 #include <ATen/core/jit_type.h>
 #include <ATen/core/stack.h>
 #include <ATen/core/type_factory.h>
+#include <c10/util/Exception.h>
 #include <c10/util/StringUtil.h>
 #include <c10/util/hash.h>
 #include <c10/util/irange.h>
@@ -45,7 +46,7 @@ TORCH_API c10::intrusive_ptr<ConstantString> ConstantString::create(
 }
 
 TORCH_API c10::intrusive_ptr<ConstantString> ConstantString::create(
-    c10::string_view str_) {
+    std::string_view str_) {
   return c10::make_intrusive<ConstantString>(std::string(str_));
 }
 
@@ -65,7 +66,7 @@ bool operator==(const ivalue::Tuple& lhs, const ivalue::Tuple& rhs) {
 }
 
 std::ostream& operator<<(std::ostream& out, const ivalue::EnumHolder& v) {
-  out << v.qualifiedClassName() << "." << v.name();
+  out << v.qualifiedClassName() << '.' << v.name();
   return out;
 }
 
@@ -96,6 +97,8 @@ c10::TypePtr IValue::TagType<c10::Type>::get(const IValue& v) {
       case Tag::ComplexDouble:
         return ComplexType::get();
       case Tag::Int:
+        return IntType::get();
+      case Tag::UInt:
         return IntType::get();
       case Tag::SymInt:
         return c10::SymIntType::get();
@@ -269,7 +272,7 @@ bool IValue::overlaps(const IValue& rhs) const {
   rhs.getSubValues(rhsSubValues);
   getSubValues(thisSubValues);
   for (auto& sub : thisSubValues) {
-    if (rhsSubValues.count(sub)) {
+    if (rhsSubValues.contains(sub)) {
       return true;
     }
   }
@@ -320,6 +323,8 @@ IValue IValue::equals(const IValue& rhs) const {
       return rhs.isComplexDouble() && lhs.toComplexDouble() == rhs.toComplexDouble();
     case Tag::Int:
       return rhs.isInt() && lhs.toInt() == rhs.toInt();
+    case Tag::UInt:
+      return rhs.isUnsigned() && lhs.toUInt() == rhs.toUInt();
     case Tag::SymInt:
       return rhs.isSymInt() && lhs.toSymInt() == rhs.toSymInt();
     case Tag::SymFloat:
@@ -353,7 +358,7 @@ IValue IValue::equals(const IValue& rhs) const {
     case Tag::Enum:
       return lhs.toEnumHolder()->is(*rhs.toEnumHolder());
     case Tag::Uninitialized:
-      // Unitialized ivalues show up in no-ops when the compiler can prove a
+      // Uninitialized ivalues show up in no-ops when the compiler can prove a
       // value will never be used. Just return false on any equality comparison.
       return false;
   }
@@ -379,6 +384,8 @@ size_t IValue::hash(const IValue& v) {
     case Tag::Int:
       return c10::get_hash(v.payload.u.as_int);
     // NB: these are technically strict aliasing violations
+    case Tag::UInt:
+      return c10::get_hash(v.payload.u.as_int);
     case Tag::SymInt:
       return c10::get_hash(v.payload.u.as_int);
     case Tag::SymFloat:
@@ -406,7 +413,7 @@ size_t IValue::hash(const IValue& v) {
     case Tag::Enum:
     case Tag::Stream:
     case Tag::Uninitialized:
-      throw std::runtime_error(
+      TORCH_CHECK(false,
           "unhashable type: '" + v.type()->repr_str() + "'");
   }
   // the above switch should be exhaustive
@@ -471,7 +478,7 @@ bool IValue::isOptionalTensorList() const {
     return false;
   }
   const auto& ty = static_cast<detail::ListImpl*>(payload.u.as_intrusive_ptr)->elementType;
-  const auto& expected_ty = c10::getTypePtr<c10::optional<at::Tensor>>();
+  const auto& expected_ty = c10::getTypePtr<std::optional<at::Tensor>>();
   return expected_ty == ty;
 }
 
@@ -519,7 +526,7 @@ std::ostream& printMaybeAnnotatedList(
       !elementTypeCanBeInferredFromMembers(list_elem_type)) {
     out << "annotate(" << the_list.type<c10::Type>()->annotation_str() << ", ";
     printList(out, the_list.toListRef(), "[", "]", formatter);
-    out << ")";
+    out << ')';
     return out;
   } else {
     return printList(out, the_list.toListRef(), "[", "]", formatter);
@@ -531,7 +538,7 @@ std::ostream& printDict(
     std::ostream& out,
     const Dict& v,
     const IValueFormatter& formatter) {
-  out << "{";
+  out << '{';
 
   bool first = true;
   for (const auto& pair : v) {
@@ -545,7 +552,7 @@ std::ostream& printDict(
     first = false;
   }
 
-  out << "}";
+  out << '}';
   return out;
 }
 }
@@ -558,8 +565,8 @@ static std::ostream& printMaybeAnnotatedDict(
   auto value_type = the_dict.type()->castRaw<DictType>()->getValueType();
   if (the_dict.toGenericDict().empty() ||
       !elementTypeCanBeInferredFromMembers(value_type)) {
-    out << "annotate(" << the_dict.type<c10::Type>()->annotation_str() << ",";
-    printDict(out, the_dict.toGenericDict(), formatter) << ")";
+    out << "annotate(" << the_dict.type<c10::Type>()->annotation_str() << ',';
+    printDict(out, the_dict.toGenericDict(), formatter) << ')';
   } else {
     return printDict(out, the_dict.toGenericDict(), formatter);
   }
@@ -569,13 +576,8 @@ static std::ostream& printMaybeAnnotatedDict(
 static std::ostream& printComplex(std::ostream & out, const IValue & v) {
   c10::complex<double> d = v.toComplexDouble();
   IValue real(d.real()), imag(std::abs(d.imag()));
-  auto sign = "";
-  if (d.imag() >= 0) {
-    sign = "+";
-  } else {
-    sign = "-";
-  }
-  return out << real << sign << imag << "j";
+  auto sign = d.imag() >= 0 ? '+' : '-';
+  return out << real << sign << imag << 'j';
 }
 
 std::ostream& IValue::repr(
@@ -599,13 +601,13 @@ std::ostream& IValue::repr(
       double d = v.toDouble();
       int c = std::fpclassify(d);
       if ((c == FP_NORMAL || c == FP_ZERO ) && std::abs(d) < 1e10) {
-        int64_t i = int64_t(d);
-        if (double(i) == d) {
+        int64_t i = static_cast<int64_t>(d);
+        if (static_cast<double>(i) == d) {
           // -0.0 (signed zero) needs to be parsed as -0.
           if (i == 0 && std::signbit(d)) {
-            return out << "-" << i << ".";
+            return out << '-' << i << '.';
           }
-          return out << i << ".";
+          return out << i << '.';
         }
       }
       auto orig_prec = out.precision();
@@ -640,21 +642,21 @@ std::ostream& IValue::repr(
       std::stringstream device_stream;
       device_stream << v.toDevice();
       out << "torch.device(";
-      c10::printQuotedString(out, device_stream.str());
-      return out << ")";
+      c10::printQuotedString(out, std::move(device_stream).str());
+      return out << ')';
     }
     case IValue::Tag::Generator: {
       auto generator = v.toGenerator();
       out << "torch.Generator(device=";
       c10::printQuotedString(out, generator.device().str());
-      out << ", seed=" << generator.current_seed() << ")";
+      out << ", seed=" << generator.current_seed() << ')';
       return out;
     }
     case IValue::Tag::GenericDict:
       return printMaybeAnnotatedDict(out, v, formatter);
     case IValue::Tag::Enum: {
       auto enum_holder = v.toEnumHolder();
-      return out << enum_holder->qualifiedClassName() << "." <<
+      return out << enum_holder->qualifiedClassName() << '.' <<
           enum_holder->name();
     }
     case IValue::Tag::Object: {
@@ -756,7 +758,7 @@ IValueComparator getLessThanComparator(const IValue& v) {
     torch::jit::Function* lt_func =
         checkObjectSortSchema(v.type()->expect<ClassType>(), why_not);
     if (!lt_func) {
-      AT_ERROR(why_not.str());
+      TORCH_CHECK(false, std::move(why_not).str());
     }
 
     return [lt_func](const IValue& a, const IValue& b) {
@@ -772,7 +774,7 @@ IValueComparator getLessThanComparator(const IValue& v) {
     };
   }
 
-  AT_ERROR("IValues of type: ", v.tagKind(), " are not comparable");
+  TORCH_CHECK(false, "IValues of type: ", v.tagKind(), " are not comparable");
 }
 
 IValueComparator getGreaterThanComparator(const IValue& v) {
@@ -797,9 +799,9 @@ std::ostream& operator<<(std::ostream & out, const IValue & v) {
       double d = v.toDouble();
       int c = std::fpclassify(d);
       if (c == FP_NORMAL || c == FP_ZERO) {
-        int64_t i = int64_t(d);
-        if (double(i) == d) {
-          return out << i << ".";
+        int64_t i = static_cast<int64_t>(d);
+        if (static_cast<double>(i) == d) {
+          return out << i << '.';
         }
       }
       auto orig_prec = out.precision();
@@ -811,6 +813,8 @@ std::ostream& operator<<(std::ostream & out, const IValue & v) {
       return printComplex(out, v);
     } case IValue::Tag::Int:
       return out << v.toInt();
+    case IValue::Tag::UInt:
+      return out << v.toUInt();
     case IValue::Tag::SymInt:
       return out << v.toSymInt();
     case IValue::Tag::SymFloat:
@@ -848,7 +852,7 @@ std::ostream& operator<<(std::ostream & out, const IValue & v) {
       return printDict(out, v.toGenericDict(), formatter);
     case IValue::Tag::PyObject: {
       auto py_obj = v.toPyObject();
-      return out << "<PyObject at" << py_obj << ">";
+      return out << "<PyObject at" << py_obj << '>';
     }
     case IValue::Tag::Generator:
       return out << "Generator";
@@ -858,22 +862,22 @@ std::ostream& operator<<(std::ostream & out, const IValue & v) {
       // TODO we should attempt to call __str__ if the object defines it.
       auto obj = v.toObject();
       // print this out the way python would do it
-      return out << "<" << obj->name() << " object at " << obj.get() << ">";
+      return out << '<' << obj->name() << " object at " << obj.get() << '>';
     }
     case IValue::Tag::Enum: {
       auto enum_holder = v.toEnumHolder();
-      return out << "Enum<" << enum_holder->unqualifiedClassName() << "." <<
-          enum_holder->name() << ">";
+      return out << "Enum<" << enum_holder->unqualifiedClassName() << '.' <<
+          enum_holder->name() << '>';
     }
 
   }
-  return out << "<Invalid IValue tag=" << std::to_string(static_cast<uint32_t>(v.tag)) << ">";
+  return out << "<Invalid IValue tag=" << std::to_string(static_cast<uint32_t>(v.tag)) << '>';
 }
 
 #undef TORCH_FORALL_TAGS
 
 void IValue::dump() const {
-  std::cout << *this << "\n";
+  std::cout << *this << '\n';
 }
 
 std::shared_ptr<ClassType> ivalue::Object::type() const {
@@ -886,23 +890,25 @@ c10::intrusive_ptr<ivalue::Object> ivalue::Object::create(
       StrongTypePtr(nullptr, std::move(classType)), numSlots);
 }
 
-IValue IValue::deepcopy(c10::optional<at::Device> device) const {
-  IValue::HashAliasedIValueMap memo;
+IValue IValue::deepcopy(std::optional<at::Device> device) const {
+  IValue::HashIdentityIValueMap memo;
   return deepcopy(memo, device);
 }
 
 IValue IValue::deepcopy(
-    IValue::HashAliasedIValueMap& memo,
-    c10::optional<at::Device> device) const {
-  if (memo.count(*this)) {
-    return memo.at(*this);
+    IValue::HashIdentityIValueMap& memo,
+    std::optional<at::Device> device) const {
+  if (auto it = memo.find(*this); it != memo.end()) {
+    return it->second;
   }
   IValue copy;
   switch(tag) {
     case IValue::Tag::Tensor: {
       const at::Tensor& src_tensor = toTensor();
       copy = device.has_value() && !src_tensor.device().is_meta()
-          ? IValue(src_tensor.to(*device))
+          // non_blocking must be false: deepcopy never synchronizes the copy.
+          ? IValue(
+                src_tensor.to(*device, /*non_blocking=*/false, /*copy=*/true))
           : IValue(src_tensor.clone());
     } break;
     case IValue::Tag::Tuple: {
@@ -967,7 +973,7 @@ IValue IValue::deepcopy(
       copy = *this;
     } break;
     default: {
-      AT_ERROR("Can't deepcopy IValue with tag: ", tagKind());
+      TORCH_CHECK(false, "Can't deepcopy IValue with tag: ", tagKind());
     }
   }
   // NB: this doesn't work if an object contains itself, and it may
@@ -1027,14 +1033,14 @@ c10::intrusive_ptr<ivalue::Object> ivalue::Object::copy_to_weak_compilation_ref(
 }
 
 c10::intrusive_ptr<ivalue::Object> ivalue::Object::deepcopy(
-    c10::optional<at::Device> device) const {
-  IValue::HashAliasedIValueMap memo;
+    std::optional<at::Device> device) const {
+  IValue::HashIdentityIValueMap memo;
   return deepcopy(memo, device);
 }
 
 c10::intrusive_ptr<ivalue::Object> ivalue::Object::deepcopy(
-    IValue::HashAliasedIValueMap& memo,
-    c10::optional<at::Device> device) const {
+    IValue::HashIdentityIValueMap& memo,
+    std::optional<at::Device> device) const {
   auto cu = type_.cu_;
   auto object = ivalue::Object::create(WeakOrStrongTypePtr(type_.cu_, type_.type_), type()->numAttributes());
   for (const auto i : c10::irange(slots_.size())) {
@@ -1046,11 +1052,11 @@ c10::intrusive_ptr<ivalue::Object> ivalue::Object::deepcopy(
       std::stringstream err;
       err << "Cannot serialize custom bound C++ class";
       if (auto qualname = type()->name()) {
-        err << " " << qualname->qualifiedName();
+        err << ' ' << qualname->qualifiedName();
       }
       err << ". Please define serialization methods via def_pickle() for "
             "this class.";
-      AT_ERROR(err.str());
+      TORCH_CHECK(false, std::move(err).str());
     }
     object->setSlot(i, slots_[i].deepcopy(memo, device));
   }
@@ -1178,14 +1184,16 @@ TORCH_API intrusive_ptr<ivalue::Future> collectAll(
 
 namespace {
 
+#ifndef STRIP_ERROR_MESSAGES
 std::string formatSetOfDevices(const std::vector<c10::Device>& devices) {
   std::ostringstream oss;
   std::copy(
       devices.begin(),
       devices.end(),
       std::ostream_iterator<c10::Device>(oss, ", "));
-  return oss.str();
+  return std::move(oss).str();
 }
+#endif
 
 }
 

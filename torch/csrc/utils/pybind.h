@@ -1,5 +1,6 @@
 #pragma once
 
+#include <torch/csrc/Layout.h>
 #include <torch/csrc/python_headers.h>
 #include <torch/csrc/utils/pythoncapi_compat.h>
 
@@ -10,6 +11,7 @@
 #include <pybind11/stl.h>
 
 #include <torch/csrc/Device.h>
+#include <torch/csrc/Dtype.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/MemoryFormat.h>
@@ -18,13 +20,15 @@
 
 namespace py = pybind11;
 
+#define IS_PYBIND_2_13_PLUS PYBIND11_VERSION_HEX >= 0x020D0000
+
 // This makes intrusive_ptr to be available as a custom pybind11 holder type,
 // see
 // https://pybind11.readthedocs.io/en/stable/advanced/smart_ptrs.html#custom-smart-pointers
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::intrusive_ptr<T>, true);
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::intrusive_ptr<T>, true)
 
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonOrSharedTypePtr<T>);
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonTypePtr<T>, true);
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonOrSharedTypePtr<T>)
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonTypePtr<T>, true)
 
 namespace pybind11::detail {
 
@@ -35,7 +39,7 @@ struct TORCH_PYTHON_API type_caster<at::Tensor> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::Tensor, _("torch.Tensor"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
 
   static handle cast(
       const at::Tensor& src,
@@ -50,7 +54,7 @@ struct type_caster<at::Storage> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::Storage, _("torch.StorageBase"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (torch::isStorage(obj)) {
       value = torch::createStorage(obj);
@@ -73,7 +77,7 @@ struct type_caster<at::Generator> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::Generator, _("torch.Generator"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPGenerator_Check(obj)) {
       value = reinterpret_cast<THPGenerator*>(obj)->cdata;
@@ -96,7 +100,7 @@ struct TORCH_PYTHON_API type_caster<at::IntArrayRef> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::IntArrayRef, _("Tuple[int, ...]"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
   static handle cast(
       at::IntArrayRef src,
       return_value_policy /* policy */,
@@ -112,7 +116,7 @@ struct TORCH_PYTHON_API type_caster<at::SymIntArrayRef> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::SymIntArrayRef, _("List[int]"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
   static handle cast(
       at::SymIntArrayRef src,
       return_value_policy /* policy */,
@@ -128,7 +132,7 @@ struct TORCH_PYTHON_API type_caster<at::ArrayRef<c10::SymNode>> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::ArrayRef<c10::SymNode>, _("List[SymNode]"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
   static handle cast(
       at::ArrayRef<c10::SymNode> src,
       return_value_policy /* policy */,
@@ -144,7 +148,7 @@ struct type_caster<at::MemoryFormat> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::MemoryFormat, _("torch.memory_format"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPMemoryFormat_Check(obj)) {
       value = reinterpret_cast<THPMemoryFormat*>(obj)->memory_format;
@@ -172,7 +176,7 @@ struct type_caster<at::Device> {
   // after a successful call to load.
   type_caster() : value(c10::kCPU) {}
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPDevice_Check(obj)) {
       value = reinterpret_cast<THPDevice*>(obj)->device;
@@ -190,6 +194,35 @@ struct type_caster<at::Device> {
 };
 
 template <>
+struct type_caster<at::ScalarType> {
+ public:
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  PYBIND11_TYPE_CASTER(at::ScalarType, _("torch.dtype"));
+
+  // PYBIND11_TYPE_CASTER defines a member field called value. at::ScalarType
+  // cannot be default-initialized, we provide this constructor to explicitly
+  // initialize that field. The value doesn't matter as it will be overwritten
+  // after a successful call to load.
+  type_caster() : value(at::kFloat) {}
+
+  bool load(handle src, bool /*unused*/) {
+    PyObject* obj = src.ptr();
+    if (THPDtype_Check(obj)) {
+      value = reinterpret_cast<THPDtype*>(obj)->scalar_type;
+      return true;
+    }
+    return false;
+  }
+
+  static handle cast(
+      const at::ScalarType& src,
+      return_value_policy /* policy */,
+      handle /* parent */) {
+    return Py_NewRef(torch::getTHPDtype(src));
+  }
+};
+
+template <>
 struct type_caster<c10::Stream> {
  public:
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -201,12 +234,12 @@ struct type_caster<c10::Stream> {
   // after a successful call to load.
   type_caster() : value(c10::Stream::DEFAULT, c10::Device(c10::kCPU, 0)) {}
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPStream_Check(obj)) {
       value = c10::Stream::unpack3(
           ((THPStream*)obj)->stream_id,
-          ((THPStream*)obj)->device_index,
+          static_cast<c10::DeviceIndex>(((THPStream*)obj)->device_index),
           static_cast<c10::DeviceType>(((THPStream*)obj)->device_type));
       return true;
     }
@@ -225,7 +258,7 @@ template <>
 struct type_caster<c10::DispatchKey>
     : public type_caster_base<c10::DispatchKey> {
   using base = type_caster_base<c10::DispatchKey>;
-  c10::DispatchKey tmp;
+  c10::DispatchKey tmp{};
 
  public:
   bool load(handle src, bool convert) {
@@ -254,7 +287,7 @@ struct TORCH_PYTHON_API type_caster<c10::Scalar> {
   PYBIND11_TYPE_CASTER(
       c10::Scalar,
       _("Union[Number, torch.SymInt, torch.SymFloat, torch.SymBool]"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::Scalar& si,
@@ -266,7 +299,7 @@ template <>
 struct TORCH_PYTHON_API type_caster<c10::SymInt> {
  public:
   PYBIND11_TYPE_CASTER(c10::SymInt, _("Union[int, torch.SymInt]"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::SymInt& si,
@@ -278,7 +311,7 @@ template <>
 struct TORCH_PYTHON_API type_caster<c10::SymFloat> {
  public:
   PYBIND11_TYPE_CASTER(c10::SymFloat, _("float"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::SymFloat& si,
@@ -290,7 +323,7 @@ template <>
 struct TORCH_PYTHON_API type_caster<c10::SymBool> {
  public:
   PYBIND11_TYPE_CASTER(c10::SymBool, _("Union[bool, torch.SymBool]"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::SymBool& si,
@@ -304,10 +337,10 @@ struct type_caster<c10::complex<T>> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(c10::complex<T>, _("complex"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
 
-    // Refered from `THPUtils_unpackComplexDouble`
+    // Referred from `THPUtils_unpackComplexDouble`
     Py_complex py_complex = PyComplex_AsCComplex(obj);
     if (py_complex.real == -1.0 && PyErr_Occurred()) {
       return false;
@@ -327,6 +360,28 @@ struct type_caster<c10::complex<T>> {
   }
 };
 
+template <>
+struct type_caster<c10::Layout> {
+ public:
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  PYBIND11_TYPE_CASTER(c10::Layout, _("torch.layout"));
+
+  static handle cast(
+      c10::Layout layout,
+      return_value_policy /*unused*/,
+      handle /*parent*/) {
+    return handle(Py_NewRef(torch::getTHPLayout(layout)));
+  }
+
+  bool load(handle src, bool /*convert*/) {
+    if (!THPLayout_Check(src.ptr())) {
+      return false;
+    }
+    const auto layout = reinterpret_cast<THPLayout*>(src.ptr());
+    value = layout->layout;
+    return true;
+  }
+};
 } // namespace pybind11::detail
 
 namespace torch::impl {
@@ -343,7 +398,7 @@ namespace torch::impl {
 //
 // Attaching the GIL release logic to the holder pointer rather than the
 // actual destructor of T is helpful when T is Python-agnostic and
-// shouldn't refer to the PYthon API.
+// shouldn't refer to the Python API.
 //
 // Note there are limitations to the correctness of code that makes use of this.
 // In particular, if a shared_ptr is constructed from C++ code without this

@@ -3,8 +3,8 @@
 """
 Test the scalar constructors, which also do type-coercion
 """
-import functools
 
+import functools
 from unittest import skipIf as skipif
 
 import pytest
@@ -16,8 +16,9 @@ from torch.testing._internal.common_utils import (
     subtest,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
-    xpassIfTorchDynamo,
+    xpassIfTorchDynamo_np,
 )
+
 
 if TEST_WITH_TORCHDYNAMO:
     import numpy as np
@@ -31,7 +32,7 @@ skip = functools.partial(skipif, True)
 
 
 class TestFromString(TestCase):
-    @xpassIfTorchDynamo  # (reason="XXX: floats from strings")
+    @xpassIfTorchDynamo_np  # (reason="XXX: floats from strings")
     def test_floating(self):
         # Ticket #640, floats from string
         fsingle = np.single("1.234")
@@ -39,7 +40,7 @@ class TestFromString(TestCase):
         assert_almost_equal(fsingle, 1.234)
         assert_almost_equal(fdouble, 1.234)
 
-    @xpassIfTorchDynamo  # (reason="XXX: floats from strings")
+    @xpassIfTorchDynamo_np  # (reason="XXX: floats from strings")
     def test_floating_overflow(self):
         """Strings containing an unrepresentable float overflow"""
         fhalf = np.half("1e10000")
@@ -92,15 +93,27 @@ class TestArrayFromScalar(TestCase):
         arr = np.array(x, dtype=t2)
         # type should be preserved exactly
         if t2 is None:
-            assert arr.dtype.type is t1
+            if arr.dtype.type is not t1:
+                raise AssertionError(
+                    f"Expected arr.dtype.type is {t1}, got {arr.dtype.type}"
+                )
         else:
-            assert arr.dtype.type is t2
+            if arr.dtype.type is not t2:
+                raise AssertionError(
+                    f"Expected arr.dtype.type is {t2}, got {arr.dtype.type}"
+                )
 
         arr1 = np.asarray(x, dtype=t2)
         if t2 is None:
-            assert arr1.dtype.type is t1
+            if arr1.dtype.type is not t1:
+                raise AssertionError(
+                    f"Expected arr1.dtype.type is {t1}, got {arr1.dtype.type}"
+                )
         else:
-            assert arr1.dtype.type is t2
+            if arr1.dtype.type is not t2:
+                raise AssertionError(
+                    f"Expected arr1.dtype.type is {t2}, got {arr1.dtype.type}"
+                )
 
     @parametrize("t1", int_types + uint_types)
     @parametrize("t2", int_types + uint_types + [None])

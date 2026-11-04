@@ -1,13 +1,13 @@
 #pragma once
 
+#include <c10/util/complex.h>
 #include <torch/csrc/inductor/aoti_runtime/utils.h>
 
-namespace torch {
-namespace aot_inductor {
+namespace torch::aot_inductor {
 
 template <typename T>
 inline RAIIAtenTensorHandle scalar_to_tensor_handle(T value) {
-  throw std::runtime_error("Unsupported scalar_to_tensor_handle");
+  AOTI_RUNTIME_CHECK(false, "Unsupported scalar_to_tensor_handle");
 }
 
 // Specialize for supported C++ primitive types
@@ -31,7 +31,8 @@ AOTI_RUNTIME_SCALAR_TO_TENSOR(int16, int16_t)
 AOTI_RUNTIME_SCALAR_TO_TENSOR(int32, int32_t)
 AOTI_RUNTIME_SCALAR_TO_TENSOR(int64, int64_t)
 AOTI_RUNTIME_SCALAR_TO_TENSOR(bool, bool)
+AOTI_RUNTIME_SCALAR_TO_TENSOR(complex64, c10::complex<float>)
+AOTI_RUNTIME_SCALAR_TO_TENSOR(complex128, c10::complex<double>)
 #undef AOTI_RUNTIME_SCALAR_TO_TENSOR
 
-} // namespace aot_inductor
-} // namespace torch
+} // namespace torch::aot_inductor

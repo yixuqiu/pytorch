@@ -2,26 +2,22 @@
 #include <torch/csrc/jit/ir/alias_analysis.h>
 #include <torch/csrc/jit/ir/ir_views.h>
 #include <torch/csrc/jit/jit_log.h>
-#include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/peephole.h>
 #include <torch/csrc/jit/passes/peephole_list_idioms.h>
 #include <torch/csrc/jit/passes/value_refinement_utils.h>
-#include <torch/csrc/jit/runtime/graph_executor.h>
 #include <torch/csrc/jit/runtime/slice_indices_adjust.h>
 #include <limits>
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
-static c10::optional<size_t> normalizeIndex(int64_t index, size_t len) {
+static std::optional<size_t> normalizeIndex(int64_t index, size_t len) {
   if (index < 0) {
     index = index + len;
   }
   if (index >= 0 && index < static_cast<int64_t>(len)) {
     return index;
   } else {
-    return c10::nullopt;
+    return std::nullopt;
   }
 }
 
@@ -60,8 +56,8 @@ struct ListLenRefiner {
 
       auto first_input = n->input(0);
       if (first_input->type()->castRaw<ListType>() &&
-          !mutated_lists_.count(first_input)) {
-        if (!li_with_len_use.count(first_input)) {
+          !mutated_lists_.contains(first_input)) {
+        if (!li_with_len_use.contains(first_input)) {
           li_with_len_use.insert(first_input);
         } else {
           lists_to_refine_.insert(first_input);
@@ -83,7 +79,7 @@ struct ListLenRefiner {
           }
           auto li_len = n->input(1 - const_index);
           if (!li_len->node()->matches("aten::len.t(t[] a) -> int") ||
-              !lists_to_refine_.count(li_len->node()->input())) {
+              !lists_to_refine_.contains(li_len->node()->input())) {
             continue;
           }
           ListRefinement refine;
@@ -101,7 +97,7 @@ struct ListLenRefiner {
         }
       } else if (n->kind() == prim::If) {
         IfView if_n(n);
-        bool has_cond_ref = boolean_value_refinements_.count(if_n.cond()) != 0;
+        bool has_cond_ref = boolean_value_refinements_.contains(if_n.cond());
         ListRefinement empty;
         auto true_block_refinements = RefineListLens(
             if_n.thenBlock(),
@@ -127,16 +123,16 @@ struct ListLenRefiner {
     }
     active_refinements_.pop_back();
     return block_refinements;
-  };
+  }
 
-  c10::optional<int64_t> tryFindRefinement(Value* v) {
+  std::optional<int64_t> tryFindRefinement(Value* v) {
     for (const auto& ref : active_refinements_) {
       auto maybe_refinement = ref->find(v);
       if (maybe_refinement != ref->end()) {
         return maybe_refinement->second;
       }
     }
-    return c10::nullopt;
+    return std::nullopt;
   }
 
   std::shared_ptr<Graph> graph_;
@@ -158,9 +154,10 @@ struct ListLenRefiner {
 struct PeepholeOptimizeListIdiomsImpl {
   PeepholeOptimizeListIdiomsImpl(
       std::shared_ptr<Graph> graph,
-      bool refine_list_len)
+      bool refine_list_len,
+      const AliasDb& alias_db)
       : graph_(std::move(graph)),
-        aliasDb_(std::make_unique<AliasDb>(graph_)),
+        aliasDb_(alias_db),
         refine_list_len_(refine_list_len) {}
 
   bool run() {
@@ -174,7 +171,7 @@ struct PeepholeOptimizeListIdiomsImpl {
 
  private:
   void checkForMutatedList(Value* v) {
-    if (v->type()->castRaw<ListType>() && aliasDb_->hasWriters(v)) {
+    if (v->type()->castRaw<ListType>() && aliasDb_.hasWriters(v)) {
       mutated_lists_.insert(v);
     }
   }
@@ -199,8 +196,8 @@ struct PeepholeOptimizeListIdiomsImpl {
     auto step_val = toIValue(slice_node->input(3));
 
     // All args must be constant to apply this optimization.
-    if (start_val == c10::nullopt || end_val == c10::nullopt ||
-        step_val == c10::nullopt) {
+    if (start_val == std::nullopt || end_val == std::nullopt ||
+        step_val == std::nullopt) {
       return false;
     }
 
@@ -223,7 +220,7 @@ struct PeepholeOptimizeListIdiomsImpl {
     }
 
     slice_node->output()->replaceAllUsesWith(slice_list_construct->output());
-    if (mutated_lists_.count(slice_node->output())) {
+    if (mutated_lists_.contains(slice_node->output())) {
       mutated_lists_.insert(slice_list_construct->output());
     }
 
@@ -246,7 +243,7 @@ struct PeepholeOptimizeListIdiomsImpl {
       auto first_input = node->input(0);
 
       // only optimizing ops with unmutated lists
-      if (mutated_lists_.count(first_input)) {
+      if (mutated_lists_.contains(first_input)) {
         continue;
       }
 
@@ -284,7 +281,7 @@ struct PeepholeOptimizeListIdiomsImpl {
         }
         auto second_input = node->input(1);
         // already checked first, need to check second
-        if (mutated_lists_.count(second_input)) {
+        if (mutated_lists_.contains(second_input)) {
           continue;
         }
         if (second_input->node()->kind() != prim::ListConstruct) {
@@ -301,7 +298,7 @@ struct PeepholeOptimizeListIdiomsImpl {
           list_construct->addInput(v);
         }
         node->output()->replaceAllUsesWith(list_construct->output());
-        if (mutated_lists_.count(node->output())) {
+        if (mutated_lists_.contains(node->output())) {
           mutated_lists_.insert(list_construct->output());
         }
         changed = true;
@@ -314,16 +311,23 @@ struct PeepholeOptimizeListIdiomsImpl {
 
   std::unordered_set<Value*> mutated_lists_;
   std::shared_ptr<Graph> graph_;
-  std::unique_ptr<AliasDb> aliasDb_;
+  const AliasDb& aliasDb_;
   bool refine_list_len_;
 };
 
 bool PeepholeOptimizeListIdioms(
     const std::shared_ptr<Graph>& graph,
-    bool refine_list_len) {
-  PeepholeOptimizeListIdiomsImpl opt(graph, refine_list_len);
+    bool refine_list_len,
+    const AliasDb& alias_db) {
+  PeepholeOptimizeListIdiomsImpl opt(graph, refine_list_len, alias_db);
   return opt.run();
 }
 
-} // namespace jit
-} // namespace torch
+bool PeepholeOptimizeListIdioms(
+    const std::shared_ptr<Graph>& graph,
+    bool refine_list_len) {
+  AliasDb alias_db(graph);
+  return PeepholeOptimizeListIdioms(graph, refine_list_len, alias_db);
+}
+
+} // namespace torch::jit

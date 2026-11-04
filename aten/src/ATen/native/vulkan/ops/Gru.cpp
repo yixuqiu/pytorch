@@ -14,6 +14,9 @@
 #include <ATen/ops/tanh.h>
 #endif
 
+#include <c10/util/irange.h>
+#include <utility>
+
 namespace at {
 namespace native {
 namespace vulkan {
@@ -79,7 +82,7 @@ std::tuple<Tensor, Tensor> gru_input(
   // reshape to 2D due to Vulkan at::mm op accepts only 2D
   auto x = input_vk.reshape({batch_size * seq_length, input_vk.size(2)});
 
-  for (int64_t i = 0; i < num_layers; ++i) {
+  for (const auto i : c10::irange(num_layers)) {
     // extract each hidden state and squeeze into 2D dim
     auto h = at::slice(hx_vk, 0, i, i + 1, 1);
     h = h.reshape({h.size(0) * h.size(1), h.size(2)});
@@ -122,7 +125,7 @@ std::tuple<Tensor, Tensor> gru_input(
   auto h_n = at::cat(h_n_list, 1);
   x = x.reshape({batch_size, seq_length, x.size(1)});
   h_n = h_n.reshape({h_n.size(0) * h_n.size(1), h_n.size(2), h_n.size(3)});
-  return std::tuple<Tensor, Tensor>(x, h_n);
+  return std::tuple<Tensor, Tensor>(std::move(x), std::move(h_n));
 }
 
 #ifdef USE_VULKAN_API
@@ -135,7 +138,8 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
 
 } // namespace
 
-std::vector<c10::intrusive_ptr<LinearPackedContext>> pack_linear_op_contexts(
+static std::vector<c10::intrusive_ptr<LinearPackedContext>>
+pack_linear_op_contexts(
     const std::vector<Tensor>& params_cpu,
     int64_t num_layers) {
   TORCH_CHECK(
@@ -148,7 +152,7 @@ std::vector<c10::intrusive_ptr<LinearPackedContext>> pack_linear_op_contexts(
   std::vector<c10::intrusive_ptr<LinearPackedContext>> linear_op_contexts;
   linear_op_contexts.reserve(num_layers * 6);
 
-  for (int64_t i = 0; i < num_layers; ++i) {
+  for (const auto i : c10::irange(num_layers)) {
     const auto& w_ih = params_cpu.at(i * 4);
     const auto& w_hh = params_cpu.at(i * 4 + 1);
     const auto& b_ih = params_cpu.at(i * 4 + 2);
@@ -239,7 +243,7 @@ const c10::impl::GenericList GruPackedContext::unpack() const {
         packed_linear_context.toCustomClass<LinearPackedContext>()->unpack();
 
     TORCH_CHECK(
-        unpacked_linear_context.size() > 0u,
+        !unpacked_linear_context.empty(),
         "unpacked_linear_context does not have any elements!");
 
     params_cpu.emplace_back(
@@ -350,7 +354,7 @@ std::tuple<Tensor, Tensor> run_gru_context(
   auto h_n = at::cat(h_n_list, 1);
   x = x.reshape({batch_size, seq_length, x.size(1)});
   h_n = h_n.reshape({h_n.size(0) * h_n.size(1), h_n.size(2), h_n.size(3)});
-  return std::tuple<Tensor, Tensor>(x, h_n);
+  return std::tuple<Tensor, Tensor>(std::move(x), std::move(h_n));
 }
 
 } // namespace ops

@@ -244,13 +244,22 @@ class CustomMmaMultistage : public CustomMmaBase<Shape_, Policy_, Stages> {
             lane_idx) {}
 
   CUTLASS_DEVICE
-  bool set_prologue_done(bool value) {
+  void set_prologue_done(bool value) {
     prologue_done_ = value;
   }
 
   CUTLASS_DEVICE
-  bool set_zero_outside_bounds(bool value) {
+  void set_zero_outside_bounds(bool value) {
     zero_outside_bounds_ = value;
+  }
+
+  CUTLASS_DEVICE
+  static void drain_cp_asyncs() {
+    // commit and drain all pending and predicated cp.async pnz from the GEMM
+    // mainloop
+    cutlass::arch::cp_async_fence();
+    cutlass::arch::cp_async_wait<0>();
+    __syncthreads();
   }
 
   template <bool kLoadA = true, bool kLoadB = true>
@@ -747,14 +756,6 @@ class CustomMmaMultistage : public CustomMmaBase<Shape_, Policy_, Stages> {
             typename Operator::MathOperator,
             arch::OpMultiplyAddComplexFastF32>::value) {
       accum = plus_accum(accum, tmp_accum);
-    }
-
-    if (SharedMemoryClear == SharedMemoryClearOption::kZfill) {
-      // commit and drain all pending and predicated cp.async pnz from the GEMM
-      // mainloop
-      cutlass::arch::cp_async_fence();
-      cutlass::arch::cp_async_wait<0>();
-      __syncthreads();
     }
   }
 };

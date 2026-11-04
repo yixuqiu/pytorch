@@ -5,14 +5,13 @@
 #include <unordered_map>
 #include <vector>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 /**
  * \brief A structure describing a match of a pattern in a graph.
  *
  * The structure contains an anchor node, from which the match was found, and
- * match-maps for nodes and values. A match-map specifies the correspondance
+ * match-maps for nodes and values. A match-map specifies the correspondence
  * between nodes in the pattern graph (match-map keys) with nodes in the actual
  * graph (match-map values). We keep such maps for both nodes and values.
  */
@@ -39,7 +38,7 @@ struct Match {
  * graph are ignored during matching (IOW, we're essentially performing DCE on
  * the pattern).
  *  - Pattern graph nodes cannot alias. TODO: the check not implemented yet.
- *  - Aliasing nodes in the graph cannot consitute a match (i.e. through all
+ *  - Aliasing nodes in the graph cannot constitute a match (i.e. through all
  * found matches, no nodes in the subgraph alias with each other). TODO: check
  * not implemented yet.
  *  - The matcher will not mutate either the pattern graph or the matched graph.
@@ -63,12 +62,11 @@ struct Match {
  * output and assume that we can traverse up from this node to match the
  * entire pattern.
  *
- * Corrolary 1: the order of outputs in the pattern matters!
+ * Corollary 1: the order of outputs in the pattern matters!
  * Corollary 2: patterns cannot contain any nodes not participating in the main
  * output computation.
  */
 std::vector<Match> TORCH_API
 findPatternMatches(const Graph& pattern, Graph& graph);
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

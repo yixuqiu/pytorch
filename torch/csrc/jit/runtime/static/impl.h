@@ -14,8 +14,10 @@
 #include <torch/csrc/jit/runtime/static/ProcessedNodeInputs.h>
 #include <torch/custom_class.h>
 #include <limits>
+#include <vector>
 
 #ifdef FBCODE_CAFFE2
+#include <c10/util/Registry.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 #endif
@@ -29,7 +31,7 @@ TORCH_API std::string dumpValueSet(
     const c10::FastSet<const Value*>& value_set,
     const char* set_name = "");
 
-TORCH_API inline bool doesNotHeapAllocateWhenStoredInIValue(const Type& type) {
+inline bool doesNotHeapAllocateWhenStoredInIValue(const Type& type) {
   switch (type.kind()) {
     // NOTE: NumberType may allocate because it includes complex.
     case TypeKind::NoneType:
@@ -44,11 +46,11 @@ TORCH_API inline bool doesNotHeapAllocateWhenStoredInIValue(const Type& type) {
   }
 }
 
-TORCH_API inline c10::Symbol getStaticRuntimeMetadataSymbol() {
+inline c10::Symbol getStaticRuntimeMetadataSymbol() {
   return Symbol::attr("static_runtime::metadata");
 }
 
-TORCH_API inline bool borrowsOutputs(c10::Symbol kind) {
+inline bool borrowsOutputs(c10::Symbol kind) {
   static const std::array<c10::Symbol, 4> symbols_with_borrowed_outputs = {
       c10::Symbol::fromQualString("static_runtime::select_tensor"),
       c10::Symbol::fromQualString("static_runtime::dict_unpack"),
@@ -70,7 +72,7 @@ TORCH_API inline bool borrowsOutputs(c10::Symbol kind) {
 //     The output aliases that end up here are as a result of aliasDb failing to
 //     recognize them as outputs due to collection object (e.g., Tuple) aliasing
 //     inputs.
-// Values that dont't show up in output_aliases or external_aliases are created
+// Values that don't show up in output_aliases or external_aliases are created
 // and consumed within the graph.
 class ValueGroup {
  public:
@@ -111,7 +113,7 @@ class TORCH_API ManagedTensorRanges {
 
   // If true, then this node is the last use of at least one
   // managed tensor. availableTensorValuesAfterNode(node) will return a vector
-  // of the managed tensors that are available for re-use
+  // of the managed tensors that are available for reuse
   // in the nodes following this one.
   bool nodeFreesManagedTensors(Node* node) const;
   const std::vector<const Value*>& availableTensorValuesAfterNode(
@@ -137,12 +139,14 @@ class TORCH_API ManagedTensorRanges {
   // type are mutable)
   std::vector<const Value*> collectValuesWithTrackedLifetimes(
       at::ArrayRef<const Value*> values);
+  void extendLifetime(Value* input, size_t new_end);
+  void extendInputLifetime(Node* node, size_t new_end);
 
   // Maps Node* to the set of managed tensors that are now available
-  // for re-use after this node.
-  c10::FastMap<Node*, std::vector<const Value*>> node_to_newly_free_tensors_{};
+  // for reuse after this node.
+  c10::FastMap<Node*, std::vector<const Value*>> node_to_newly_free_tensors_;
   // Maps each Value* to its lifetime (start node index, end node index)
-  c10::FastMap<const Value*, Lifetime> value_lifetimes_{};
+  c10::FastMap<const Value*, Lifetime> value_lifetimes_;
 };
 
 struct TORCH_API StaticModuleOptions {
@@ -176,7 +180,7 @@ struct TORCH_API StaticModuleOptions {
 
 /*
   Responsible for plugging StaticRuntime metadata onto the
-  IR nodes. StaticRuntimeMetdata extends CustomClassHolder
+  IR nodes. StaticRuntimeMetadata extends CustomClassHolder
   which can be casted to IValue and attached to IR node.
   This is needed to pass parent graph metadata to forked
   graph in presence of prim::fork operator
@@ -194,7 +198,7 @@ class TORCH_API StaticRuntimeMetadata : public torch::CustomClassHolder {
   StaticModuleOptions opts_;
 };
 
-/// The static runime supports two execution modes.
+/// The static runtime supports two execution modes.
 ///
 /// Mode 1: single-threaded with no parallelism except for intra-op parallelism
 /// For this mode, you can do either:
@@ -239,13 +243,25 @@ class TORCH_API StaticRuntimeMetadata : public torch::CustomClassHolder {
 /// @endcode
 ///
 class MemoryPlanner;
-class StaticNodeInfo;
 class ProcessedNode;
 class StaticRuntime;
 
 using SROperator = std::function<void(ProcessedNode*)>;
 
 #ifdef FBCODE_CAFFE2
+
+class BlockRunner;
+
+// Node execution function pointer type. Called once per inference in place of
+// the sequential node loop. `block_runner` owns the nodes and exposes per-run
+// state such as the live MemoryPlanner. The context pointer holds
+// executor-specific state created at model load time.
+using NodeExecutorFn = void (*)(
+    BlockRunner& block_runner,
+    ProcessedNode* nodes,
+    size_t num_nodes,
+    void* context);
+
 struct TORCH_API SROperatorObserver {
   using OperatorCallback = void (*)(const Node*);
   OperatorCallback startCb = nullptr;
@@ -292,6 +308,36 @@ class TORCH_API ProcessedFunction {
   Kind kind_{ProcessedFunction::Kind::kOutVariant};
   bool check_memory_overlap_{false};
   size_t num_outputs_{0};
+};
+
+class TORCH_API StaticNodeInfo {
+ public:
+  StaticNodeInfo(
+      Node* n,
+      ProcessedFunction* fn,
+      ProcessedNodeInputs inputs,
+      uint16_t outputs_offset);
+
+  Node* node() const {
+    return node_;
+  }
+
+  size_t num_outputs() const {
+    DCHECK(fn_ != nullptr);
+    return fn_->num_outputs();
+  }
+
+  bool has_out_variant() const {
+    return fn_->kind() == ProcessedFunction::Kind::kOutVariant;
+  }
+
+ private:
+  friend class ProcessedNode;
+
+  Node* node_;
+  const ProcessedFunction* fn_;
+  ProcessedNodeInputs inputs_;
+  uint16_t outputs_offset_;
 };
 
 // A `BlockInfo` instance stores all of the shared state that each
@@ -393,7 +439,7 @@ class BlockInfo {
   c10::FastSet<const Value*> managed_output_tensor_values_;
   c10::FastSet<const Value*> leaked_values_;
 
-  ManagedTensorRanges managed_tensor_ranges_{};
+  ManagedTensorRanges managed_tensor_ranges_;
 
   // The index of this block's inputs in the shared values_ array.
   const uint16_t input_idx_;
@@ -402,10 +448,26 @@ class BlockInfo {
   Block& block_;
 };
 
+#ifdef FBCODE_CAFFE2
+// Factory base class for pluggable node execution strategies.
+// Used only at model load time (not on the hot path).
+struct TORCH_API NodeExecutorFunctor {
+  // Called once at model load. Returns a function pointer for inference.
+  // The context is owned by the functor and must outlive the BlockRunner.
+  virtual NodeExecutorFn Create(
+      const BlockInfo& block_info,
+      const StaticModuleOptions& opts,
+      void** context) = 0;
+  virtual ~NodeExecutorFunctor() = default;
+};
+
+TORCH_DECLARE_REGISTRY(SRNodeExecutorRegistry, NodeExecutorFunctor);
+#endif // FBCODE_CAFFE2
+
 class TORCH_API StaticModule {
  public:
   explicit StaticModule(
-      std::shared_ptr<torch::jit::Graph> g,
+      const std::shared_ptr<torch::jit::Graph>& g,
       const StaticModuleOptions& opts = StaticModuleOptions(),
       std::vector<IValue> sample_inputs = {});
 
@@ -417,7 +479,7 @@ class TORCH_API StaticModule {
 
  private:
   explicit StaticModule(
-      std::pair<std::shared_ptr<torch::jit::Graph>, c10::optional<Module>>
+      std::pair<std::shared_ptr<torch::jit::Graph>, std::optional<Module>>
           graph_and_module,
       const StaticModuleOptions& opts);
 
@@ -456,7 +518,7 @@ class TORCH_API StaticModule {
     return num_inputs() + num_constants() + num_intermediate_values();
   }
 
-  C10_NODISCARD const std::vector<uint16_t>& output_indices() const {
+  [[nodiscard]] const std::vector<uint16_t>& output_indices() const {
     return output_indices_;
   }
 
@@ -488,9 +550,9 @@ class TORCH_API StaticModule {
         });
   }
 
-  C10_NODISCARD Node* findNodeWithKindForTesting(const std::string& kind) const;
+  [[nodiscard]] Node* findNodeWithKindForTesting(const std::string& kind) const;
 
-  const c10::optional<c10::FunctionSchema>& schema() const {
+  const std::optional<c10::FunctionSchema>& schema() const {
     return schema_;
   }
 
@@ -539,15 +601,15 @@ class TORCH_API StaticModule {
   // metadata that is stored in IR nodes as attribute
   at::intrusive_ptr<jit::StaticRuntimeMetadata> sr_metadata_;
   std::shared_ptr<torch::jit::Graph> graph_;
-  c10::optional<torch::jit::Module> module_;
-  c10::optional<c10::FunctionSchema> schema_;
+  std::optional<torch::jit::Module> module_;
+  std::optional<c10::FunctionSchema> schema_;
   std::unique_ptr<StaticRuntime> cached_runtime_;
 
   // Bookkeeping for creating new StaticRuntime instances
   // IValue table (defined by prim::Constant nodes)
   std::vector<IValue> constants_;
   // The functions to be called by corresponding ProcessedNode.
-  std::vector<ProcessedFunction> functions_{};
+  std::vector<ProcessedFunction> functions_;
   // A list of pre-processed nodes from which ProcessedNode are created per
   // StaticRuntime instance.
   std::vector<StaticNodeInfo> nodes_;
@@ -556,7 +618,7 @@ class TORCH_API StaticModule {
 
   size_t num_intermediate_values_ = 0;
 
-  // Includes self if module_ != nullopt.
+  // Includes self if module_ != std::nullopt.
   // Note that we might have num_inputs_ == 0 even if the schema has a `self`
   // argument. In this case, `self` isn't used in the graph, but the schema
   // includes it anyways to be consistent with the JIT interpreter.
@@ -644,7 +706,7 @@ class TORCH_API BlockRunner {
   }
 
   // Output is readonly. The writing process happens inside ProcessedNodes
-  C10_NODISCARD const IValue& Output(uint32_t i) const {
+  [[nodiscard]] const IValue& Output(uint32_t i) const {
     DCHECK(i < outputs_.size());
     return *outputs_[i];
   }
@@ -672,6 +734,10 @@ class TORCH_API BlockRunner {
   const MemoryPlanner* get_memory_planner() const {
     return planner_.get();
   }
+
+  // Detect and correct incorrect schema alias info for a node's outputs at
+  // runtime. Public so pluggable node executors can invoke it.
+  void verify_and_correct_memory_overlap(ProcessedNode& n);
 
   bool check_for_memory_leak(
       bool output_returned = true,
@@ -759,7 +825,6 @@ class TORCH_API BlockRunner {
   bool fast_check_and_correct_overlap_with(
       ProcessedNode& n,
       c10::IValue& tensor_ival);
-  void verify_and_correct_memory_overlap(ProcessedNode& n);
 
   // clean up owning refs of input IValues
   void clean_up_input_ivalues() noexcept {
@@ -811,38 +876,14 @@ class TORCH_API BlockRunner {
 
   std::vector<IValue*> outputs_;
   std::vector<ProcessedNode> nodes_;
-};
 
-// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-class TORCH_API StaticNodeInfo {
- public:
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-  StaticNodeInfo(
-      Node* n,
-      ProcessedFunction* fn,
-      ProcessedNodeInputs inputs,
-      uint16_t outputs_offset);
-
-  Node* node() const {
-    return node_;
-  }
-
-  size_t num_outputs() const {
-    DCHECK(fn_ != nullptr);
-    return fn_->num_outputs();
-  }
-
-  bool has_out_variant() const {
-    return fn_->kind() == ProcessedFunction::Kind::kOutVariant;
-  }
-
- private:
-  friend class ProcessedNode;
-
-  Node* node_;
-  const ProcessedFunction* fn_;
-  ProcessedNodeInputs inputs_;
-  uint16_t outputs_offset_;
+#ifdef FBCODE_CAFFE2
+  // Pluggable node execution strategy. Initialized from
+  // SRNodeExecutorRegistry at model load time.
+  NodeExecutorFn node_executor_fn_ = nullptr;
+  void* node_executor_ctx_ = nullptr;
+  std::unique_ptr<NodeExecutorFunctor> node_executor_owner_;
+#endif
 };
 
 inline size_t BlockInfo::num_nodes() const {
@@ -871,6 +912,9 @@ class TORCH_API ProcessedNodeMetadata {
   // if the contained type (BlockRunner) is not copyable
   ProcessedNodeMetadata(const ProcessedNodeMetadata&) = delete;
   ProcessedNodeMetadata& operator=(const ProcessedNodeMetadata&) = delete;
+  ProcessedNodeMetadata(ProcessedNodeMetadata&&) = delete;
+  ProcessedNodeMetadata&& operator=(ProcessedNodeMetadata&&) = delete;
+  ~ProcessedNodeMetadata() = default;
 
   std::vector<BlockRunner>& block_runners() {
     return block_runners_;
@@ -893,10 +937,8 @@ class TORCH_API ProcessedNodeMetadata {
   torch::jit::TaskLauncher* launcher_;
 };
 
-// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 class TORCH_API ProcessedNode {
  public:
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   ProcessedNode() = default;
 
   ProcessedNode(const StaticNodeInfo& other, IValue* values)
@@ -915,6 +957,7 @@ class TORCH_API ProcessedNode {
   ProcessedNode(const ProcessedNode&) = delete;
   ProcessedNode& operator=(const ProcessedNode& other) = delete;
   ProcessedNode& operator=(ProcessedNode&&) = default;
+  ~ProcessedNode() = default;
 
   void run();
 
@@ -923,7 +966,7 @@ class TORCH_API ProcessedNode {
   }
 
   // Input is readonly
-  C10_NODISCARD const IValue& Input(uint32_t i) const {
+  [[nodiscard]] const IValue& Input(uint32_t i) const {
     return values_[inputs_[i]];
   }
 
@@ -933,7 +976,7 @@ class TORCH_API ProcessedNode {
     return values_[outputs_offset_ + i];
   }
 
-  C10_NODISCARD const IValue& Output(uint32_t i) const {
+  [[nodiscard]] const IValue& Output(uint32_t i) const {
     DCHECK(i < num_outputs());
     return values_[outputs_offset_ + i];
   }
@@ -943,12 +986,12 @@ class TORCH_API ProcessedNode {
     return static_cast<uint32_t>(fn_->num_outputs());
   }
 
-  C10_NODISCARD c10::ArrayRef<const IValue> outputs() const {
+  [[nodiscard]] c10::ArrayRef<const IValue> outputs() const {
     return c10::ArrayRef<const IValue>(
         values_ + outputs_offset_, num_outputs());
   }
 
-  C10_NODISCARD uint16_t num_inputs() const {
+  [[nodiscard]] uint16_t num_inputs() const {
     return inputs_.size();
   }
 
@@ -990,7 +1033,7 @@ class TORCH_API ProcessedNode {
     values_ = values;
   }
 
-  C10_NODISCARD uint16_t output_ivalue_index(uint16_t i) const {
+  [[nodiscard]] uint16_t output_ivalue_index(uint16_t i) const {
     DCHECK(i < num_outputs());
     return outputs_offset_ + i;
   }
@@ -1019,14 +1062,14 @@ class TORCH_API ProcessedNode {
   }
 
  private:
-  C10_NODISCARD bool verify_outputs_dont_overlap_each_other() const;
+  [[nodiscard]] bool verify_outputs_dont_overlap_each_other() const;
 
-  C10_NODISCARD bool verify_inputs_dont_overlap_outputs(bool force_check) const;
+  [[nodiscard]] bool verify_inputs_dont_overlap_outputs(bool force_check) const;
 
-  Node* node_;
-  const ProcessedFunction* fn_;
+  Node* node_{nullptr};
+  const ProcessedFunction* fn_{nullptr};
   ProcessedNodeInputs inputs_;
-  uint16_t outputs_offset_;
+  uint16_t outputs_offset_{0};
   bool overlap_detected_{false};
   IValue* values_ = nullptr; // unowned
   // Metadata for ProcessedNode.
@@ -1110,30 +1153,28 @@ class TORCH_API StaticRuntime {
   class IValueArray {
    public:
     IValueArray() = default;
-    explicit IValueArray(size_t size) : array_(allocate(size)), size_(size) {}
+    IValueArray(const IValueArray&) = delete;
+    IValueArray& operator=(const IValueArray&) = delete;
 
-    IValue* data() const {
-      return array_.get();
+    IValueArray(IValueArray&&) noexcept = default;
+    IValueArray& operator=(IValueArray&&) noexcept = default;
+
+    explicit IValueArray(size_t size) : array_(size) {}
+
+    IValue* data() {
+      return array_.empty() ? nullptr : array_.data();
+    }
+
+    const IValue* data() const {
+      return array_.empty() ? nullptr : array_.data();
     }
 
     size_t size() const {
-      return size_;
+      return array_.size();
     }
 
    private:
-    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays)
-    static std::unique_ptr<IValue[]> allocate(size_t size) {
-      if (size) {
-        return std::make_unique<IValue[]>(size);
-      }
-      return nullptr;
-    }
-
-    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays)
-    std::unique_ptr<IValue[]> array_ = nullptr;
-    size_t size_ = 0;
+    std::vector<IValue> array_;
   };
 
   std::unique_ptr<BlockRunner> block_;
@@ -1143,3 +1184,4 @@ class TORCH_API StaticRuntime {
 };
 
 } // namespace torch::jit
+C10_DECLARE_bool(static_runtime_disable_debug_memory_overlap_check);

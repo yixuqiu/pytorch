@@ -3,9 +3,7 @@
 #include <c10/util/overloaded.h>
 #include <torch/csrc/profiler/collection.h>
 
-namespace torch {
-namespace profiler {
-namespace impl {
+namespace torch::profiler::impl {
 
 namespace {
 static constexpr TensorImplAddress NoTensorImpl{nullptr};
@@ -18,8 +16,8 @@ struct RawTensorInfo {
   bool is_free_;
 
   // Used to assign back to the original structs.
-  std::reference_wrapper<c10::optional<AllocationID>> allocation_id_ref_;
-  std::reference_wrapper<c10::optional<TensorID>> id_ref_;
+  std::reference_wrapper<std::optional<AllocationID>> allocation_id_ref_;
+  std::reference_wrapper<std::optional<TensorID>> id_ref_;
 };
 
 struct RawTensors {
@@ -32,7 +30,7 @@ struct RawTensors {
         t.impl(), t.data_, t.device_, false, t.allocation_id_, t.id_});
   }
 
-  void operator()(c10::optional<TensorMetadata>& t) {
+  void operator()(std::optional<TensorMetadata>& t) {
     if (t.has_value()) {
       (*this)(*t);
     }
@@ -52,7 +50,7 @@ struct RawTensors {
   }
 
   template <typename T>
-  void operator()(T&) {}
+  void operator()(T& /*unused*/) {}
 
   std::vector<RawTensorInfo> tensors_;
 };
@@ -60,7 +58,7 @@ struct RawTensors {
 
 void calculateUniqueTensorIDs(
     std::vector<std::shared_ptr<Result>>& sorted_results) {
-  // This task is equivilent to https://leetcode.com/problems/number-of-islands/
+  // This task is equivalent to https://leetcode.com/problems/number-of-islands/
   // We first cluster events with a greedy index assignment, and then merge
   // groups that overlap.
   std::vector<RawTensorInfo> tensors;
@@ -76,7 +74,7 @@ void calculateUniqueTensorIDs(
     for (auto& result : sorted_results) {
       result->visit(c10::overloaded(
           [&](ExtraFields<EventType::TorchOp>& torch_op) {
-            for (auto& i : torch_op.inputs_) {
+            for (auto& i : torch_op.inputs_.shapes) {
               std::visit(raw_tensors, i);
             }
           },
@@ -130,18 +128,13 @@ void calculateUniqueTensorIDs(
     for (const auto& t : tensors) {
       if (t.impl_ != NoTensorImpl) {
         // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-        tensor_set.insert(*t.allocation_id_ref_.get());
+        tensor_set.insert(t.allocation_id_ref_.get().value());
       }
     }
-    tensors.erase(
-        std::remove_if(
-            tensors.begin(),
-            tensors.end(),
-            [&tensor_set](const auto& i) {
-              auto it = tensor_set.find(*i.allocation_id_ref_.get());
-              return it == tensor_set.end();
-            }),
-        tensors.end());
+    std::erase_if(tensors, [&tensor_set](const auto& i) {
+      auto it = tensor_set.find(i.allocation_id_ref_.get().value());
+      return it == tensor_set.end();
+    });
   }
 
   // Handle the case that the storage of a TensorImpl changed.
@@ -190,11 +183,9 @@ void calculateUniqueTensorIDs(
   // --------------------------------------------------------------------------
   for (const auto& t : tensors) {
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-    const auto id = id_map.at(*t.allocation_id_ref_.get());
+    const auto id = id_map.at(t.allocation_id_ref_.get().value());
     t.id_ref_.get().emplace(TensorID(id));
   }
 }
 
-} // namespace impl
-} // namespace profiler
-} // namespace torch
+} // namespace torch::profiler::impl

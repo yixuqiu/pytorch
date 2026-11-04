@@ -1,9 +1,7 @@
 #include <c10/util/DeadlockDetection.h>
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 RegisterWorkerInfoOnce::RegisterWorkerInfoOnce() {
   // WorkerInfo needs to be registered exactly once. Since the op registration
@@ -15,17 +13,17 @@ RegisterWorkerInfoOnce::RegisterWorkerInfoOnce() {
 }
 
 WorkerInfo::WorkerInfo(std::string name, int64_t id)
-    : WorkerInfo(std::move(name), (worker_id_t)id) {
+    : WorkerInfo(std::move(name), static_cast<worker_id_t>(id)) {
   TORCH_CHECK(
       id <= std::numeric_limits<worker_id_t>::max(),
       "RPC worker id ",
       id,
-      " out of bound of int16_t.");
+      " out of bounds for int16_t.");
 }
 
 WorkerInfo::WorkerInfo(std::string name, worker_id_t id)
     : name_(std::move(name)), id_(id) {
-  bool validSize = name_.length() < MAX_NAME_LEN && name_.length() > 0;
+  bool validSize = name_.length() < MAX_NAME_LEN && !name_.empty();
   bool validChar =
       std::find_if(name_.begin(), name_.end(), [](char c) {
         return !(std::isalnum(c) || c == '-' || c == '_' || c == ':');
@@ -221,10 +219,6 @@ void RpcAgent::rpcRetryCallback(
       // If the RPC Agent has shutdown, we cannot retry messages. Thus we mark
       // the future with an error since the RPC was never completed
       // successfully.
-      std::string errorMessage = c10::str(
-          "RPC Agent is no longer running on Node ",
-          RpcAgent::getWorkerInfo().id_,
-          ". Cannot retry message.");
       earliestRpc->originalFuture_->setError(jitFuture.exception_ptr());
     } else if (earliestRpc->retryCount_ < earliestRpc->options_.maxRetries) {
       // If the previous future completed with an error and we haven't
@@ -259,14 +253,26 @@ const WorkerInfo& RpcAgent::getWorkerInfo() const {
   return workerInfo_;
 }
 
+#if defined(TORCH_RPC_HAS_ATOMIC_SHARED_PTR)
+std::atomic<std::shared_ptr<RpcAgent>> RpcAgent::currentRpcAgent_{nullptr};
+#else
 std::shared_ptr<RpcAgent> RpcAgent::currentRpcAgent_ = nullptr;
+#endif
 
 bool RpcAgent::isCurrentRpcAgentSet() {
+#if defined(TORCH_RPC_HAS_ATOMIC_SHARED_PTR)
+  return currentRpcAgent_.load() != nullptr;
+#else
   return std::atomic_load(&currentRpcAgent_) != nullptr;
+#endif
 }
 
 std::shared_ptr<RpcAgent> RpcAgent::getCurrentRpcAgent() {
+#if defined(TORCH_RPC_HAS_ATOMIC_SHARED_PTR)
+  std::shared_ptr<RpcAgent> agent = currentRpcAgent_.load();
+#else
   std::shared_ptr<RpcAgent> agent = std::atomic_load(&currentRpcAgent_);
+#endif
   TORCH_CHECK(
       agent,
       "Current RPC agent is not set! Did you initialize the RPC "
@@ -279,17 +285,28 @@ void RpcAgent::setCurrentRpcAgent(std::shared_ptr<RpcAgent> rpcAgent) {
     std::shared_ptr<RpcAgent> previousAgent;
     // Use compare_exchange so that we don't actually perform the exchange if
     // that would trigger the assert just below. See:
+#if defined(TORCH_RPC_HAS_ATOMIC_SHARED_PTR)
+    // https://en.cppreference.com/w/cpp/atomic/atomic/compare_exchange
+    currentRpcAgent_.compare_exchange_strong(
+        previousAgent, std::move(rpcAgent));
+#else
     // https://en.cppreference.com/w/cpp/atomic/atomic_compare_exchange
     std::atomic_compare_exchange_strong(
         &currentRpcAgent_, &previousAgent, std::move(rpcAgent));
+#endif
     TORCH_INTERNAL_ASSERT(
         previousAgent == nullptr, "Current RPC agent is set!");
   } else {
     // We can't use compare_exchange (we don't know what value to expect) but we
     // don't need to, as the only case that would trigger the assert is if we
     // replaced nullptr with nullptr, which we can just do as it has no effect.
+#if defined(TORCH_RPC_HAS_ATOMIC_SHARED_PTR)
+    std::shared_ptr<RpcAgent> previousAgent =
+        currentRpcAgent_.exchange(std::move(rpcAgent));
+#else
     std::shared_ptr<RpcAgent> previousAgent =
         std::atomic_exchange(&currentRpcAgent_, std::move(rpcAgent));
+#endif
     TORCH_INTERNAL_ASSERT(
         previousAgent != nullptr, "Current RPC agent is not set!");
   }
@@ -332,9 +349,7 @@ std::unordered_map<std::string, std::string> RpcAgent::getDebugInfo() {
 
 std::ostream& operator<<(std::ostream& os, const WorkerInfo& workerInfo) {
   return os << "WorkerInfo(id=" << workerInfo.id_
-            << ", name=" << workerInfo.name_ << ")";
+            << ", name=" << workerInfo.name_ << ')';
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

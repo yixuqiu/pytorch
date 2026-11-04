@@ -1,9 +1,10 @@
+# mypy: allow-untyped-defs
 import contextlib
-import warnings
-
-from typing import Union
+from typing import Any
+from typing_extensions import deprecated
 
 import torch
+
 
 __all__ = [
     "is_built",
@@ -13,9 +14,13 @@ __all__ = [
     "cuBLASModule",
     "preferred_linalg_library",
     "preferred_blas_library",
+    "cublas_workspace_size",
+    "cublaslt_workspace_size",
+    "blas_workspace_size",
+    "preferred_rocm_fa_library",
+    "is_ck_sdpa_available",
     "cufft_plan_cache",
     "matmul",
-    "SDPBackend",
     "SDPAParams",
     "enable_cudnn_sdp",
     "cudnn_sdp_enabled",
@@ -25,8 +30,12 @@ __all__ = [
     "mem_efficient_sdp_enabled",
     "math_sdp_enabled",
     "enable_math_sdp",
+    "allow_fp16_bf16_reduction_math_sdp",
+    "fp16_bf16_reduction_math_sdp_allowed",
+    "is_flash_attention_available",
     "can_use_flash_attention",
     "can_use_efficient_attention",
+    "can_use_cudnn_attention",
     "sdp_kernel",
 ]
 
@@ -61,7 +70,7 @@ class cuFFTPlanCache:
     r"""
     Represent a specific plan cache for a specific `device_index`.
 
-    The attributes `size` and `max_size`, and method `clear`, can fetch and/ or
+    The attributes `size` and `max_size`, and method `clear`, can fetch and/or
     change properties of the C++ cuFFT plan cache.
     """
 
@@ -121,22 +130,87 @@ class cuFFTPlanCacheManager:
 
 
 class cuBLASModule:
+    @staticmethod
+    def _parse_reduction_setting(value: Any, attr_name: str) -> tuple[bool, bool]:
+        def _ensure_bool(obj: Any, which: str) -> bool:
+            if isinstance(obj, bool):
+                return obj
+            raise TypeError(
+                f"{attr_name} expects a bool for {which}, but got {type(obj)!r}"
+            )
+
+        if isinstance(value, bool):
+            return value, True
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise TypeError(f"{attr_name} expects at least one boolean argument")
+            if len(value) > 2:
+                raise TypeError(f"{attr_name} expects at most two boolean arguments")
+            allow_reduced_precision = _ensure_bool(value[0], "allow_reduced_precision")
+            if len(value) == 1:
+                return allow_reduced_precision, True
+            allow_splitk = _ensure_bool(value[1], "allow_splitk")
+            return allow_reduced_precision, allow_splitk
+        raise TypeError(
+            f"{attr_name} expects a bool or a tuple/list of bools, but got {type(value)!r}"
+        )
+
     def __getattr__(self, name):
         if name == "allow_tf32":
             return torch._C._get_cublas_allow_tf32()
+        elif name == "prefer_cublaslt_grouped_gemm":
+            return torch._C._get_cublaslt_prefer_grouped_gemm()
         elif name == "allow_fp16_reduced_precision_reduction":
-            return torch._C._get_cublas_allow_fp16_reduced_precision_reduction()
+            allow_reduced_precision, _ = (
+                torch._C._get_cublas_allow_fp16_reduced_precision_reduction()
+            )
+            return allow_reduced_precision
+        elif name == "allow_fp16_reduced_precision_reduction_split_k":
+            _, allow_splitk = (
+                torch._C._get_cublas_allow_fp16_reduced_precision_reduction()
+            )
+            return allow_splitk
         elif name == "allow_bf16_reduced_precision_reduction":
-            return torch._C._get_cublas_allow_bf16_reduced_precision_reduction()
+            allow_reduced_precision, _ = (
+                torch._C._get_cublas_allow_bf16_reduced_precision_reduction()
+            )
+            return allow_reduced_precision
+        elif name == "allow_bf16_reduced_precision_reduction_split_k":
+            _, allow_splitk = (
+                torch._C._get_cublas_allow_bf16_reduced_precision_reduction()
+            )
+            return allow_splitk
+        elif name == "allow_fp16_accumulation":
+            return torch._C._get_cublas_allow_fp16_accumulation()
+        elif name == "fp32_precision":
+            return torch._C._get_fp32_precision_getter("cuda", "matmul")
         raise AttributeError("Unknown attribute " + name)
 
     def __setattr__(self, name, value):
         if name == "allow_tf32":
             return torch._C._set_cublas_allow_tf32(value)
+        elif name == "prefer_cublaslt_grouped_gemm":
+            return torch._C._set_cublaslt_prefer_grouped_gemm(value)
         elif name == "allow_fp16_reduced_precision_reduction":
-            return torch._C._set_cublas_allow_fp16_reduced_precision_reduction(value)
+            allow_reduced_precision, allow_splitk = self._parse_reduction_setting(
+                value, "allow_fp16_reduced_precision_reduction"
+            )
+            return torch._C._set_cublas_allow_fp16_reduced_precision_reduction(
+                allow_reduced_precision,
+                allow_splitk,
+            )
         elif name == "allow_bf16_reduced_precision_reduction":
-            return torch._C._set_cublas_allow_bf16_reduced_precision_reduction(value)
+            allow_reduced_precision, allow_splitk = self._parse_reduction_setting(
+                value, "allow_bf16_reduced_precision_reduction"
+            )
+            return torch._C._set_cublas_allow_bf16_reduced_precision_reduction(
+                allow_reduced_precision,
+                allow_splitk,
+            )
+        elif name == "allow_fp16_accumulation":
+            return torch._C._set_cublas_allow_fp16_accumulation(value)
+        elif name == "fp32_precision":
+            return torch._C._set_fp32_precision_setter("cuda", "matmul", value)
         raise AttributeError("Unknown attribute " + name)
 
 
@@ -149,7 +223,7 @@ _LinalgBackends_str = ", ".join(_LinalgBackends.keys())
 
 
 def preferred_linalg_library(
-    backend: Union[None, str, torch._C._LinalgBackend] = None
+    backend: None | str | torch._C._LinalgBackend = None,
 ) -> torch._C._LinalgBackend:
     r"""
     Override the heuristic PyTorch uses to choose between cuSOLVER and MAGMA for CUDA linear algebra operations.
@@ -188,7 +262,7 @@ def preferred_linalg_library(
     * :func:`torch.linalg.lu_solve`
     * :func:`torch.linalg.qr`
     * :func:`torch.linalg.eigh`
-    * :func:`torch.linalg.eighvals`
+    * :func:`torch.linalg.eigvals`
     * :func:`torch.linalg.svd`
     * :func:`torch.linalg.svdvals`
     """
@@ -197,7 +271,7 @@ def preferred_linalg_library(
     elif isinstance(backend, str):
         if backend not in _LinalgBackends:
             raise RuntimeError(
-                "Unknown input value. " f"Choose from: {_LinalgBackends_str}."
+                f"Unknown input value. Choose from: {_LinalgBackends_str}."
             )
         torch._C._set_linalg_preferred_backend(_LinalgBackends[backend])
     elif isinstance(backend, torch._C._LinalgBackend):
@@ -209,27 +283,32 @@ def preferred_linalg_library(
 
 
 _BlasBackends = {
+    "default": torch._C._BlasBackend.Default,
     "cublas": torch._C._BlasBackend.Cublas,
+    "hipblas": torch._C._BlasBackend.Cublas,  # alias
     "cublaslt": torch._C._BlasBackend.Cublaslt,
     "hipblaslt": torch._C._BlasBackend.Cublaslt,  # alias
+    "ck": torch._C._BlasBackend.Ck,
 }
 _BlasBackends_str = ", ".join(_BlasBackends.keys())
 
 
 def preferred_blas_library(
-    backend: Union[None, str, torch._C._BlasBackend] = None
+    backend: None | str | torch._C._BlasBackend = None,
 ) -> torch._C._BlasBackend:
     r"""
-    Override the library PyTorch uses for BLAS operations. Choose between cuBLAS and cuBLASLt.
+    Override the library PyTorch uses for BLAS operations. Choose between cuBLAS, cuBLASLt, and CK [ROCm-only].
 
     .. warning:: This flag is experimental and subject to change.
 
     When PyTorch runs a CUDA BLAS operation it defaults to cuBLAS even if both cuBLAS and cuBLASLt are available.
-    For PyTorch built for ROCm, hipBLAS and hipBLASLt may offer different performance.
+    For PyTorch built for ROCm, hipBLAS, hipBLASLt, and CK may offer different performance.
     This flag (a :class:`str`) allows overriding which BLAS library to use.
 
     * If `"cublas"` is set then cuBLAS will be used wherever possible.
     * If `"cublaslt"` is set then cuBLASLt will be used wherever possible.
+    * If `"ck"` is set then CK will be used wherever possible.
+    * If `"default"` (the default) is set then heuristics will be used to pick between the other options.
     * When no input is given, this function returns the currently preferred library.
     * User may use the environment variable TORCH_BLAS_PREFER_CUBLASLT=1 to set the preferred library to cuBLASLt
       globally.
@@ -247,7 +326,7 @@ def preferred_blas_library(
     elif isinstance(backend, str):
         if backend not in _BlasBackends:
             raise RuntimeError(
-                "Unknown input value. " f"Choose from: {_BlasBackends_str}."
+                f"Unknown input value. Choose from: {_BlasBackends_str}."
             )
         torch._C._set_blas_preferred_backend(_BlasBackends[backend])
     elif isinstance(backend, torch._C._BlasBackend):
@@ -258,11 +337,177 @@ def preferred_blas_library(
     return torch._C._get_blas_preferred_backend()
 
 
+def cublas_workspace_size(size: None | int = None) -> int:
+    r"""Query or set the cuBLAS workspace size in bytes.
+
+    When called with no arguments, returns the current workspace size.
+    When called with a size argument, sets the workspace size and returns the new value.
+    Setting the workspace size will take precedence over the CUBLAS_WORKSPACE_CONFIG environment variable.
+    Changes affect subsequent cuBLAS operations. When workspace caching is enabled,
+    cached allocations are resized lazily as their handle and stream pairs are used.
+
+    Args:
+        size (int, optional): workspace size in bytes. Must be non-negative.
+
+    Returns:
+        int: the current (or newly set) workspace size in bytes.
+    """
+    if size is not None:
+        torch._C._cuda_setCublasWorkspaceSize(size)
+    return torch._C._cuda_getCublasWorkspaceSize()
+
+
+def cublaslt_workspace_size(size: None | int = None) -> int:
+    r"""Query or set the cuBLASLt workspace size in bytes.
+
+    When called with no arguments, returns the current workspace size.
+    When called with a size argument, sets the workspace size and returns the new value.
+    Setting the workspace size will take precedence over the CUBLASLT_WORKSPACE_SIZE environment variable.
+    Changes affect subsequent cuBLASLt operations. When workspace caching is enabled,
+    cached allocations are resized lazily as their handle and stream pairs are used.
+
+    Args:
+        size (int, optional): workspace size in bytes. Must be non-negative.
+
+    Returns:
+        int: the current (or newly set) workspace size in bytes.
+    """
+    if size is not None:
+        torch._C._cuda_setCublasLtWorkspaceSize(size)
+    return torch._C._cuda_getCublasLtWorkspaceSize()
+
+
+def blas_workspace_size(
+    size: None | int = None,
+    backend: None | str | torch._C._BlasBackend = None,
+) -> int:
+    r"""Query or set the BLAS workspace size for a given backend.
+
+    Convenience wrapper that dispatches to :func:`cublas_workspace_size` or
+    :func:`cublaslt_workspace_size` depending on the backend.
+
+    When *backend* is ``None`` the current :func:`preferred_blas_library` is
+    used.  ``Default`` is resolved to the platform's default backend (cuBLAS
+    on NVIDIA, potentially hipBLASLt on supported ROCm architectures).
+
+    .. note::
+
+       On CUDA, when workspace caching is enabled with
+       ``TORCH_CUBLAS_WORKSPACE_CACHE=1``,
+       ``TORCH_CUBLASLT_UNIFIED_WORKSPACE`` controls whether the cuBLASLt
+       workspace is capped at the cuBLAS workspace size and physically reuses
+       the same allocation. Unified workspaces are enabled by default on
+       open-source CUDA builds when caching is enabled.
+
+    .. note::
+
+        Setting the workspace size for the cublas backend will take precedence
+        over the CUBLAS_WORKSPACE_CONFIG environment variable, and setting the
+        workspace size for the cublaslt backend will take precedence over the
+        CUBLASLT_WORKSPACE_SIZE environment variable.
+
+    Args:
+        size (int, optional): workspace size in bytes.  Must be non-negative.
+            When omitted the current size is returned without modification.
+        backend (str | torch._C._BlasBackend, optional): which backend's
+            workspace to query/set.  Accepts the same strings as
+            :func:`preferred_blas_library` (e.g. ``"cublas"``, ``"cublaslt"``).
+
+    Returns:
+        int: the current (or newly set) workspace size in bytes.
+
+    Raises:
+        RuntimeError: if the resolved backend is CK (no workspace concept).
+    """
+    if backend is None:
+        resolved = preferred_blas_library()
+    elif isinstance(backend, str):
+        if backend not in _BlasBackends:
+            raise RuntimeError(
+                f"Unknown backend string. Choose from: {_BlasBackends_str}."
+            )
+        resolved = _BlasBackends[backend]
+    elif isinstance(backend, torch._C._BlasBackend):
+        resolved = backend
+    else:
+        raise RuntimeError("Unknown backend type.")
+
+    if resolved == torch._C._BlasBackend.Default:
+        resolved = torch._C._get_blas_default_backend()
+
+    if resolved == torch._C._BlasBackend.Ck:
+        raise RuntimeError("CK backend does not use a workspace.")
+
+    if resolved == torch._C._BlasBackend.Cublaslt:
+        return cublaslt_workspace_size(size)
+    return cublas_workspace_size(size)
+
+
+_ROCmFABackends = {
+    "default": torch._C._ROCmFABackend.Default,
+    "aotriton": torch._C._ROCmFABackend.AOTriton,
+    "ck": torch._C._ROCmFABackend.Ck,
+}
+_ROCmFABackends_str = ", ".join(_ROCmFABackends.keys())
+
+
 from torch._C import _SDPAParams as SDPAParams, _SDPBackend as SDPBackend
+
+
+def preferred_rocm_fa_library(
+    backend: None | str | torch._C._ROCmFABackend = None,
+) -> torch._C._ROCmFABackend:
+    r"""
+    [ROCm-only]
+    Override the backend PyTorch uses in ROCm environments for Flash Attention. Choose between AOTriton and CK
+
+    .. warning:: This flag is experimental and subject to change.
+
+    When Flash Attention is enabled and desired, PyTorch defaults to using AOTriton as the backend.
+    This flag (a :class:`str`) allows users to override this backend to use composable_kernel
+
+    * If `"default"` is set then the default backend will be used wherever possible. Currently AOTriton.
+    * If `"aotriton"` is set then AOTriton will be used wherever possible.
+    * If `"ck"` is set then CK will be used wherever possible.
+    * When no input is given, this function returns the currently preferred library.
+    * User may use the environment variable TORCH_ROCM_FA_PREFER_CK=1 to set the preferred library to CK
+      globally.
+
+    Note: When a library is preferred other libraries may still be used if the preferred library
+    doesn't implement the operation(s) called.
+    This flag may achieve better performance if PyTorch's library selection is incorrect
+    for your application's inputs.
+    """
+    if backend is None:
+        pass
+    elif isinstance(backend, str):
+        if backend not in _ROCmFABackends:
+            raise RuntimeError(
+                f"Unknown input value. Choose from: {_ROCmFABackends_str}."
+            )
+        torch._C._set_rocm_fa_preferred_backend(_ROCmFABackends[backend])
+    elif isinstance(backend, torch._C._ROCmFABackend):
+        torch._C._set_rocm_fa_preferred_backend(backend)
+    else:
+        raise ValueError(f"Unknown input value. Choose from: {_ROCmFABackends_str}.")
+
+    return torch._C._get_rocm_fa_preferred_backend()
+
 
 # Set the __module__ attribute
 SDPAParams.__module__ = "torch.backends.cuda"
 SDPAParams.__name__ = "SDPAParams"
+
+
+def is_ck_sdpa_available() -> bool:
+    r"""
+    .. warning:: This flag is beta and subject to change.
+
+    Returns whether composable_kernel may be used as the backend for
+    scaled-dot-product-attention.
+    """
+    # pyrefly: ignore [missing-attribute]
+    return torch._C._is_ck_sdpa_available()
 
 
 def flash_sdp_enabled():
@@ -319,6 +564,37 @@ def enable_math_sdp(enabled: bool):
     torch._C._set_sdp_use_math(enabled)
 
 
+def allow_fp16_bf16_reduction_math_sdp(enabled: bool):
+    r"""
+    .. warning:: This flag is beta and subject to change.
+
+    Enables or disables fp16/bf16 reduction in math scaled dot product attention.
+    """
+    torch._C._set_math_sdp_allow_fp16_bf16_reduction(enabled)
+
+
+def fp16_bf16_reduction_math_sdp_allowed():
+    r"""
+    .. warning:: This flag is beta and subject to change.
+
+    Returns whether fp16/bf16 reduction in math scaled dot product attention is enabled or not.
+    """
+    return torch._C._get_math_sdp_allow_fp16_bf16_reduction()
+
+
+def is_flash_attention_available() -> bool:
+    r"""Check if PyTorch was built with FlashAttention for scaled_dot_product_attention.
+
+    Returns:
+        True if FlashAttention is built and available; otherwise, False.
+
+    Note:
+        This function is dependent on a CUDA-enabled build of PyTorch. It will return False
+        in non-CUDA environments.
+    """
+    return torch._C._is_flash_attention_available()
+
+
 def can_use_flash_attention(params: SDPAParams, debug: bool = False) -> bool:
     r"""Check if FlashAttention can be utilized in scaled_dot_product_attention.
 
@@ -359,6 +635,26 @@ def can_use_efficient_attention(params: SDPAParams, debug: bool = False) -> bool
     return torch._C._can_use_mem_efficient_attention(params, debug)
 
 
+def can_use_cudnn_attention(params: SDPAParams, debug: bool = False) -> bool:
+    r"""Check if cudnn_attention can be utilized in scaled_dot_product_attention.
+
+    Args:
+        params: An instance of SDPAParams containing the tensors for query,
+                key, value, an optional attention mask, dropout rate, and
+                a flag indicating if the attention is causal.
+        debug: Whether to logging.warn with information as to why cuDNN attention could not be run.
+            Defaults to False.
+
+    Returns:
+        True if cuDNN can be used with the given parameters; otherwise, False.
+
+    Note:
+        This function is dependent on a CUDA-enabled build of PyTorch. It will return False
+        in non-CUDA environments.
+    """
+    return torch._C._can_use_cudnn_attention(params, debug)
+
+
 def cudnn_sdp_enabled():
     r"""
     .. warning:: This flag is beta and subject to change.
@@ -378,6 +674,15 @@ def enable_cudnn_sdp(enabled: bool):
 
 
 @contextlib.contextmanager
+@deprecated(
+    (
+        "`torch.backends.cuda.sdp_kernel()` is deprecated. "
+        "In the future, this context manager will be removed. "
+        "Please see `torch.nn.attention.sdpa_kernel()` for the new context manager, "
+        "with updated signature."
+    ),
+    category=FutureWarning,
+)
 def sdp_kernel(
     enable_flash: bool = True,
     enable_math: bool = True,
@@ -390,16 +695,7 @@ def sdp_kernel(
     This context manager can be used to temporarily enable or disable any of the three backends for scaled dot product attention.
     Upon exiting the context manager, the previous state of the flags will be restored.
     """
-    warnings.warn(
-        (
-            "torch.backends.cuda.sdp_kernel() "
-            "is deprecated. In the future, this context manager will be removed. "
-            "Please see, torch.nn.attention.sdpa_kernel() for the new context manager, with updated "
-            "signature."
-        ),
-        FutureWarning,
-    )
-    from torch.nn.attention import sdpa_kernel, SDPBackend
+    from torch.nn.attention import sdpa_kernel
 
     backend_list = []
     if enable_flash:

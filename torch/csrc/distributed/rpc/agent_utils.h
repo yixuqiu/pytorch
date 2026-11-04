@@ -3,9 +3,7 @@
 #include <torch/csrc/distributed/c10d/PrefixStore.hpp>
 #include <torch/csrc/distributed/rpc/utils.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 // All RPC peers should call into this function at the same time. Each peer
 // provides its own id and name, and this function uses the given Store to
@@ -26,7 +24,7 @@ TORCH_API std::unordered_map<std::string, worker_id_t> collectCurrentNames(
     const worker_id_t selfId,
     const std::string& selfName);
 
-// Remove name frmo Store, used in dynamic RPC groups.
+// Remove name from Store, used in dynamic RPC groups.
 // NOTE: This needs to be called with the Dynamic RPC group
 // membership management token held.
 TORCH_API void removeCurrentName(
@@ -41,6 +39,4 @@ TORCH_API int syncCallCount(
     const int worldSize,
     int activeCalls = 0);
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

@@ -1,32 +1,30 @@
 # Owner(s): ["oncall: jit"]
+# ruff: noqa: F841
 
 import inspect
 import os
 import sys
 import types
 import unittest
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 from textwrap import dedent
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 from torch import Tensor
 from torch.testing import FileCheck
+
 
 # Make the helper files in test/ importable
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
-from torch.testing._internal.common_utils import skipIfTorchDynamo, TEST_CUDA
+from torch.testing._internal.common_utils import (
+    raise_on_run_directly,
+    skipIfTorchDynamo,
+    TEST_CUDA,
+)
 from torch.testing._internal.jit_utils import JitTestCase, make_global
-
-if __name__ == "__main__":
-    raise RuntimeError(
-        "This test file is not meant to be run directly, use:\n\n"
-        "\tpython test/test_jit.py TESTNAME\n\n"
-        "instead."
-    )
 
 
 class TestList(JitTestCase):
@@ -58,6 +56,26 @@ class TestList(JitTestCase):
 
         self.checkScript(ternary_predicate, ([1, 2, 3],))
         self.checkScript(ternary_predicate, ([],))
+
+    def test_bare_container_annotation(self):
+        err = r"Attempted to use list without a contained type"
+
+        with self.assertRaisesRegex(RuntimeError, err):
+
+            @torch.jit.script
+            def bare_list_empty():
+                x: list = []
+                return x
+
+        # `isinstance` against a bare container is still valid (it is a
+        # type-erased runtime check, not a value's element type).
+        @torch.jit.script
+        def uses_isinstance(x: List[int]):
+            if isinstance(x, list):
+                return len(x)
+            return 0
+
+        self.assertEqual(uses_isinstance([1, 2, 3]), 3)
 
     def test_in_check(self):
         def int_in(x: List[int]) -> bool:
@@ -1185,6 +1203,7 @@ class TestList(JitTestCase):
 
         self.checkScript(test_list_remove2, ())
 
+    @skipIfTorchDynamo("Dynamo does not model TorchScript list copying")
     def test_extend_list_mutable(self):
         @torch.jit.script
         def extend_list(a: List[Tensor], b: List[Tensor]) -> List[Tensor]:
@@ -1645,9 +1664,9 @@ class TestDict(JitTestCase):
 
         def test_dictcomprehension_is_typed_from_annotation():
             metasyntactics = ["foo", "bar", "baz"]
-            x: Dict[str, Optional[int]] = {
+            x: Dict[str, Optional[int]] = {  # noqa: C420, RUF025
                 word: None for word in metasyntactics
-            }  # noqa: RUF025
+            }
             return x
 
         self.checkScript(test_dictcomprehension_is_typed_from_annotation, ())
@@ -1775,7 +1794,7 @@ class TestDict(JitTestCase):
             return x
 
         self.checkScript(setdefault, (self.dict(), "a", torch.randn(2, 2)))
-        self.checkScript(setdefault, (self.dict(), "nonexistant", torch.randn(2, 2)))
+        self.checkScript(setdefault, (self.dict(), "nonexistent", torch.randn(2, 2)))
 
     @skipIfTorchDynamo("TorchDynamo fails for this test for unknown reason")
     def test_update(self):
@@ -1823,7 +1842,7 @@ class TestDict(JitTestCase):
     def test_popitem(self):
         @torch.jit.script
         def popitem(
-            x: Dict[str, Tensor]
+            x: Dict[str, Tensor],
         ) -> Tuple[Tuple[str, Tensor], Dict[str, Tensor]]:
             item = x.popitem()
             return item, x
@@ -1896,9 +1915,13 @@ class TestDict(JitTestCase):
 
         @torch.jit.script
         def missing_index(x: Dict[str, int]) -> int:
-            return x["dne"]
+            return x["dne"]  # codespell:ignore
 
-        with self.assertRaisesRegexWithHighlight(RuntimeError, "KeyError", 'x["dne"'):
+        with self.assertRaisesRegexWithHighlight(
+            RuntimeError,
+            "KeyError",
+            'x["dne"',  # codespell:ignore
+        ):
             missing_index({"item": 20, "other_item": 120})
 
         code = dedent(
@@ -2190,7 +2213,7 @@ class TestNamedTuple(JitTestCase):
             t: int
 
         class MyModule(types.ModuleType):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__("MyModule")
 
             def __getattr__(self, attr):
@@ -2345,7 +2368,7 @@ class TestNamedTuple(JitTestCase):
             t: "int"
 
         class MyModule(types.ModuleType):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__("MyModule")
 
             def __getattr__(self, attr):
@@ -2370,7 +2393,7 @@ class TestScriptDict(JitTestCase):
 
     The vast majority of tests are for making sure that objects returned
     by torch.jit.script behave like dictionaries do so that they are fungible
-    in almost all cirumstances with regular dictionaries.
+    in almost all circumstances with regular dictionaries.
     """
 
     def _script_dict_add(self, d: torch._C.ScriptDict, k: int, v: int):
@@ -2607,7 +2630,7 @@ class TestScriptList(JitTestCase):
 
     The vast majority of tests are for making sure that instances of
     torch._C.ScriptList behave like lists do so that they are fungible
-    in almost all cirumstances with regular list.
+    in almost all circumstances with regular list.
     """
 
     def _script_list_add(self, l: torch._C.ScriptList, e: int):
@@ -2849,7 +2872,6 @@ class TestScriptList(JitTestCase):
         with self.assertRaises(TypeError):
             script_data.append("str")
 
-    @skipIfTorchDynamo("https://github.com/pytorch/torchdynamo/issues/1991")
     def test_clear(self):
         """
         Test clear.
@@ -2966,3 +2988,36 @@ class TestScriptList(JitTestCase):
         self.assertEqual(len(l), 3)
         self.assertTrue(3 in l)
         self.assertEqual(l[2], 3)
+
+    def test_defaultdict(self):
+        def get_dict():
+            test_dict = defaultdict(list)
+            return test_dict
+
+        class Test(torch.nn.Module):
+            segments_groupby_col: Dict[str, List[str]]
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.segments_groupby_col = get_dict()
+                self.col1 = "a"
+                self.col2 = "b"
+
+            def forward(self):
+                if self.col1 in self.segments_groupby_col:
+                    return 1
+                else:
+                    return 2
+
+        test = Test()
+        test_script = torch.jit.script(test)
+        test_script.segments_groupby_col
+
+        # Smoketest for flakiness. Takes around 2s.
+        for _ in range(300):
+            test = Test()
+            test_script = torch.jit.script(test)
+
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_jit.py")

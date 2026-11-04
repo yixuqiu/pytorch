@@ -18,7 +18,6 @@ namespace c10 {
   _(namespaces, scope)               \
   _(namespaces, user)                \
   _(namespaces, _caffe2)             \
-  _(namespaces, dimname)             \
   _(namespaces, namespaces)          \
   _(prim, Assign)                    \
   _(prim, BroadcastingChunk)         \
@@ -187,7 +186,6 @@ namespace c10 {
   _(aten, append)                    \
   _(aten, as_tensor)                 \
   _(aten, adaptive_avg_pool2d_backward) \
-  _(aten, dim)                       \
   _(aten, format)                    \
   _(aten, percentFormat)             \
   _(aten, __not__)                   \
@@ -227,6 +225,8 @@ namespace c10 {
   _(aten, is_autocast_enabled)       \
   _(aten, is_autocast_cpu_enabled)   \
   _(aten, is_autocast_xla_enabled)   \
+  _(aten, get_autocast_dtype)        \
+  _(aten, is_autocast_mps_enabled)   \
   FORALL_ATEN_BASE_SYMBOLS(_)        \
   _(onnx, Add)                       \
   _(onnx, Concat)                    \

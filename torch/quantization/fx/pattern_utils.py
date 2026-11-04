@@ -6,6 +6,7 @@ If you are adding a new entry/functionality, please, add it to the
 appropriate files under `torch/ao/quantization/fx/`, while adding an import statement
 here.
 """
+
 from torch.ao.quantization.fx.pattern_utils import (
     _register_fusion_pattern,
     _register_quant_pattern,
@@ -14,6 +15,7 @@ from torch.ao.quantization.fx.pattern_utils import (
     get_default_quant_patterns,
     QuantizeHandler,
 )
+
 
 # QuantizeHandler.__module__ = _NAMESPACE
 _register_fusion_pattern.__module__ = "torch.ao.quantization.fx.pattern_utils"

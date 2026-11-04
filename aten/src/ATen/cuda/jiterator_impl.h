@@ -9,6 +9,7 @@
 #include <ATen/native/cuda/MemoryAccess.cuh>
 #include <ATen/native/cuda/JitLoops.cuh>
 
+#include <array>
 #include <string>
 #include <variant>
 #include <vector>
@@ -47,9 +48,11 @@ c10::SmallVector<std::string> get_extra_args_typenames(const c10::SmallVector<at
 int can_vectorize_up_to(at::ScalarType type, char* pointer) {
   switch(type) {
 #define DEFINE_CASE(ctype, scalartype)                                   \
-    case ScalarType::scalartype : return memory::can_vectorize_up_to<ctype>(pointer);
+    case scalartype : return memory::can_vectorize_up_to<ctype>(pointer);
 
-    AT_FORALL_SCALAR_TYPES_WITH_COMPLEX(DEFINE_CASE)
+    AT_FORALL_SCALAR_TYPES_V2(
+      AT_WRAP(DEFINE_CASE),
+      AT_EXPAND(AT_ALL_SCALAR_TYPES_WITH_COMPLEX))
 #undef DEFINE_CASE
 
     default: TORCH_INTERNAL_ASSERT(false, "Unrecognized ScalarType: ", type);
@@ -117,12 +120,12 @@ struct OffsetCalculatorVariant {
   }
 
  private:
-  OffsetCalculatorTypes v;
+  OffsetCalculatorTypes v{};
 };
 
 struct ArrayVariant {
 // works for up to 8 input + 8 outputs
-#define DEFINE_CASE(index) at::detail::Array<char*, index>, at::detail::Array<char*, index+8>
+#define DEFINE_CASE(index) std::array<char*, index>, std::array<char*, index+8>
   using ArrayTypes = std::variant<
     AT_FOR_8_CASES_WITH_COMMA(DEFINE_CASE)
   >;
@@ -132,8 +135,8 @@ struct ArrayVariant {
     int ntensors = iter.ntensors();
     switch(ntensors) {
 #define DEFINE_CASE(index)                                            \
-      case index: array = at::detail::Array<char*, index>{}; break;   \
-      case index+8: array = at::detail::Array<char*, index+8>{}; break;
+      case index: array = std::array<char*, index>{}; break;   \
+      case index+8: array = std::array<char*, index+8>{}; break;
 
       AT_FOR_8_CASES(DEFINE_CASE)
 #undef DEFINE_CASE
@@ -182,7 +185,7 @@ struct TrivialOffsetCalculatorVariant {
   }
 
 private:
-  TrivialOffsetCalculatorTypes v;
+  TrivialOffsetCalculatorTypes v{};
 };
 
 struct LoadWithCastVariant {
@@ -211,7 +214,7 @@ struct LoadWithCastVariant {
   }
 
 private:
-  LoadWithCastPtr v;
+  LoadWithCastPtr v{};
 };
 
 struct StoreWithCastVariant {
@@ -240,7 +243,7 @@ struct StoreWithCastVariant {
   }
 
 private:
-  StoreWithCastPtr v;
+  StoreWithCastPtr v{};
 };
 
 } // namespace at::native

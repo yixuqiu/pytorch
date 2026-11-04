@@ -11,15 +11,21 @@ import torch
 from torch._subclasses.meta_utils import assert_metadata_eq
 from torch.testing._internal.common_cuda import with_tf32_off
 from torch.testing._internal.common_device_type import (
-    instantiate_device_type_tests, onlyCPU, onlyCUDA, toleranceOverride, tol, skipMeta)
+    instantiate_device_type_tests, onlyAccelerator, toleranceOverride, tol, skipMeta, skipMPS)
 from torch.testing._internal.common_modules import module_db, modules, ModuleErrorEnum, TrainEvalMode
 from torch.testing._internal.common_utils import (
     TestCase, run_tests, freeze_rng_state, mock_wrapper, get_tensors_from, gradcheck,
-    gradgradcheck, parametrize, wrapSwapTensorsTest)
+    gradgradcheck, parametrize, wrapSwapTensorsTest, TEST_WITH_ROCM, HardwareClassification)
 from unittest.mock import patch, call
 
 
+if TEST_WITH_ROCM:
+    import os
+    os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] = "1"
+    os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC_BATCHNORM"] = "1"
+
 class TestModule(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
     precision = 1e-5
@@ -36,11 +42,11 @@ class TestModule(TestCase):
             for item_name, item in items:
                 self.assertEqual(
                     item.device, device,
-                    f'{name} {item_name} is on device {item.device} instead of the expected device {device}')
+                    lambda msg: f'{msg}\n{name} {item_name} is on device {item.device} instead of the expected device {device}')
                 if item.dtype.is_floating_point:
                     self.assertEqual(
                         item.dtype, dtype,
-                        f'{name} {item_name} is of dtype {item.dtype} instead of the expected dtype {dtype}')
+                        lambda msg: f'{msg}\n{name} {item_name} is of dtype {item.dtype} instead of the expected dtype {dtype}')
         _check_module(module.named_parameters(), "Parameter")
         _check_module(module.named_buffers(), "Buffer")
 
@@ -139,7 +145,8 @@ class TestModule(TestCase):
                 m.train(training)
                 self._assert_module_parameters_and_buffer_are(m, device, dtype)
 
-    @onlyCUDA
+    @skipMPS
+    @onlyAccelerator
     @modules(module_db)
     def test_multiple_device_transfer(self, device, dtype, module_info, training):
         module_cls = module_info.module_cls
@@ -172,11 +179,11 @@ class TestModule(TestCase):
                 self._assert_module_parameters_and_buffer_are(m, "cpu", dtype)
 
                 # === Move back to GPU and forward pass ===
-                m.cuda()
+                m.to(device)
                 m(*input_device_args, **input_device_kwargs)
                 self._assert_module_parameters_and_buffer_are(m, device, dtype)
 
-                if torch.cuda.device_count() >= 2:
+                if torch.accelerator.device_count() >= 2:
                     # === test cross-GPU transfer works
                     def _to_device1(objs):
                         if isinstance(objs, (tuple, list)):
@@ -184,16 +191,16 @@ class TestModule(TestCase):
                         elif isinstance(objs, dict):
                             return {name: _to_device1(item) for name, item in objs.items()}
                         elif isinstance(objs, torch.Tensor):
-                            return objs.cuda(1)
+                            return objs.to(1)
                         else:
                             return objs
                     input_device_1_args = _to_device1(input_device_args)
                     input_device_1_kwargs = _to_device1(input_device_kwargs)
 
-                    m.cuda(1)
-                    with torch.cuda.device(1):
+                    m.to(1)
+                    with torch.accelerator.device_index(1):
                         m(*input_device_1_args, **input_device_1_kwargs)
-                    self._assert_module_parameters_and_buffer_are(m, torch.device("cuda:1"), dtype)
+                    self._assert_module_parameters_and_buffer_are(m, torch.device(f"{torch.device(device).type}:1"), dtype)
 
     @modules(module_db)
     def test_repr(self, device, dtype, module_info, training):
@@ -239,7 +246,8 @@ class TestModule(TestCase):
                 with tempfile.TemporaryFile() as f:
                     torch.save(m, f)
                     f.seek(0)
-                    m_copy = torch.load(f)
+                    # weights_only=False as this is legacy code that saves the model
+                    m_copy = torch.load(f, weights_only=False)
                     output_from_copy = m_copy(*args, **kwargs)
                     self.assertEqual(output, output_from_copy)
 
@@ -321,7 +329,7 @@ class TestModule(TestCase):
 
     def _retain_grad(self, obj):
         # gradients needs to be retained to check for grad. This is useful when
-        # non-leafs are present in the graph.
+        # non-leaves are present in the graph.
         def inner_retain_grad(obj):
             if obj.requires_grad:
                 obj.retain_grad()
@@ -365,9 +373,7 @@ class TestModule(TestCase):
             elif isinstance(obj, dict):
                 return any(_can_be_noncontiguous(o) for o in obj.values())
             # scalar tensors can not be non-contiguous
-            if not isinstance(obj, torch.Tensor) or obj.dim() == 0:
-                return False
-            return True
+            return isinstance(obj, torch.Tensor) and obj.dim() != 0
 
         for module_input in module_inputs:
             if module_input.forward_input is None:
@@ -440,9 +446,10 @@ class TestModule(TestCase):
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
                                                        requires_grad=True, training=training)
+
         # === Set nondet tol for gradcheck to user-defined value if on CUDA and cudNN is enabled
         gradcheck_nondet_tol = 0.0
-        if (torch.device(device).type == 'cuda' and torch.backends.cudnn.enabled):
+        if (torch.device(device).type == 'cuda' and torch.backends.cudnn.enabled) or torch.device(device).type == 'xpu':
             gradcheck_nondet_tol = module_info.gradcheck_nondet_tol
 
         for module_input in module_inputs:
@@ -483,11 +490,19 @@ class TestModule(TestCase):
                     output_flattened = torch.utils._pytree.tree_leaves(output)
                     return output_flattened
 
+            def do_check(flat_input):
+                self.assertTrue(
+                    check(
+                        fn_to_gradcheck,
+                        flat_input,
+                        nondet_tol=gradcheck_nondet_tol,
+                        fast_mode=module_info.gradcheck_fast_mode
+                    ))
+
             # check total derivative
             grad_input = input_args + params + tuple(obj for (_, obj) in kwarg_tensors)
             flat_input, flat_spec = torch.utils._pytree.tree_flatten(grad_input)
-
-            self.assertTrue(check(fn_to_gradcheck, flat_input, nondet_tol=gradcheck_nondet_tol))
+            do_check(flat_input)
 
             # check partial derivatives
             old_params_requires_grad = [p.requires_grad for p in params]
@@ -502,14 +517,14 @@ class TestModule(TestCase):
                 p.requires_grad = old
                 grad_input = input_args + params + tuple(obj for (_, obj) in kwarg_tensors)
                 flat_input, flat_spec = torch.utils._pytree.tree_flatten(grad_input)
-                self.assertTrue(check(fn_to_gradcheck, flat_input, nondet_tol=gradcheck_nondet_tol))
+                do_check(flat_input)
                 p.requires_grad = False
 
             for (_, obj), old in zip(kwarg_tensors, old_kwargs_requires_grad):
                 obj.requires_grad = old
                 grad_input = input_args + params + tuple(obj for (_, obj) in kwarg_tensors)
                 flat_input, flat_spec = torch.utils._pytree.tree_flatten(grad_input)
-                self.assertTrue(check(fn_to_gradcheck, flat_input, nondet_tol=gradcheck_nondet_tol))
+                do_check(flat_input)
                 obj.requires_grad = False
 
     @modules(module_db, allowed_dtypes=[torch.double])
@@ -521,7 +536,8 @@ class TestModule(TestCase):
     def test_gradgrad(self, device, dtype, module_info, training):
         self._test_gradients_helper(device, dtype, module_info, training, gradgradcheck)
 
-    @onlyCUDA
+    @skipMPS
+    @onlyAccelerator
     @with_tf32_off  # Turn off TF32 to compute at full precision https://github.com/pytorch/pytorch/issues/86798
     @toleranceOverride({torch.float32: tol(5e-2, 0),
                         torch.float64: tol(4e-4, 0)})
@@ -618,8 +634,8 @@ class TestModule(TestCase):
     @with_tf32_off
     @modules(module_db)
     def test_memory_format(self, device, dtype, module_info, training):
-        is_sm86or80 = device.startswith("cuda") and (torch.cuda.get_device_capability(0) == (8, 6)
-                                                     or torch.cuda.get_device_capability(0) == (8, 0))
+        is_sm86or80 = torch.device(device).type == "cuda" and (torch.cuda.get_device_capability(0) == (8, 6)
+                                                               or torch.cuda.get_device_capability(0) == (8, 0))
         # TODO tighten it to a specific module
         atol, rtol = (3e-3, 7e-3) if is_sm86or80 else (None, None)
         module_cls = module_info.module_cls
@@ -653,7 +669,7 @@ class TestModule(TestCase):
                 d = obj.dim()
                 if ((mem_format == torch.channels_last and d != 4)
                    or (mem_format == torch.channels_last_3d and d != 5)):
-                    return obj.clone().detach().requires_grad_(obj.requires_grad)
+                    return obj.detach().clone().requires_grad_(obj.requires_grad)
                 return obj.clone().to(memory_format=mem_format).detach().requires_grad_(obj.requires_grad)
 
             return self._traverse_obj(obj, inner_to_mem_format)
@@ -663,10 +679,10 @@ class TestModule(TestCase):
                 d = output.dim()
                 if (d == 4 and ((input_mem_format == torch.channels_last)
                                 or (module_mem_format == torch.channels_last and module_memformat_affects_out))):
-                    self.assertTrue(output.is_contiguous(memory_format=torch.channels_last))
+                    self.assertTrue(output.numel() == 0 or output.is_contiguous(memory_format=torch.channels_last))
                 elif (d == 5 and ((input_mem_format == torch.channels_last_3d)
                                   or (module_mem_format == torch.channels_last_3d and module_memformat_affects_out))):
-                    self.assertTrue(output.is_contiguous(memory_format=torch.channels_last_3d))
+                    self.assertTrue(output.numel() == 0 or output.is_contiguous(memory_format=torch.channels_last_3d))
                 else:
                     self.assertTrue(output.is_contiguous())
             return self._traverse_obj(output, inner_check_out_mem_format)
@@ -777,7 +793,11 @@ class TestModule(TestCase):
                                 )
 
                             # === Check mem format of grad_inputs. ===
-                            _check_out_mem_format(grad_inputs, input_mem_format, module_mem_format)
+                            if module_cls == torch.nn.AdaptiveAvgPool1d and m.output_size == 1:
+                                # Global average pooling uses mean backward's expanded gradient.
+                                self.assertEqual(grad_inputs[0].stride(-1), 0)
+                            else:
+                                _check_out_mem_format(grad_inputs, input_mem_format, module_mem_format)
 
     # Test whether train and eval modes differ for each module. Use to verify
     # that the ModuleInfo entry flag is correct.
@@ -808,40 +828,12 @@ class TestModule(TestCase):
             except AttributeError as e:
                 if "'training'" in str(e):
                     self.assertTrue(module_info.train_and_eval_differ,
-                                    f"The ModuleInfo entry for {module_info.name} has "
+                                    lambda msg: f"{msg}\nThe ModuleInfo entry for {module_info.name} has "
                                     "train_and_eval_differ=False, but the training mode was found to "
                                     "affect the forward pass. Consider setting train_and_eval_differ=True "
                                     "for this ModuleInfo entry.")
                 else:
                     raise e
-
-
-    @onlyCPU
-    @modules(module_db)
-    def test_device_ctx_init(self, device, dtype, module_info, training):
-        module_cls = module_info.module_cls
-        module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
-                                                       requires_grad=False, training=training)
-        with torch.device('meta'):
-            module_inputs_meta = module_info.module_inputs_func(module_info, device=None, dtype=dtype,
-                                                                requires_grad=False, training=training)
-
-        for module_input, module_input_meta in zip(module_inputs, module_inputs_meta):
-            c_args, c_kwargs = module_input.constructor_input.args, module_input.constructor_input.kwargs
-
-            c_args_meta, c_kwargs_meta = module_input_meta.constructor_input.args, module_input_meta.constructor_input.kwargs
-
-            m_cpu = module_cls(*c_args, **c_kwargs)
-
-            with torch.device('meta'):
-                m = module_cls(*c_args_meta, **c_kwargs_meta)
-
-            for (p_meta, p_cpu) in chain(zip(m.parameters(), m_cpu.parameters()),
-                                         zip(m.buffers(), m_cpu.buffers())):
-                if torch.nn.parameter.is_lazy(p_meta):
-                    continue
-                self.assertTrue(p_meta.is_meta)
-                assert_metadata_eq(self.assertEqual, p_meta, p_cpu)
 
 
     @modules([module for module in module_db if module.module_error_inputs_func is not None])
@@ -863,15 +855,17 @@ class TestModule(TestCase):
             else:
                 raise NotImplementedError(f"Unknown error type {error_input.error_on}")
 
-    @modules([module for module in module_db if not module.is_lazy])
+    # Only run this test for float32 because the test loops over all the dtypes
+    @skipMPS
+    @modules([module for module in module_db if not module.is_lazy], allowed_dtypes=[torch.float32])
     @parametrize('swap', [True, False])
     @parametrize('set_grad', [True, False])
     @wrapSwapTensorsTest()
     def test_to(self, device, dtype, module_info, training, swap, set_grad):
         module_cls = module_info.module_cls
         devices = ['cpu']
-        if torch.cuda.is_available():
-            devices += ['cuda']
+        if torch.accelerator.is_available():
+            devices.append(torch.device(device).type)
         dtypes = module_info.dtypes
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
                                                        requires_grad=False, training=training)
@@ -879,6 +873,7 @@ class TestModule(TestCase):
 
         for module_input in module_inputs:
             c_args, c_kwargs = module_input.constructor_input.args, module_input.constructor_input.kwargs
+            args, kwargs = module_input.forward_input.args, module_input.forward_input.kwargs
 
             m = module_cls(*c_args, **c_kwargs)
 
@@ -895,6 +890,17 @@ class TestModule(TestCase):
                     new_b = b.detach().clone().to(device, dtype)
                     setattr(m, n, new_b)
             _to(m, set_grad=set_grad)
+
+            # Check .to() can be run after forward and backward with swap
+            has_params = len(list(m.parameters())) > 0
+            if swap and not set_grad and has_params:
+                out = m(*args, **kwargs)
+                if isinstance(out, tuple):
+                    out = out[0]
+                out.sum().backward()
+                m.to(dtype=torch.half)
+                # reset
+                m.to(dtype=torch.float32)
 
             prev_device, prev_dtype = device, dtype
             for device_, dtype_ in product(devices, dtypes):
@@ -940,7 +946,6 @@ class TestModule(TestCase):
                         self.assertTrue(all(a == b for a, b in zip(g_cdatas_before, g_cdatas_after)))
                         self.assertTrue(all(a == b for a, b in zip(g_ids_before, g_ids_after)))
 
-
     @modules([module for module in module_db if not module.is_lazy], allowed_dtypes=[torch.float32])
     @parametrize('swap', [True, False])
     @wrapSwapTensorsTest()
@@ -982,7 +987,310 @@ class TestModule(TestCase):
                 self.assertTrue(all(a != b for a, b in zip(p_cdatas_before, p_cdatas_after)))
 
 
-instantiate_device_type_tests(TestModule, globals(), allow_mps=True)
+class TestModuleCPUOnly(TestCase):
+    hw_classification = HardwareClassification.CPU
+
+    @modules(module_db)
+    def test_device_ctx_init(self, dtype, module_info, training):
+        module_cls = module_info.module_cls
+        module_inputs = module_info.module_inputs_func(module_info, device="cpu", dtype=dtype,
+                                                       requires_grad=False, training=training)
+        with torch.device('meta'):
+            module_inputs_meta = module_info.module_inputs_func(module_info, device=None, dtype=dtype,
+                                                                requires_grad=False, training=training)
+
+        for module_input, module_input_meta in zip(module_inputs, module_inputs_meta):
+            c_args, c_kwargs = module_input.constructor_input.args, module_input.constructor_input.kwargs
+
+            c_args_meta, c_kwargs_meta = module_input_meta.constructor_input.args, module_input_meta.constructor_input.kwargs
+
+            m_cpu = module_cls(*c_args, **c_kwargs)
+
+            with torch.device('meta'):
+                m = module_cls(*c_args_meta, **c_kwargs_meta)
+
+            for (p_meta, p_cpu) in chain(zip(m.parameters(), m_cpu.parameters()),
+                                         zip(m.buffers(), m_cpu.buffers())):
+                if torch.nn.parameter.is_lazy(p_meta):
+                    continue
+                self.assertTrue(p_meta.is_meta)
+                assert_metadata_eq(self.assertEqual, p_meta, p_cpu)
+
+
+class TestJitReplaceSubmodule(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_jit_replace_submodule(self):
+        from torch.jit._recursive import wrap_cpp_module
+
+        class SubA(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class SubB(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x) * 2
+
+        class Parent(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.child = SubA()
+
+            def forward(self, x):
+                return self.child(x)
+
+        root = torch.jit.script(Parent())
+        new_child = torch.jit.script(SubB())
+
+        inp = torch.randn(2, 4)
+        out_before = root(inp)
+
+        root = wrap_cpp_module(
+            torch._C._jit_replace_submodule(root._c, "child", new_child._c)
+        )
+
+        out_after = root(inp)
+        self.assertFalse(torch.equal(out_before, out_after))
+        self.assertEqual(
+            root.child._c._type().name(),
+            new_child._c._type().name(),
+        )
+
+    def test_jit_replace_submodule_mutates_in_place(self):
+        # _jit_replace_submodule must mutate the input ``root._c`` in
+        # place rather than swap on a clone.  Old behaviour cloned root
+        # first, returned the clone, and left ``root._c`` untouched --
+        # which silently broke callers that hold onto the original root
+        # and discard the return value (e.g. regional-AOTI's
+        # create_lowered_from_scripted_merge before the in-place fix).
+        #
+        # We must NOT inspect via ``root.child`` -- ``RecursiveScriptModule``
+        # caches Python child wrappers at construction and would return the
+        # stale SubA wrapper regardless of any underlying C++ swap.  Re-wrap
+        # ``root._c`` after the call to get a fresh Python view that reflects
+        # the current C++ attribute slots; under the in-place contract the
+        # re-wrap sees SubB, under the cloned contract it still sees SubA.
+        from torch.jit._recursive import wrap_cpp_module
+
+        class SubA(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class SubB(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x) * 2
+
+        class Parent(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.child = SubA()
+
+            def forward(self, x):
+                return self.child(x)
+
+        root = torch.jit.script(Parent())
+        new_child = torch.jit.script(SubB())
+        root_c_before = root._c
+        original_child_type_name = root.child._c._type().name()
+        new_child_type_name = new_child._c._type().name()
+        self.assertNotEqual(original_child_type_name, new_child_type_name)
+
+        # Intentionally discard the return value so we are checking the
+        # mutation on the input ``root._c``.
+        torch._C._jit_replace_submodule(root._c, "child", new_child._c)
+
+        # Underlying C++ ScriptModule object must be the same instance --
+        # the in-place contract returns the input, not a clone.
+        self.assertIs(root._c, root_c_before)
+
+        # Re-wrap to bypass RecursiveScriptModule's cached children dict
+        # and read the current state of ``root._c``'s attribute slots.
+        re_wrapped = wrap_cpp_module(root._c)
+        self.assertEqual(
+            re_wrapped.child._c._type().name(),
+            new_child_type_name,
+        )
+
+    def test_jit_replace_submodule_nested(self):
+        class Leaf(torch.nn.Module):
+            def __init__(self, scale: float) -> None:
+                super().__init__()
+                self.scale = scale
+
+            def forward(self, x):
+                return x * self.scale
+
+        class Mid(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.leaf = Leaf(1.0)
+
+            def forward(self, x):
+                return self.leaf(x)
+
+        class Root(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mid = Mid()
+
+            def forward(self, x):
+                return self.mid(x)
+
+        root = torch.jit.script(Root())
+        new_leaf = torch.jit.script(Leaf(3.0))
+
+        inp = torch.randn(2, 4)
+        root = torch.jit._recursive.wrap_cpp_module(
+            torch._C._jit_replace_submodule(root._c, "mid.leaf", new_leaf._c)
+        )
+
+        out_after = root(inp)
+        self.assertEqual(out_after, inp * 3.0)
+
+    def test_jit_replace_submodule_empty_qualified_name(self):
+        class Leaf(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        class Root(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.child = Leaf()
+
+            def forward(self, x):
+                return self.child(x)
+
+        root = torch.jit.script(Root())
+        new_child = torch.jit.script(Leaf())
+
+        with self.assertRaisesRegex(RuntimeError, "non-empty qualified_name"):
+            torch._C._jit_replace_submodule(root._c, "", new_child._c)
+
+    def test_jit_replace_submodule_missing_segment(self):
+        class Leaf(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        class Root(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.child = Leaf()
+
+            def forward(self, x):
+                return self.child(x)
+
+        root = torch.jit.script(Root())
+        new_child = torch.jit.script(Leaf())
+
+        with self.assertRaisesRegex(RuntimeError, "could not find submodule path segment 'missing'"):
+            torch._C._jit_replace_submodule(root._c, "missing.leaf", new_child._c)
+
+        with self.assertRaisesRegex(RuntimeError, "could not find submodule path segment 'missing'"):
+            torch._C._jit_replace_submodule(root._c, "missing", new_child._c)
+
+    def test_jit_replace_submodule_non_module_attribute(self):
+        class Leaf(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        class Root(torch.nn.Module):
+            scalar: int
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.child = Leaf()
+                self.scalar = 7
+
+            def forward(self, x):
+                return self.child(x) + self.scalar
+
+        root = torch.jit.script(Root())
+        new_child = torch.jit.script(Leaf())
+
+        with self.assertRaisesRegex(RuntimeError, "'scalar'.*is not a submodule"):
+            torch._C._jit_replace_submodule(root._c, "scalar", new_child._c)
+
+        with self.assertRaisesRegex(RuntimeError, "'scalar'.*is not a submodule"):
+            torch._C._jit_replace_submodule(root._c, "scalar.nested", new_child._c)
+
+    def test_jit_replace_submodule_shared_parent_type(self):
+        class Leaf(torch.nn.Module):
+            def __init__(self, scale: float) -> None:
+                super().__init__()
+                self.scale = scale
+
+            def forward(self, x):
+                return x * self.scale
+
+        class Mid(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.leaf = Leaf(1.0)
+
+            def forward(self, x):
+                return self.leaf(x)
+
+        class Root(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mid_a = Mid()
+                self.mid_b = Mid()
+
+            def forward(self, x):
+                return self.mid_a(x) + self.mid_b(x)
+
+        root = torch.jit.script(Root())
+        new_leaf = torch.jit.script(Leaf(2.0))
+
+        with self.assertRaisesRegex(Exception, "unique parent types"):
+            torch._C._jit_replace_submodule(root._c, "mid_a.leaf", new_leaf._c)
+
+    def test_jit_replace_submodule_empty_path_segment(self):
+        class Leaf(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        class Mid(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.leaf = Leaf()
+
+            def forward(self, x):
+                return self.leaf(x)
+
+        class Root(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mid = Mid()
+
+            def forward(self, x):
+                return self.mid(x)
+
+        root = torch.jit.script(Root())
+        new_leaf = torch.jit.script(Leaf())
+
+        with self.assertRaisesRegex(RuntimeError, "empty path segments"):
+            torch._C._jit_replace_submodule(root._c, "mid..leaf", new_leaf._c)
+
+
+instantiate_device_type_tests(TestModule, globals(), allow_mps=True, allow_xpu=True)
+instantiate_device_type_tests(TestModuleCPUOnly, globals(), only_for="cpu")
 
 if __name__ == '__main__':
     run_tests()

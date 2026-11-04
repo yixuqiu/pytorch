@@ -25,15 +25,14 @@ template <typename T, template <class> class Op>
 std::vector<Tensor> foreach_binary_op(
     TensorList tensors,
     at::ArrayRef<Scalar> scalars) {
-  std::vector<std::vector<at::Tensor>> tensor_lists;
   std::vector<at::Tensor> vec_res;
   vec_res.reserve(tensors.size());
   for (const auto& t : tensors) {
     vec_res.emplace_back(at::native::empty_like(t));
   }
 
-  tensor_lists.emplace_back(tensors.vec());
-  tensor_lists.emplace_back(vec_res);
+  auto tensor_lists =
+      c10::make_nested<Tensor>(tensors.vec(), std::move(vec_res));
 
   using opmath_t = at::opmath_type<T>;
   multi_tensor_apply<2, opmath_t>(
@@ -46,13 +45,12 @@ std::vector<Tensor> foreach_binary_op(
           /* res_arg_index */ 1>(),
 
       Op<opmath_t>());
-  return tensor_lists[1];
+  return std::move(tensor_lists[1]);
 }
 
 template <typename T, template <class> class Op>
 void foreach_binary_op_(TensorList tensors, at::ArrayRef<Scalar> scalars) {
-  std::vector<std::vector<at::Tensor>> tensor_lists;
-  tensor_lists.emplace_back(tensors.vec());
+  auto tensor_lists = c10::make_nested<Tensor>(tensors.vec());
 
   using opmath_t = at::opmath_type<T>;
   multi_tensor_apply<1, opmath_t>(
@@ -235,15 +233,7 @@ std::vector<Tensor> foreach_tensor_sub_scalarlist_kernel_cuda(
       });
 }
 
-FOREACH_BINARY_OP_SCALARLIST(
-    all_types_half_bfloat16,
-    clamp_max,
-    minimum,
-    false);
-FOREACH_BINARY_OP_SCALARLIST(
-    all_types_half_bfloat16,
-    clamp_min,
-    maximum,
-    false);
+FOREACH_BINARY_OP_SCALARLIST(all_types_half_bfloat16, clamp_max, minimum, true);
+FOREACH_BINARY_OP_SCALARLIST(all_types_half_bfloat16, clamp_min, maximum, true);
 
 } // namespace at::native

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
 include(GNUInstallDirs)
 
@@ -12,14 +12,13 @@ include(GNUInstallDirs)
 project(PYTORCH_QNNPACK C CXX ASM)
 
 # ---[ Options.
-option(PYTORCH_QNNPACK_CUSTOM_THREADPOOL "Build QNNPACK for custom thread pool" OFF)
 set(PYTORCH_QNNPACK_LIBRARY_TYPE "default" CACHE STRING "Type of library (shared, static, or default) to build")
 set_property(CACHE PYTORCH_QNNPACK_LIBRARY_TYPE PROPERTY STRINGS default static shared)
 option(PYTORCH_QNNPACK_BUILD_TESTS "Build QNNPACK unit tests" ON)
 option(PYTORCH_QNNPACK_BUILD_BENCHMARKS "Build QNNPACK benchmarks" ON)
 
 # Enable runtime requantization.
-add_definitions(-DPYTORCH_QNNPACK_RUNTIME_QUANTIZATION=1)
+add_compile_definitions("PYTORCH_QNNPACK_RUNTIME_QUANTIZATION=1")
 
 # ---[ Target processor
 SET(PYTORCH_QNNPACK_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
@@ -29,11 +28,13 @@ ENDIF()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # TODO: See https://github.com/pytorch/pytorch/issues/56285
-  set_source_files_properties(src/operator-run.c PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
-  set_source_files_properties(src/conv-run.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
-  set_source_files_properties(src/deconv-run.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
-  set_source_files_properties(src/fc-run.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
-  set_source_files_properties(src/fc-dynamic-run.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
+  set_source_files_properties(
+    src/operator-run.c
+    src/conv-run.cc
+    src/deconv-run.cc
+    src/fc-run.cc
+    src/fc-dynamic-run.cc
+    PROPERTIES COMPILE_OPTIONS -Wno-deprecated-declarations)
 endif()
 
 # ---[ CMake options
@@ -234,6 +235,10 @@ set(PYTORCH_QNNPACK_AARCH64_ASM_UKERNELS
   src/q8conv/8x8-aarch64-neon.S
   src/q8gemm/8x8-aarch64-neon.S
   src/q8gemm/8x8-dq-aarch64-neon.S
+  src/q8gemm/4x8-dq-aarch64-neon.S
+  src/q8gemm/3x8-dq-aarch64-neon.S
+  src/q8gemm/2x8-dq-aarch64-neon.S
+  src/q8gemm/1x8-dq-aarch64-neon.S
   src/q8gemm_sparse/8x4-packA-aarch64-neon.S
   src/q8gemm_sparse/8x8c1x4-dq-packedA-aarch64-neon.S
   src/q8gemm_sparse/8x8c8x1-dq-packedA-aarch64-neon.S)
@@ -293,30 +298,30 @@ set_target_properties(pytorch_qnnpack PROPERTIES
   C_STANDARD 11
   C_EXTENSIONS YES)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv[5-8]" OR IOS_ARCH MATCHES "^armv7")
-  set_property(SOURCE ${PYTORCH_QNNPACK_ARM_NEON_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 -marm -mfpu=neon ")
+  set_property(SOURCE ${PYTORCH_QNNPACK_ARM_NEON_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -O2 -marm -mfpu=neon)
   if(IOS)
-    set_property(SOURCE ${PYTORCH_QNNPACK_AARCH32_ASM_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -arch ${IOS_ARCH} ")
+    set_property(SOURCE ${PYTORCH_QNNPACK_AARCH32_ASM_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -arch ${IOS_ARCH})
   endif()
 endif()
 if(PYTORCH_QNNPACK_TARGET_PROCESSOR MATCHES "^(aarch64|arm64)$" OR IOS_ARCH MATCHES "^arm64.*")
-  set_property(SOURCE ${PYTORCH_QNNPACK_ARM_NEON_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 ")
+  set_property(SOURCE ${PYTORCH_QNNPACK_ARM_NEON_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -O2)
   if(IOS)
-    set_property(SOURCE ${PYTORCH_QNNPACK_AARCH64_ASM_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -arch ${IOS_ARCH} ")
+    set_property(SOURCE ${PYTORCH_QNNPACK_AARCH64_ASM_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -arch ${IOS_ARCH})
   endif()
 endif()
 if(PYTORCH_QNNPACK_TARGET_PROCESSOR MATCHES "^(i[3-6]86|x86_64)$" OR IOS_ARCH MATCHES "^(i386|x86_64)$")
-  set_property(SOURCE ${PYTORCH_QNNPACK_X86_SSE2_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 -msse2 ")
+  set_property(SOURCE ${PYTORCH_QNNPACK_X86_SSE2_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -O2 -msse2)
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv[5-8]" OR IOS_ARCH MATCHES "^armv7")
-  set_property(SOURCE ${PYTORCH_QNNPACK_PSIMD_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 -marm -mfpu=neon ")
-  set_property(SOURCE ${PYTORCH_QNNPACK_SCALAR_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 -marm ")
+  set_property(SOURCE ${PYTORCH_QNNPACK_PSIMD_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -O2 -marm -mfpu=neon)
+  set_property(SOURCE ${PYTORCH_QNNPACK_SCALAR_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -O2 -marm)
 else()
-  set_property(SOURCE ${PYTORCH_QNNPACK_PSIMD_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 ")
-  set_property(SOURCE ${PYTORCH_QNNPACK_SCALAR_UKERNELS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 ")
+  set_property(SOURCE ${PYTORCH_QNNPACK_PSIMD_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -O2)
+  set_property(SOURCE ${PYTORCH_QNNPACK_SCALAR_UKERNELS} APPEND PROPERTY COMPILE_OPTIONS -O2)
 endif()
-set_property(SOURCE ${PYTORCH_QNNPACK_INIT_SRCS} APPEND_STRING PROPERTY COMPILE_FLAGS " -Os ")
+set_property(SOURCE ${PYTORCH_QNNPACK_INIT_SRCS} APPEND PROPERTY COMPILE_OPTIONS -Os)
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-  set_property(SOURCE ${PYTORCH_QNNPACK_OPERATOR_SRCS} APPEND_STRING PROPERTY COMPILE_FLAGS " -O2 ")
+  set_property(SOURCE ${PYTORCH_QNNPACK_OPERATOR_SRCS} APPEND PROPERTY COMPILE_OPTIONS -O2)
 endif()
 target_include_directories(pytorch_qnnpack PUBLIC include)
 target_include_directories(pytorch_qnnpack PUBLIC src)
@@ -332,6 +337,9 @@ if(NOT TARGET clog)
     "${CONFU_DEPENDENCIES_BINARY_DIR}/clog")
   # We build static version of clog but a dynamic library may indirectly depend on it
   set_property(TARGET clog PROPERTY POSITION_INDEPENDENT_CODE ON)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(clog PRIVATE "-Wno-unused-result")
+  endif()
 endif()
 target_link_libraries(pytorch_qnnpack PUBLIC clog)
 
@@ -373,13 +381,7 @@ elseif(NOT TARGET pthreadpool AND USE_SYSTEM_PTHREADPOOL)
     IMPORTED_LOCATION "${PTHREADPOOL_LIBRARY}")
   add_library(pthreadpool_interface INTERFACE)
 endif()
-if(PYTORCH_QNNPACK_CUSTOM_THREADPOOL)
-  # Depend on pthreadpool interface, but not on implementation.
-  # This is used when QNNPACK user (e.g. Caffe2) provides its own threadpool implementation.
-  target_link_libraries(pytorch_qnnpack PUBLIC pthreadpool_interface)
-else()
-  target_link_libraries(pytorch_qnnpack PUBLIC pthreadpool)
-endif()
+target_link_libraries(pytorch_qnnpack PUBLIC pthreadpool)
 
 # ---[ Configure FXdiv
 if(NOT TARGET fxdiv AND NOT USE_SYSTEM_FXDIV)
@@ -397,6 +399,12 @@ elseif(NOT TARGET fxdiv AND USE_SYSTEM_FXDIV)
   set_property(TARGET fxdiv PROPERTY LINKER_LANGUAGE C)
 endif()
 target_link_libraries(pytorch_qnnpack PRIVATE fxdiv)
+
+# -- [ CMake-4 compat mode
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0.0" AND NOT (USE_SYSTEM_PSIMD OR USE_SYSTEM_FP16))
+  message(WARNING "Ancient psimd/FP16 forces CMake compatibility")
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
 
 # ---[ Configure psimd
 if(NOT TARGET psimd AND NOT USE_SYSTEM_PSIMD)
@@ -429,6 +437,11 @@ elseif(NOT TARGET fp16 AND USE_SYSTEM_FP16)
   set_target_properties(fp16 PROPERTIES LINKER_LANGUAGE C)
 endif()
 target_link_libraries(pytorch_qnnpack PRIVATE fp16)
+
+# -- [ Undo cmake-4 compat mode
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0.0")
+  unset(CMAKE_POLICY_VERSION_MINIMUM)
+endif()
 
 install(TARGETS pytorch_qnnpack
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -653,6 +666,15 @@ if(PYTORCH_QNNPACK_BUILD_TESTS)
   target_include_directories(q8gavgpool-test PRIVATE src test)
   target_link_libraries(q8gavgpool-test PRIVATE pytorch_qnnpack cpuinfo fp16 gtest gtest_main)
   add_test(q8gavgpool-test q8gavgpool-test)
+
+  add_executable(requantization-test test/requantization.cc)
+  set_target_properties(requantization-test PROPERTIES
+    CXX_STANDARD 14
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+  target_include_directories(requantization-test PRIVATE src test)
+  target_link_libraries(requantization-test PRIVATE pytorch_qnnpack cpuinfo fp16 gtest gtest_main)
+  add_test(requantization-test requantization-test)
 
   add_executable(u8maxpool-test test/u8maxpool.cc)
   set_target_properties(u8maxpool-test PROPERTIES

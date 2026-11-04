@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 #include <utility>
@@ -45,7 +46,7 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
     // unordered_map<int, vector<unique_ptr<Handle>>> created_handles;
     Handle(const Handle& rhs) = delete;
     // Following https://stackoverflow.com/questions/3279543/what-is-the-copy-and-swap-idiom
-    Handle(Handle&& rhs) : Handle() { std::swap(handle, rhs.handle); }
+    Handle(Handle&& rhs) noexcept : Handle() { std::swap(handle, rhs.handle); }
     // operator= takes argument by value
     Handle& operator=(Handle rhs) { std::swap(handle, rhs.handle); return *this; }
     ~Handle() {
@@ -114,15 +115,65 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
         return my_handles[device];
     }
 
+#ifdef USE_ROCM
+    // hipblaslt cannot share a single handle across multiple streams, so this
+    // overload returns a handle unique to each (device, stream) pair. With
+    // create=false it returns nullptr instead of creating a handle when this
+    // thread has none for the pair and the pool has no spare.
+    Handle_t reserve(int device, void* stream, bool create = true)
+    {
+        auto key = std::make_pair(device, stream);
+        // If this thread already has a handle for this (device, stream), return it
+        if(my_stream_handles.find(key) != my_stream_handles.end())
+        return my_stream_handles[key];
+
+        // otherwise, either grab a handle from the pool if one is available,
+        // or if not, create a new one.
+        auto parent = weak_parent.lock();
+        TORCH_CHECK(parent, "Cannot create handle during program termination");
+        std::lock_guard<std::mutex> guard(parent->mutex);
+
+        if(parent->available_handles[device].size() > 0)
+        {
+        my_stream_handles[key] = parent->available_handles[device].back();
+        parent->available_handles[device].pop_back();
+        }
+        else if(create)
+        {
+        parent->created_handles[device].emplace_back(true /*create*/);
+        my_stream_handles[key] = parent->created_handles[device].back().handle;
+        }
+        else
+        {
+        return nullptr;
+        }
+
+        return my_stream_handles[key];
+    }
+
+    // Returns this thread's handle for (device, stream) without creating one,
+    // or nullptr if it has none.
+    Handle_t find(int device, void* stream) const
+    {
+        auto it = my_stream_handles.find(std::make_pair(device, stream));
+        return it == my_stream_handles.end() ? nullptr : it->second;
+    }
+#endif
+
     private:
     // Stores the per-device handles currently owned by this thread
     std::unordered_map<int, Handle_t> my_handles;
+#ifdef USE_ROCM
+    // Stores per-(device, stream) handles for ROCm, where hipblaslt
+    // requires a unique handle per stream.
+    std::map<std::pair<int, void*>, Handle_t> my_stream_handles;
+#endif
 
     std::weak_ptr<DeviceThreadHandlePool> weak_parent;
 
     // Called by the destructor.  Releases this thread's handles back into the pool.
     void release() {
-        if(my_handles.size() > 0) {
+        if(!my_handles.empty()) {
             auto parent = weak_parent.lock();
             if (!parent) {
                 // If this thread exits after atexit handlers have completed, the
@@ -134,6 +185,18 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
             for(auto d_h : my_handles)
                 parent->available_handles[d_h.first].push_back(d_h.second);
         }
+#ifdef USE_ROCM
+        if(!my_stream_handles.empty()) {
+            auto parent = weak_parent.lock();
+            if (!parent) {
+                return;
+            }
+
+            std::lock_guard<std::mutex> guard(parent->mutex);
+            for(auto& [key, handle] : my_stream_handles)
+                parent->available_handles[key.first].push_back(handle);
+        }
+#endif
     }
     };
 

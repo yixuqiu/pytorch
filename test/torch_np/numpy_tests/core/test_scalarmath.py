@@ -6,19 +6,11 @@ import itertools
 import operator
 import sys
 import warnings
-
 from unittest import expectedFailure as xfail, skipIf as skipif, SkipTest
 
 import numpy
-
-# from numpy._utils import _pep440
 import pytest
 from pytest import raises as assert_raises
-
-# from hypothesis import given, settings
-# from hypothesis.strategies import sampled_from
-# from hypothesis.extra import numpy as hynp
-
 
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -29,8 +21,9 @@ from torch.testing._internal.common_utils import (
     subtest,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
-    xpassIfTorchDynamo,
+    xpassIfTorchDynamo_np,
 )
+
 
 if TEST_WITH_TORCHDYNAMO:
     import numpy as np
@@ -47,8 +40,6 @@ else:
         assert_,
         assert_almost_equal,
         assert_equal,
-        #    assert_array_equal, suppress_warnings, _gen_alignment_data,
-        #    assert_warns,
     )
 
 
@@ -120,12 +111,12 @@ class TestTypes(TestCase):
                 assert_equal(
                     c_scalar.dtype,
                     c_array.dtype,
-                    "error with types (%d/'%s' + %d/'%s')"
-                    % (k, np.dtype(atype).name, l, np.dtype(btype).name),
+                    "error with types "
+                    f"({k:d}/'{np.dtype(atype).name}' + {l:d}/'{np.dtype(btype).name}')",
                 )
 
     def test_type_create(self):
-        for k, atype in enumerate(types):
+        for atype in types:
             a = np.array([1, 2, 3], atype)
             b = atype([1, 2, 3])
             assert_equal(a, b)
@@ -134,7 +125,7 @@ class TestTypes(TestCase):
     def test_leak(self):
         # test leak of scalar objects
         # a leak would show up in valgrind as still-reachable of ~2.6MB
-        for i in range(200000):
+        for _ in range(200000):
             np.add(1, 1)
 
 
@@ -173,7 +164,7 @@ class TestBaseMath(TestCase):
                 np.add(2, inp2, out=out)
                 assert_almost_equal(out, exp1 + 2, err_msg=msg)
 
-    @xpassIfTorchDynamo  # (reason="pytorch does not have .view")
+    @xpassIfTorchDynamo_np  # (reason="pytorch does not have .view")
     def test_lower_align(self):
         # check data that is not aligned to element size
         # i.e doubles are aligned to 4 bytes on i386
@@ -205,7 +196,7 @@ class TestPower(TestCase):
                 assert_almost_equal(b, 6765201, err_msg=msg)
 
     @skip(reason="NP_VER: fails on CI on older NumPy")
-    @xpassIfTorchDynamo  # (reason="Value-based casting: (2)**(-2) -> 0 in pytorch.")
+    @xpassIfTorchDynamo_np  # (reason="Value-based casting: (2)**(-2) -> 0 in pytorch.")
     def test_integers_to_negative_integer_power(self):
         # Note that the combination of uint64 with a signed integer
         # has common type np.float64. The other combinations should all
@@ -259,7 +250,7 @@ class TestPower(TestCase):
                 a = t1(3)
                 b = t2(2)
                 result = a**b
-                msg = f"error with {t1!r} and {t2!r}:" f"got {result!r}, expected {9!r}"
+                msg = f"error with {t1!r} and {t2!r}:got {result!r}, expected {9!r}"
                 if np.issubdtype(np.dtype(result), np.integer):
                     assert_(result == 9, msg)
                 else:
@@ -363,9 +354,9 @@ class TestModulus(TestCase):
         b = np.array(1.0, dtype=dt)
         a = np.nextafter(np.array(0.0, dtype=dt), -b)
         rem = operator.mod(a, b)
-        assert_(rem <= b, "dt: %s" % dt)
+        assert_(rem <= b, f"dt: {dt}")
         rem = operator.mod(-a, -b)
-        assert_(rem >= -b, "dt: %s" % dt)
+        assert_(rem >= -b, f"dt: {dt}")
 
         # Check nans, inf
         #     with suppress_warnings() as sup:
@@ -380,14 +371,14 @@ class TestModulus(TestCase):
             finf = np.array(np.inf, dtype=dt)
             fnan = np.array(np.nan, dtype=dt)
             rem = operator.mod(fone, fzer)
-            assert_(np.isnan(rem), "dt: %s" % dt)
+            assert_(np.isnan(rem), f"dt: {dt}")
             # MSVC 2008 returns NaN here, so disable the check.
             # rem = operator.mod(fone, finf)
             # assert_(rem == fone, 'dt: %s' % dt)
             rem = operator.mod(fone, fnan)
-            assert_(np.isnan(rem), "dt: %s" % dt)
+            assert_(np.isnan(rem), f"dt: {dt}")
             rem = operator.mod(finf, fone)
-            assert_(np.isnan(rem), "dt: %s" % dt)
+            assert_(np.isnan(rem), f"dt: {dt}")
             for op in [floordiv_and_mod, divmod]:
                 div, mod = op(fone, fzer)
                 assert_(np.isinf(div)) and assert_(np.isnan(mod))
@@ -439,7 +430,7 @@ class TestComplexDivision(TestCase):
         for t in [np.complex64, np.complex128]:
             # tupled (numerator, denominator, expected)
             # for testing as expected == numerator/denominator
-            data = list()
+            data = []
 
             # trigger branch: real(fabs(denom)) > imag(fabs(denom))
             # followed by else condition as neither are == 0
@@ -473,7 +464,7 @@ class TestConversion(TestCase):
             assert_equal([int(_m) for _m in a], li)
 
     @skipif(numpy.__version__ < "1.24", reason="NP_VER: fails on NumPy 1.23.x")
-    @xpassIfTorchDynamo  # (reason="pytorch does not emit this warning.")
+    @xpassIfTorchDynamo_np  # (reason="pytorch does not emit this warning.")
     def test_iinfo_long_values_1(self):
         for code in "bBh":
             with pytest.warns(DeprecationWarning):
@@ -576,7 +567,7 @@ class TestConversion(TestCase):
 #            assert_equal( val, val2 )
 
 
-@xpassIfTorchDynamo  # (reason="can delegate repr to pytorch")
+@xpassIfTorchDynamo_np  # (reason="can delegate repr to pytorch")
 class TestRepr(TestCase):
     def _test_type_repr(self, t):
         finfo = np.finfo(t)
@@ -739,6 +730,9 @@ class TestBitShifts(TestCase):
         # gh-2449
         dt = np.dtype(type_code)
         nbits = dt.itemsize * 8
+        if dt in (np.dtype(np.uint64), np.dtype(np.uint32), np.dtype(np.uint16)):
+            raise SkipTest("NYI: bitshift uint64")
+
         for val in [5, -5]:
             for shift in [nbits, nbits + 4]:
                 val_scl = np.array(val).astype(dt)[()]
@@ -770,7 +764,8 @@ class TestHash(TestCase):
     def test_integer_hashes(self, type_code):
         scalar = np.dtype(type_code).type
         for i in range(128):
-            assert hash(i) == hash(scalar(i))
+            if hash(i) != hash(scalar(i)):
+                raise AssertionError(f"Expected hash({i}) == hash(scalar({i}))")
 
     @parametrize("type_code", np.typecodes["AllFloat"])
     def test_float_and_complex_hashes(self, type_code):
@@ -782,12 +777,21 @@ class TestHash(TestCase):
                 val = complex(numpy_val)
             else:
                 val = float(numpy_val)
-            assert val == numpy_val
-            assert hash(val) == hash(numpy_val)
+            if val != numpy_val:
+                raise AssertionError(
+                    f"Expected val == numpy_val, got {val} vs {numpy_val}"
+                )
+            if hash(val) != hash(numpy_val):
+                raise AssertionError(
+                    f"Expected hash(val) == hash(numpy_val), got {hash(val)} vs {hash(numpy_val)}"
+                )
 
         if hash(float(np.nan)) != hash(float(np.nan)):
             # If Python distinguishes different NaNs we do so too (gh-18833)
-            assert hash(scalar(np.nan)) != hash(scalar(np.nan))
+            if hash(scalar(np.nan)) == hash(scalar(np.nan)):
+                raise AssertionError(
+                    "Expected hash(scalar(np.nan)) != hash(scalar(np.nan))"
+                )
 
     @parametrize("type_code", np.typecodes["Complex"])
     def test_complex_hashes(self, type_code):
@@ -795,7 +799,10 @@ class TestHash(TestCase):
         scalar = np.dtype(type_code).type
         for val in [np.pi + 1j, np.inf - 3j, 3j, 6.0 + 1j]:
             numpy_val = scalar(val)
-            assert hash(complex(numpy_val)) == hash(numpy_val)
+            if hash(complex(numpy_val)) != hash(numpy_val):
+                raise AssertionError(
+                    f"Expected hash(complex(numpy_val)) == hash(numpy_val), got {hash(complex(numpy_val))} vs {hash(numpy_val)}"
+                )
 
 
 @contextlib.contextmanager
@@ -852,7 +859,7 @@ class TestScalarOpsMisc(TestCase):
             operation(min, neg_1)
 
     @skipif(numpy.__version__ < "1.24", reason="NP_VER: fails on NumPy 1.23.x")
-    @xpassIfTorchDynamo  # (reason="pytorch does not warn on overflow")
+    @xpassIfTorchDynamo_np  # (reason="pytorch does not warn on overflow")
     @parametrize("dtype", "B")
     def test_scalar_unsigned_integer_overflow(self, dtype):
         val = np.dtype(dtype).type(8)
@@ -931,13 +938,19 @@ class TestScalarSubclassingMisc(TestCase):
 
         # inheritance has to override, or this is correctly lost:
         res = op(myf_simple1(1), myf_simple2(2))
-        assert type(res) == sctype or type(res) == np.bool_
-        assert op(myf_simple1(1), myf_simple2(2)) == op(1, 2)  # inherited
+        if type(res) is not sctype and type(res) is not np.bool_:
+            raise AssertionError(
+                f"Expected type(res) is sctype or np.bool_, got {type(res)}"
+            )
+        if op(myf_simple1(1), myf_simple2(2)) != op(1, 2):
+            raise AssertionError("Expected inherited op to match")  # inherited
 
         # Two independent subclasses do not really define an order.  This could
         # be attempted, but we do not since Python's `int` does neither:
-        assert op(myf_op(1), myf_simple1(2)) == __op__
-        assert op(myf_simple1(1), myf_op(2)) == op(1, 2)  # inherited
+        if op(myf_op(1), myf_simple1(2)) != __op__:
+            raise AssertionError(f"Expected op result == {__op__}")
+        if op(myf_simple1(1), myf_op(2)) != op(1, 2):
+            raise AssertionError("Expected inherited op to match")  # inherited
 
     @skip(reason="We do not support subclassing scalars.")
     @parametrize("__op__, __rop__, op, cmp", ops_with_names)
@@ -958,10 +971,12 @@ class TestScalarSubclassingMisc(TestCase):
         )
 
         # Just like normally, we should never presume we can modify the float.
-        assert op(myt(1), np.float64(2)) == __op__
-        assert op(np.float64(1), myt(2)) == __rop__
+        if op(myt(1), np.float64(2)) != __op__:
+            raise AssertionError(f"Expected op result == {__op__}")
+        if op(np.float64(1), myt(2)) != __rop__:
+            raise AssertionError(f"Expected rop result == {__rop__}")
 
-        if op in {operator.mod, operator.floordiv} and subtype == complex:
+        if op in {operator.mod, operator.floordiv} and subtype is complex:
             return  # module is not support for complex.  Do not test.
 
         if __rop__ == __op__:
@@ -973,12 +988,20 @@ class TestScalarSubclassingMisc(TestCase):
         # Check for float32, as a float subclass float64 may behave differently
         res = op(myt(1), np.float16(2))
         expected = op(subtype(1), np.float16(2))
-        assert res == expected
-        assert type(res) == type(expected)
+        if res != expected:
+            raise AssertionError(f"Expected res == {expected}, got {res}")
+        if type(res) is not type(expected):
+            raise AssertionError(
+                f"Expected type(res) is {type(expected)}, got {type(res)}"
+            )
         res = op(np.float32(2), myt(1))
         expected = op(np.float32(2), subtype(1))
-        assert res == expected
-        assert type(res) == type(expected)
+        if res != expected:
+            raise AssertionError(f"Expected res == {expected}, got {res}")
+        if type(res) is not type(expected):
+            raise AssertionError(
+                f"Expected type(res) is {type(expected)}, got {type(res)}"
+            )
 
 
 if __name__ == "__main__":

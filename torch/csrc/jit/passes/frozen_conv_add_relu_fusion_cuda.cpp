@@ -1,4 +1,3 @@
-#include <ATen/Utils.h>
 
 #include <ATen/code_template.h>
 #include <ATen/cuda/CUDAConfig.h>
@@ -8,11 +7,9 @@
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/frozen_conv_add_relu_fusion.h>
 #include <torch/csrc/jit/passes/graph_rewrite_helper.h>
-#include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/passes/subgraph_rewrite.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 namespace {
 void fuseFrozenConvAddReluImpl(std::shared_ptr<Graph>& graph) {
@@ -89,7 +86,7 @@ void fuseFrozenConvAddReluImpl(std::shared_ptr<Graph>& graph) {
     }
 
     // bias is optional
-    if (vmap.find("bias") != vmap.end()) {
+    if (vmap.contains("bias")) {
       auto bias = toIValue(match.values_map.at(vmap.at("bias")));
       if (bias.has_value() && bias.value().isTensor()) {
         const at::Tensor& bias_t = bias.value().toTensor();
@@ -101,7 +98,7 @@ void fuseFrozenConvAddReluImpl(std::shared_ptr<Graph>& graph) {
     }
 
     // z is optional
-    if (vmap.find("z") != vmap.end()) {
+    if (vmap.contains("z")) {
       auto z = toIValue(match.values_map.at(vmap.at("z")));
       if (z.has_value() && z.value().isTensor()) {
         const at::Tensor& z_t = z.value().toTensor();
@@ -131,5 +128,4 @@ auto dummyInitializer = []() {
 
 } // namespace
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

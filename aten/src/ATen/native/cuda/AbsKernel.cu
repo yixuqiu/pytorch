@@ -15,7 +15,7 @@ struct AbsFunctor {
   }
 };
 
-CONSTEXPR_EXCEPT_WIN_CUDA char abs_name[] = "abs_kernel";
+constexpr char abs_name[] = "abs_kernel";
 void abs_kernel_cuda(TensorIteratorBase& iter) {
   auto dtype = iter.dtype();
   if (at::isComplexType(dtype)) {
@@ -36,16 +36,20 @@ void abs_kernel_cuda(TensorIteratorBase& iter) {
     });
 #endif
   } else {
-    AT_DISPATCH_ALL_TYPES_AND3(
-        ScalarType::Half,
-        ScalarType::BFloat16,
-        ScalarType::Bool,
+    AT_DISPATCH_SWITCH(
         iter.dtype(),
         "abs_cuda",
-        [&]() { gpu_kernel(iter, AbsFunctor<scalar_t>()); });
+        AT_DISPATCH_CASE_ALL_TYPES_AND3(
+            ScalarType::Half,
+            ScalarType::BFloat16,
+            ScalarType::Bool,
+            [&]() { gpu_kernel(iter, AbsFunctor<scalar_t>()); })
+        AT_DISPATCH_CASE(
+            ScalarType::Float8_e5m2,
+            [&]() { gpu_kernel(iter, AbsFunctor<scalar_t>()); }));
   }
 }
 
-  REGISTER_DISPATCH(abs_stub, &abs_kernel_cuda);
+  REGISTER_DISPATCH(abs_stub, &abs_kernel_cuda)
 
 } // namespace at::native

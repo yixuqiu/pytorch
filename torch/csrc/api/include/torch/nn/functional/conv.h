@@ -3,18 +3,16 @@
 #include <torch/nn/options/conv.h>
 #include <torch/types.h>
 
-namespace torch {
-namespace nn {
-namespace functional {
+namespace torch::nn::functional {
 
 #ifndef DOXYGEN_SHOULD_SKIP_THIS
 namespace detail {
 
-inline std::string padding_unwrap(enumtype::kValid) {
+inline std::string padding_unwrap(enumtype::kValid /*unused*/) {
   return "valid";
 }
 
-inline std::string padding_unwrap(enumtype::kSame) {
+inline std::string padding_unwrap(enumtype::kSame /*unused*/) {
   return "same";
 }
 
@@ -296,6 +294,4 @@ inline Tensor conv_transpose3d(
       options.dilation());
 }
 
-} // namespace functional
-} // namespace nn
-} // namespace torch
+} // namespace torch::nn::functional

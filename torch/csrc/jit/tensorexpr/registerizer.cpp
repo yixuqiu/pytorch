@@ -6,7 +6,9 @@ namespace registerizer {
 
 // AccessInfo
 
-void AccessInfo::addStore(StorePtr store, const std::shared_ptr<Scope>& scope) {
+void AccessInfo::addStore(
+    const StorePtr& store,
+    const std::shared_ptr<Scope>& scope) {
   block_ =
       block_ ? Block::getSharedParent(block_, scope->block()) : scope->block();
 
@@ -25,9 +27,9 @@ void AccessInfo::addStore(StorePtr store, const std::shared_ptr<Scope>& scope) {
 }
 
 void AccessInfo::addLoad(
-    LoadPtr load,
+    const LoadPtr& load,
     const std::shared_ptr<Scope>& scope,
-    StmtPtr usage) {
+    const StmtPtr& usage) {
   block_ =
       block_ ? Block::getSharedParent(block_, scope->block()) : scope->block();
   first_usage_ = first_usage_ ? block_->getEnclosedRoot(first_usage_) : usage;
@@ -96,13 +98,13 @@ bool AccessInfo::overlaps(const std::shared_ptr<AccessInfo>& other) {
   return overlap;
 }
 
-bool AccessInfo::dependsOnVar(VarPtr v) {
+bool AccessInfo::dependsOnVar(const VarPtr& v) {
   VarFinder vf;
   for (const auto& i : indices_) {
     i->accept(&vf);
   }
 
-  return vf.vars().count(v);
+  return vf.vars().contains(v);
 }
 
 std::shared_ptr<AccessInfo> AccessInfo::cloneWithHiddenInfo(
@@ -129,17 +131,17 @@ std::shared_ptr<AccessInfo> AccessInfo::cloneWithHiddenInfo(
 }
 
 void AccessInfo::print() const {
-  std::cout << "Access: " << *buf_ << "{";
+  std::cout << "Access: " << *buf_ << '{';
   for (const auto& i : indices_) {
-    std::cout << *i << " ";
+    std::cout << *i << ' ';
   }
   std::cout << "} stores: " << stores_.size() << " (" << *store_cost_ << ") -";
-  std::cout << " loads: " << loads_.size() << " (" << *load_cost_ << ")";
+  std::cout << " loads: " << loads_.size() << " (" << *load_cost_ << ')';
   if (conditionId_) {
     std::cout << " cond: " << conditionId_;
   }
 
-  std::cout << "\n";
+  std::cout << '\n';
 }
 
 // Scope
@@ -148,7 +150,7 @@ void Scope::closeAccess(const std::shared_ptr<AccessInfo>& info) {
   closedAccesses_.push_back(info);
 }
 
-AccessHashMap& Scope::getAccessMapByBuf(BufPtr b) {
+AccessHashMap& Scope::getAccessMapByBuf(const BufPtr& b) {
   auto it = openAccesses_.find(b);
   if (it == openAccesses_.end()) {
     // create and return
@@ -159,17 +161,12 @@ AccessHashMap& Scope::getAccessMapByBuf(BufPtr b) {
 }
 
 void Scope::filterClosed() {
-  closedAccesses_.erase(
-      std::remove_if(
-          closedAccesses_.begin(),
-          closedAccesses_.end(),
-          [](auto info) {
-            return info->store_cost()->isConstant() &&
-                immediateAs<int>(info->store_cost()) <= 1 &&
-                info->load_cost()->isConstant() &&
-                immediateAs<int>(info->load_cost()) <= 1;
-          }),
-      closedAccesses_.end());
+  std::erase_if(closedAccesses_, [](auto info) {
+    return info->store_cost()->isConstant() &&
+        immediateAs<int>(info->store_cost()) <= 1 &&
+        info->load_cost()->isConstant() &&
+        immediateAs<int>(info->load_cost()) <= 1;
+  });
 }
 
 // RegisterizerAnalysis
@@ -177,7 +174,7 @@ void Scope::filterClosed() {
 void RegisterizerAnalysis::closeAccessIntoScope(
     const std::shared_ptr<AccessInfo>& info,
     const std::shared_ptr<Scope>& scope) {
-  if (exprConditionals_.count(info->conditionId()) != 0) {
+  if (exprConditionals_.contains(info->conditionId())) {
     return;
   }
 
@@ -188,12 +185,11 @@ void RegisterizerAnalysis::closeAccessIntoScope(
   scope->closeAccess(info);
 }
 
-void RegisterizerAnalysis::visit(ForPtr v) {
-  if (v->loop_options().is_gpu_block_index() ||
-      v->loop_options().is_gpu_thread_index()) {
-    throw malformed_input(
-        "Registerization must occur after parallelism flattening");
-  }
+void RegisterizerAnalysis::visit(const ForPtr& v) {
+  TORCH_CHECK(
+      !v->loop_options().is_gpu_block_index() &&
+          !v->loop_options().is_gpu_thread_index(),
+      "MALFORMED INPUT: Registerization must occur after parallelism flattening");
 
   auto parent = currentScope_;
   currentScope_ = std::make_shared<Scope>(v->body(), parent);
@@ -223,7 +219,7 @@ void RegisterizerAnalysis::visit(ForPtr v) {
       // possible that an access at a higher scope could "unhide" the
       // conditional access, in which case we need to hoist. If there is no
       // access to this element at a higher scope then we cannot safely hoist.
-      // We cannot know at this level whether that will or wont occur.
+      // We cannot know at this level whether that will or won't occur.
       //
       // The solution we take here is to split the space-time continuum, and
       // keep both versions of the access handy. If the hoisted access is not
@@ -270,9 +266,9 @@ void RegisterizerAnalysis::visit(ForPtr v) {
 
   // having hoisted, now we can merge normally.
   mergeCurrentScopeIntoParent();
-};
+}
 
-void RegisterizerAnalysis::visit(CondPtr v) {
+void RegisterizerAnalysis::visit(const CondPtr& v) {
   ExprPtr condition = v->condition();
   BlockPtr true_stmt = v->true_stmt();
   BlockPtr false_stmt = v->false_stmt();
@@ -289,13 +285,13 @@ void RegisterizerAnalysis::visit(CondPtr v) {
       std::make_shared<Scope>(false_stmt, prev_scope, ++conditionId_);
 
   if (true_stmt) {
-    currentScope_ = true_scope;
+    currentScope_ = std::move(true_scope);
     true_stmt->accept(this);
     mergeHiddenScope(true);
     mergeCurrentScopeIntoParent();
   }
   if (false_stmt) {
-    currentScope_ = false_scope;
+    currentScope_ = std::move(false_scope);
     false_stmt->accept(this);
     mergeHiddenScope(true);
     mergeCurrentScopeIntoParent();
@@ -312,7 +308,7 @@ void RegisterizerAnalysis::visit(CondPtr v) {
 // IfThenElses are just like Conds except they are not Stmts, which means no
 // registerization can occur internally. However, the first reference to an
 // access can occur within one if its visible outside the condition.
-void RegisterizerAnalysis::visit(IfThenElsePtr v) {
+void RegisterizerAnalysis::visit(const IfThenElsePtr& v) {
   ExprPtr condition = v->condition();
   ExprPtr true_value = v->true_value();
   ExprPtr false_value = v->false_value();
@@ -333,21 +329,21 @@ void RegisterizerAnalysis::visit(IfThenElsePtr v) {
   exprConditionals_.insert(false_scope->conditionId());
 
   if (true_value) {
-    currentScope_ = true_scope;
+    currentScope_ = std::move(true_scope);
     true_value->accept(this);
     mergeHiddenScope(false);
     mergeCurrentScopeIntoParent();
   }
 
   if (false_value) {
-    currentScope_ = false_scope;
+    currentScope_ = std::move(false_scope);
     false_value->accept(this);
     mergeHiddenScope(false);
     mergeCurrentScopeIntoParent();
   }
 }
 
-void RegisterizerAnalysis::visit(LetPtr v) {
+void RegisterizerAnalysis::visit(const LetPtr& v) {
   currentScope_->addLocalVar(v->var());
 
   stmtStack_.push_front(v);
@@ -355,7 +351,7 @@ void RegisterizerAnalysis::visit(LetPtr v) {
   stmtStack_.pop_front();
 }
 
-void RegisterizerAnalysis::visit(BlockPtr v) {
+void RegisterizerAnalysis::visit(const BlockPtr& v) {
   auto prev_scope = currentScope_;
   if (currentScope_->block() != v) {
     currentScope_ = std::make_shared<Scope>(v, prev_scope);
@@ -383,7 +379,7 @@ void RegisterizerAnalysis::visit(BlockPtr v) {
   }
 }
 
-void RegisterizerAnalysis::visit(StorePtr v) {
+void RegisterizerAnalysis::visit(const StorePtr& v) {
   stmtStack_.push_front(v);
   v->value()->accept(this);
   stmtStack_.pop_front();
@@ -437,7 +433,7 @@ void RegisterizerAnalysis::visit(StorePtr v) {
   }
 }
 
-void RegisterizerAnalysis::visit(LoadPtr v) {
+void RegisterizerAnalysis::visit(const LoadPtr& v) {
   if (v->indices().empty()) {
     // already a scalar.
     return;
@@ -520,7 +516,7 @@ void RegisterizerAnalysis::mergeHiddenScope(bool allowClosed) {
   }
 }
 
-// Merge currentScope_ into it's parent, and make parent the new currentScope_.
+// Merge currentScope_ into its parent, and make parent the new currentScope_.
 void RegisterizerAnalysis::mergeCurrentScopeIntoParent() {
   auto parent = currentScope_->parent();
 
@@ -540,7 +536,7 @@ void RegisterizerAnalysis::mergeCurrentScopeIntoParent() {
         closeAccessIntoScope(pCandidate, parent);
         parentAccesses.erase(parentIt);
 
-        // the childs access inserted into the parent scope.
+        // the children access inserted into the parent scope.
         closeAccessIntoScope(candidate, parent);
         continue;
       }
@@ -565,7 +561,7 @@ void RegisterizerAnalysis::mergeCurrentScopeIntoParent() {
       ++it;
     }
 
-    // Insert the childs closed access into the parent scope.
+    // Insert the children closed access into the parent scope.
     closeAccessIntoScope(candidate, parent);
   }
 
@@ -635,7 +631,7 @@ void RegisterizerAnalysis::mergeCurrentScopeIntoParent() {
     }
   }
 
-  currentScope_ = parent;
+  currentScope_ = std::move(parent);
 }
 
 std::vector<std::shared_ptr<AccessInfo>> RegisterizerAnalysis::getCandidates() {
@@ -649,7 +645,7 @@ std::vector<std::shared_ptr<AccessInfo>> RegisterizerAnalysis::getCandidates() {
 
 // RegisterizerReplacer
 
-ExprPtr RegisterizerReplacer::mutate(LoadPtr v) {
+ExprPtr RegisterizerReplacer::mutate(const LoadPtr& v) {
   auto it = loadToAccess_.find(v);
   if (it == loadToAccess_.end()) {
     // This access cannot be registerized.
@@ -661,8 +657,8 @@ ExprPtr RegisterizerReplacer::mutate(LoadPtr v) {
   return info->replacement().var;
 }
 
-StmtPtr RegisterizerReplacer::mutate(StorePtr v) {
-  if (eliminatedIntializers_.count(v) != 0) {
+StmtPtr RegisterizerReplacer::mutate(const StorePtr& v) {
+  if (eliminatedIntializers_.contains(v)) {
     // This store is the initializer for a scalar var that is already inserted.
     return nullptr;
   }
@@ -683,7 +679,7 @@ StmtPtr RegisterizerReplacer::mutate(StorePtr v) {
   return v;
 }
 
-StmtPtr RegisterizerReplacer::mutate(BlockPtr v) {
+StmtPtr RegisterizerReplacer::mutate(const BlockPtr& v) {
   auto& scope = parentToAccesses_[v];
 
   std::vector<StmtPtr> stmts;
@@ -732,7 +728,7 @@ void RegisterizerReplacer::buildReplacements() {
   for (auto& info : infoSet_) {
     VarPtr v = alloc<Var>(
         info->buf()->name_hint() + "_" +
-            c10::to_string(getBufferAccessCount(info->buf())),
+            std::to_string(getBufferAccessCount(info->buf())),
         info->buf()->dtype());
 
     info->replacement().var = v;

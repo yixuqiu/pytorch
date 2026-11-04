@@ -6,8 +6,7 @@
 
 #include <c10/util/irange.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 namespace {
 
 IValue deepCopy(const IValue& self) {
@@ -23,11 +22,9 @@ IValue deepCopy(const IValue& self) {
 
   // Lists of ivalues should recursively deep copy their contents
   if (self.isList()) {
-    // NOLINTNEXTLINE(performance-move-const-arg)
-    auto source = std::move(self).toList();
+    auto source = self.toList();
     auto newList = c10::impl::GenericList(source.elementType());
     newList.reserve(source.size());
-    // NOLINTNEXTLINE(performance-implicit-conversion-in-loop)
     for (const IValue& value : source) {
       newList.push_back(deepCopy(value));
     }
@@ -118,7 +115,7 @@ void checkAliases(
         AT_ASSERT(inputSet && outputSet);
         bool found = false;
         for (const auto& set : inputSet->beforeSets()) {
-          if (outputSet->beforeSets().count(set)) {
+          if (outputSet->beforeSets().contains(set)) {
             found = true;
             break;
           }
@@ -188,7 +185,7 @@ const Node* findNodeForOp(
 // Handle a few special cases where we need to propagate constants
 // manually
 // TODO(suo): we should be able to move this stuff to constant prop
-c10::optional<IValue> toIValueProp(const Value* v) {
+std::optional<IValue> toIValueProp(const Value* v) {
   if (v->node()->kind() == prim::ListConstruct) {
     std::vector<IValue> genericList;
     for (auto input : v->node()->inputs()) {
@@ -196,7 +193,7 @@ c10::optional<IValue> toIValueProp(const Value* v) {
         genericList.push_back(*elem);
       } else {
         // One of the list elements isn't constant.
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
 
@@ -204,16 +201,18 @@ c10::optional<IValue> toIValueProp(const Value* v) {
     auto listType = v->node()->output()->type();
     auto containedType = listType->containedTypes().at(0);
     if (containedType == IntType::get()) {
-      return IValue(
-          fmap(genericList, [](const IValue& v) { return v.toInt(); }));
+      return IValue(fmap(
+          std::move(genericList), [](const IValue& v) { return v.toInt(); }));
     } else if (containedType == FloatType::get()) {
-      return IValue(
-          fmap(genericList, [](const IValue& v) { return v.toDouble(); }));
+      return IValue(fmap(std::move(genericList), [](const IValue& v) {
+        return v.toDouble();
+      }));
     } else if (containedType->isSubtypeOf(*TensorType::get())) {
-      return IValue(
-          fmap(genericList, [](const IValue& v) { return v.toTensor(); }));
+      return IValue(fmap(std::move(genericList), [](const IValue& v) {
+        return v.toTensor();
+      }));
     } else {
-      return c10::nullopt;
+      return std::nullopt;
     }
   }
 
@@ -222,7 +221,7 @@ c10::optional<IValue> toIValueProp(const Value* v) {
       return maybe_stack->at(0);
     }
   }
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 // batch_norm and instance_norm have incorrect annotations, because
@@ -307,5 +306,4 @@ void checkAliasAnnotation(
   checkWrites(inputsToCheck, inputsDeepCopy);
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

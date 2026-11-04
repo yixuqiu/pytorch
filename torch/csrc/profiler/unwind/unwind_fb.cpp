@@ -1,14 +1,13 @@
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__)) && \
-    defined(__has_include) &&                                              \
-    __has_include("ext/stdio_filebuf.h") && defined(FBCODE_CAFFE2)
+    defined(FBCODE_CAFFE2)
+
 #include <c10/util/flat_hash_map.h>
 #include <llvm/DebugInfo/Symbolize/Symbolize.h>
 #include <torch/csrc/profiler/unwind/unwind.h>
 
-namespace torch {
-namespace unwind {
+namespace torch::unwind {
 
-std::vector<Frame> symbolize(const std::vector<void*>& frames) {
+std::vector<Frame> symbolize(const std::vector<void*>& frames, Mode mode) {
   static std::mutex symbolize_mutex;
   static llvm::symbolize::LLVMSymbolizer symbolizer;
   static ska::flat_hash_map<void*, Frame> frame_map_;
@@ -38,7 +37,6 @@ std::vector<Frame> symbolize(const std::vector<void*>& frames) {
   return results;
 }
 
-} // namespace unwind
-} // namespace torch
+} // namespace torch::unwind
 
 #endif

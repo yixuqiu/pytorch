@@ -1,9 +1,11 @@
+#include <ATen/core/TensorBody.h>
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/TensorOperators.h>
 #include <ATen/AccumulateType.h>
 #include <ATen/Dispatch.h>
 #include <ATen/OpMathType.h>
+#include <ATen/mps/MPSDevice.h>
 #include <ATen/native/DispatchStub.h>
 #include <ATen/NestedTensorImpl.h>
 #include <ATen/TensorIndexing.h>
@@ -11,14 +13,12 @@
 #include <ATen/native/transformers/attention.h>
 #include <ATen/native/transformers/sdp_utils_cpp.h>
 #include <c10/util/typeid.h>
-#include <c10/core/DeviceType.h>
 #include <c10/core/SymInt.h>
 #include <c10/core/SymIntArrayRef.h>
 #include <c10/util/Logging.h>
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
 
-#include <type_traits>
 #include <limits>
 #include <utility>
 
@@ -27,21 +27,24 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/_fused_sdp_choice_native.h>
+#include <ATen/ops/_fused_sdp_choice_ops.h>
 #include <ATen/ops/_masked_softmax.h>
 #include <ATen/ops/_native_multi_head_attention_native.h>
 #include <ATen/ops/_nested_from_padded.h>
 #include <ATen/ops/_nested_tensor_softmax_with_shape.h>
 #include <ATen/ops/_scaled_dot_product_attention_math.h>
+#include <ATen/ops/_scaled_dot_product_attention_math_for_mps.h>
 #include <ATen/ops/_scaled_dot_product_attention_math_native.h>
 #include <ATen/ops/_scaled_dot_product_efficient_attention.h>
 #include <ATen/ops/_scaled_dot_product_flash_attention.h>
-#include <ATen/ops/_scaled_dot_product_flash_attention_backward_native.h>
-#include <ATen/ops/_scaled_dot_product_flash_attention_native.h>
 #include <ATen/ops/_scaled_dot_product_cudnn_attention.h>
 #include <ATen/ops/_scaled_dot_product_flash_attention_for_cpu.h>
 #include <ATen/ops/_scaled_dot_product_flash_attention_for_cpu_native.h>
-#include <ATen/ops/_scaled_dot_product_flash_attention_for_cpu_backward.h>
 #include <ATen/ops/_scaled_dot_product_flash_attention_for_cpu_backward_native.h>
+#include <ATen/ops/_scaled_dot_product_fused_attention_overrideable.h>
+#include <ATen/ops/_scaled_dot_product_fused_attention_overrideable_native.h>
+#include <ATen/ops/_scaled_dot_product_fused_attention_overrideable_backward.h>
+#include <ATen/ops/_scaled_dot_product_fused_attention_overrideable_backward_native.h>
 #include <ATen/ops/_softmax.h>
 #include <ATen/ops/_transform_bias_rescale_qkv.h>
 #include <ATen/ops/_transform_bias_rescale_qkv_native.h>
@@ -60,14 +63,15 @@
 #include <ATen/ops/softmax.h>
 #include <ATen/ops/split_native.h>
 #include <ATen/ops/split_with_sizes_native.h>
+#include <ATen/ops/where.h>
 #include <ATen/ops/zeros.h>
-#include <ATen/ops/zeros_like.h>
+#include <ATen/ops/_safe_softmax.h>
+#include <ATen/ops/_safe_softmax_native.h>
+#include <ATen/ops/all.h>
 #endif
 
 #include <ATen/native/nested/NestedTensorTransformerFunctions.h>
-namespace at {
-
-namespace native {
+namespace at::native {
 
 DEFINE_DISPATCH(_fused_sdp_choice_stub);
 
@@ -106,9 +110,9 @@ Tensor bmm_nt(const Tensor& a, const Tensor& b) {
 
 Tensor masked_softmax(
     Tensor& attn_scores,
-    c10::optional<Tensor> attn_mask,
+    std::optional<Tensor> attn_mask,
     const Tensor& query,
-    c10::optional<int64_t> mask_type) {
+    std::optional<int64_t> mask_type) {
   if (query.is_nested() && !attn_mask) {
     return at::_nested_tensor_softmax_with_shape(attn_scores, query);
   }
@@ -197,7 +201,7 @@ Tensor qkv_projection(
     } else {
       // encoder-decoder attention
       // TODO: is there a more efficient way to set this up?
-      // TODO: can we stay nested insted of using cat? Probably just make a
+      // TODO: can we stay nested instead of using cat? Probably just make a
       // NestedTensor out of the matmul results or something?
       auto q_kv_weight_s =
           at::native::split_with_sizes(qkv_weight, {embed_dim, embed_dim * 2}, 0);
@@ -254,7 +258,7 @@ std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cpu(
   auto q_k_v_s =
       at::native::split(q_k_v.view({3 * B, num_head, T, dim_per_head}), B, 0);
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(q_k_v_s.size() == 3);
-  return std::make_tuple(q_k_v_s[0], q_k_v_s[1], q_k_v_s[2]);
+  return std::make_tuple(std::move(q_k_v_s[0]), std::move(q_k_v_s[1]), std::move(q_k_v_s[2]));
 }
 
 std::tuple<Tensor, Tensor> native_multi_head_attention_cpu(
@@ -267,10 +271,10 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cpu(
     const Tensor& qkv_bias,
     const Tensor& proj_weight,
     const Tensor& proj_bias,
-    const c10::optional<Tensor>& mask,
+    const std::optional<Tensor>& mask,
     bool need_weights,
     bool average_attn_weights,
-    const c10::optional<int64_t> mask_type) {
+    const std::optional<int64_t> mask_type) {
   // query shape: [B, T, D]
   // qkv_weight shape: [3 * D, D]
 
@@ -357,11 +361,8 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cpu(
   }
 #endif
   // shape: 3 x [B, num_head, T, dim_per_head]
-  auto q_k_v = _transform_bias_rescale_qkv(qkv, qkv_bias, num_head);
+  auto [q, k, v] = _transform_bias_rescale_qkv(qkv, qkv_bias, num_head);
   qkv = Tensor(); // Not used any more, allow free
-  auto& q = std::get<0>(q_k_v);
-  const auto& k = std::get<1>(q_k_v);
-  const auto& v = std::get<2>(q_k_v);
 #ifndef NDEBUG
   debug_assert_shape(__LINE__, q, {B, num_head, T, dim_per_head});
   debug_assert_shape(__LINE__, k, {B, num_head, T, dim_per_head});
@@ -409,7 +410,8 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cpu(
   // Fuse transform_0213 inside
   auto proj = transform0213_gemm_nt_bias(
       attn_ctx, proj_weight, proj_bias, query);
-#ifndef NDEBUG
+// TODO: Remove me when https://github.com/pytorch/pytorch/issues/130073 is fixed
+#if !defined(NDEBUG) && 0
   debug_assert_shape(__LINE__, proj, {B, T, D});
 #endif
   if (need_weights && average_attn_weights) {
@@ -423,8 +425,16 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cpu(
 }
 
 int64_t _fused_sdp_choice_cpp(const Tensor& query_, const Tensor& key, const Tensor& value,
-        const c10::optional<Tensor>& attn_mask_, double dropout_p, bool is_causal, c10::optional<double> scale){
-  sdp::sdp_params kernel_params{query_, key, value, attn_mask_, dropout_p, is_causal};
+        const std::optional<Tensor>& attn_mask_, double dropout_p, bool is_causal, std::optional<double> scale, bool enable_gqa){
+  auto kernel_params = sdp::normalize_unbatched_input({
+      .query = query_,
+      .key = key,
+      .value = value,
+      .attn_mask = attn_mask_,
+      .dropout = dropout_p,
+      .is_causal = is_causal,
+      .enable_gqa = enable_gqa,
+  });
   auto backend = sdp::select_sdp_backend_cpp(kernel_params);
   if (backend == sdp::SDPBackend::error) {
     TORCH_CHECK(
@@ -435,25 +445,55 @@ int64_t _fused_sdp_choice_cpp(const Tensor& query_, const Tensor& key, const Ten
   return static_cast<int64_t>(backend);
 }
 
-REGISTER_ARCH_DISPATCH(_fused_sdp_choice_stub, DEFAULT, &_fused_sdp_choice_cpp);
-REGISTER_AVX2_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp);
-REGISTER_AVX512_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp);
-REGISTER_VSX_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp);
-REGISTER_ZVECTOR_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp);
+REGISTER_ALL_CPU_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp)
+REGISTER_HPU_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_meta)
 
 int64_t _fused_sdp_choice_meta(
     const Tensor& query_,
     const Tensor& key,
     const Tensor& value,
-    const c10::optional<Tensor>& attn_mask_,
+    const std::optional<Tensor>& attn_mask_,
     double dropout_p,
     bool is_causal,
-    c10::optional<double> scale) {
-  auto query_key_set = query_.key_set();
+    std::optional<double> scale,
+    bool enable_gqa) {
+  auto kernel_params = sdp::normalize_unbatched_input({
+      .query = query_,
+      .key = key,
+      .value = value,
+      .attn_mask = attn_mask_,
+      .dropout = dropout_p,
+      .is_causal = is_causal,
+      .enable_gqa = enable_gqa,
+  });
+  auto query_key_set = kernel_params.query.key_set();
+  bool has_hpu = query_key_set.has(c10::DispatchKey::HPU);
+  if (has_hpu) {
+    auto choice_int = at::_ops::_fused_sdp_choice::redispatch(
+        c10::DispatchKeySet(DispatchKey::HPU),
+        kernel_params.query,
+        kernel_params.key,
+        kernel_params.value,
+        kernel_params.attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa);
+    return choice_int;
+  }
 #if defined(USE_ROCM)
   bool has_rocm = query_key_set.has(c10::DispatchKey::HIP);
   if (has_rocm) {
-    auto choice_int = _fused_sdp_choice_stub(at::kHIP, query_, key, value, attn_mask_, dropout_p, is_causal, scale);
+    auto choice_int = _fused_sdp_choice_stub(
+        at::kHIP,
+        kernel_params.query,
+        kernel_params.key,
+        kernel_params.value,
+        kernel_params.attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa);
     return choice_int;
   }
 #else
@@ -461,16 +501,31 @@ int64_t _fused_sdp_choice_meta(
   if (has_cuda) {
     auto choice_int = _fused_sdp_choice_stub(
         at::kCUDA,
-        query_,
-        key,
-        value,
-        attn_mask_,
+        kernel_params.query,
+        kernel_params.key,
+        kernel_params.value,
+        kernel_params.attn_mask,
         dropout_p,
         is_causal,
-        scale);
+        scale,
+        enable_gqa);
     return choice_int;
   }
 #endif
+  bool has_xpu = query_key_set.has(c10::DispatchKey::XPU);
+  if (has_xpu) {
+    auto choice_int = _fused_sdp_choice_stub(
+        at::kXPU,
+        kernel_params.query,
+        kernel_params.key,
+        kernel_params.value,
+        kernel_params.attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa);
+    return choice_int;
+  }
   return static_cast<int64_t>(sdp::SDPBackend::math);
 }
 namespace {
@@ -479,10 +534,10 @@ inline void validate_sdpa_input(
     const Tensor& query_,
     const Tensor& key,
     const Tensor& value,
-    const c10::optional<Tensor>& attn_mask_,
+    const std::optional<Tensor>& attn_mask_,
     double dropout_p,
     bool is_causal,
-    c10::optional<double> scale) {
+    std::optional<double> scale) {
   TORCH_CHECK(
       query_.dtype() == key.dtype() && query_.dtype() == value.dtype(),
       "Expected query, key, and value to have the same dtype, but got query.dtype: ",
@@ -496,9 +551,12 @@ inline void validate_sdpa_input(
       "Expected query, key, and value to all be  at least 2 dimensional, but got query.dim: ",
       query_.dim(), " key.dim: ", key.dim(), " and value.dim: ", value.dim(), " instead.");
   if (attn_mask_.has_value()){
+    TORCH_CHECK(
+      !is_causal,
+      "_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True");
     auto mask_dtype = attn_mask_->dtype();
-    TORCH_CHECK(mask_dtype == at::kBool || mask_dtype == query_.dtype(),
-      "Expected attn_mask dtype to be bool or to match query dtype, but got attn_mask.dtype: ",
+    TORCH_CHECK(mask_dtype == at::kBool || mask_dtype == at::kFloat || mask_dtype == query_.dtype(),
+      "Expected attn_mask dtype to be bool or float or to match query dtype, but got attn_mask.dtype: ",
       mask_dtype, " and  query.dtype: ", query_.dtype(), " instead.");
     TORCH_CHECK(
       !query_.is_nested() && !key.is_nested(),
@@ -512,23 +570,21 @@ inline void validate_sdpa_input(
 // the math and memory efficient attn_mask implementation
 //  Args:
 //    attn_mask: attn_mask of shape (B, L, S) or (L, S) or (B, N_heads, L, S)
-c10::optional<Tensor> convert_boolean_attn_mask(const c10::optional<Tensor>& attn_mask, caffe2::TypeMeta dtype) {
+std::optional<Tensor> convert_boolean_attn_mask(const std::optional<Tensor>& attn_mask, caffe2::TypeMeta dtype) {
   // Pass through
-  if(!attn_mask.has_value()){
-    return c10::nullopt;
+  if (!attn_mask.has_value()) {
+    return std::nullopt;
   }
   // Convert boolean mask to additive mask; need to invert mask to indicate what
   // to mask *out*.
   if (attn_mask->dtype() == at::kBool) {
-    auto new_attn_mask = at::zeros_like(attn_mask.value(), dtype);
-    // TODO Use the max type of the input and output
-    new_attn_mask.masked_fill_(
-        attn_mask->logical_not(), -std::numeric_limits<double>::infinity());
-    return new_attn_mask;
+    constexpr double neg_inf = -std::numeric_limits<double>::infinity();
+    return at::where(*attn_mask, 0.0, at::scalar_tensor(neg_inf, at::TensorOptions().dtype(dtype).device(attn_mask->device())));
   }
   // Otherwise, attn_mask represents an additive attention tensor
   return attn_mask;
 }
+
 // Memory Efficient Attention requires a padded attn mask bias
 // This function pads the attn_mask bias to be a multiple of 16
 // Then slices the padded bias to the original size
@@ -538,7 +594,13 @@ c10::optional<Tensor> convert_boolean_attn_mask(const c10::optional<Tensor>& att
 template<int alignment>
 bool aligned_tensor(const at::Tensor& tensor){
   for(const auto i : c10::irange(tensor.dim() - 1)){
-    if(tensor.sym_stride(i) % alignment != 0){
+    auto stride = tensor.sym_stride(i).maybe_as_int();
+    // If the stride is unknown at compilation time, assume it is unaligned
+    // and always pad it. This is helpful to avoid unnecessary guards.
+    if (!stride)
+      return false;
+
+    if((*stride) % alignment != 0){
       return false;
     }
   }
@@ -574,18 +636,34 @@ at::Tensor preprocess_mask(
 // This causes the kernel to maybe alias query, key, value
 // So instead we pad the head_dimensions to be a multiple of 8 in the composite
 // region
-template <int alignment_size, bool slice>
-at::Tensor pad_last_dim(const at::Tensor& attn_bias) {
+at::Tensor pad_last_dim(const at::Tensor& attn_bias, int alignment_size) {
   auto last_dim_size = attn_bias.sym_size(-1);
   if (last_dim_size % alignment_size == 0) {
     return attn_bias;
   }
   auto pad_count = alignment_size - (last_dim_size % alignment_size);
-  auto padded_bias = at::pad_symint(attn_bias, {c10::SymInt(0), pad_count});
-  if (slice) {
-    return padded_bias.slice_symint(-1, 0, last_dim_size);
+  return at::pad_symint(attn_bias, {c10::SymInt(0), pad_count});
+}
+
+// Flash and cuDNN attention kernels issue 16-byte vectorized global memory
+// accesses at every row. Copy misaligned inputs (e.g. views at odd storage
+// offsets) instead of falling back to a slower backend.
+at::Tensor align_for_fused_attention(const at::Tensor& tensor, bool check_strides = true) {
+  if (tensor.is_nested() || sdp::is_aligned_for_sdpa(tensor, 16, check_strides)) {
+    return tensor;
   }
-  return padded_bias;
+  // Copy only the distinct elements of expanded dims, keeping the input's dim
+  // order so the output layout matches the aligned case. Tensors that require
+  // grad are copied in full so each element keeps its own gradient.
+  auto compact = tensor;
+  for (const auto dim : c10::irange(tensor.dim())) {
+    if (!tensor.requires_grad() && TORCH_GUARD_OR_FALSE(tensor.sym_stride(dim).sym_eq(0)) &&
+        TORCH_GUARD_OR_FALSE(tensor.sym_size(dim).sym_gt(1))) {
+      compact = compact.narrow_symint(dim, 0, 1);
+    }
+  }
+  auto copy = compact.clone(at::MemoryFormat::Preserve);
+  return compact.is_same(tensor) ? copy : copy.expand_symint(tensor.sym_sizes());
 }
 
 at::Tensor post_process_flash_output(
@@ -597,29 +675,85 @@ at::Tensor post_process_flash_output(
   return out;
 }
 
-int64_t handle_private_use(const Tensor& query_, const Tensor& key, const Tensor& value,
-    const c10::optional<Tensor>& attn_mask_, double dropout_p, bool is_causal, c10::optional<double> scale){
-  int64_t choice_int = static_cast<int64_t>(sdp::SDPBackend::math);
-  try {
-    choice_int = _fused_sdp_choice_stub(query_.device().type(),
-        query_, key, value, attn_mask_, dropout_p, is_causal, scale);
-  } catch(const ::c10::Error& e){
+bool should_compute_logsumexp(const Tensor& query, const Tensor& key, const Tensor& value) {
+  const bool any_inputs_require_grad = query.requires_grad() || key.requires_grad() || value.requires_grad();
+  const bool gradmode_enabled = at::GradMode::is_enabled();
+  return any_inputs_require_grad && gradmode_enabled;
+}
+
+bool should_compute_logsumexp_with_attn_mask(
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const std::optional<Tensor>& attn_mask) {
+  const bool any_inputs_require_grad = query.requires_grad() ||
+      key.requires_grad() || value.requires_grad() ||
+      (attn_mask.has_value() && attn_mask->requires_grad());
+  const bool gradmode_enabled = at::GradMode::is_enabled();
+  return any_inputs_require_grad && gradmode_enabled;
+}
+
+std::tuple<at::Tensor, at::Tensor> pre_process_group_query_attention_input(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const bool enable_gqa) {
+
+  if (!enable_gqa) {
+    return std::make_tuple(key, value);
   }
-  return choice_int;
+  const auto q_num_heads = query.sym_size(-3);
+  const auto k_num_heads = key.sym_size(-3);
+  const auto v_num_heads = value.sym_size(-3);
+
+  const auto all_equal = q_num_heads.sym_eq(k_num_heads).sym_and(
+      k_num_heads.sym_eq(v_num_heads));
+  if (TORCH_GUARD_OR_FALSE(all_equal)) {
+    return std::make_tuple(key, value);
+  }
+
+  // For unbacked head counts, take the general repeat path and defer the
+  // divisibility requirements to runtime instead of guarding on their values.
+  TORCH_SYM_CHECK(
+      k_num_heads.sym_gt(0).sym_and(v_num_heads.sym_gt(0)),
+      "Number of heads in key and value must be greater than 0");
+  TORCH_SYM_CHECK(
+      (q_num_heads % k_num_heads)
+          .sym_eq(0)
+          .sym_and((q_num_heads % v_num_heads).sym_eq(0)),
+      "Number of heads in key and value must divide the number of heads in query");
+
+  auto repeat_key_shape = q_num_heads / k_num_heads;
+  auto repeat_value_shape = q_num_heads / v_num_heads;
+
+  at::Tensor key_repeated = key.repeat_interleave_symint(repeat_key_shape, -3);
+  at::Tensor value_repeated = value.repeat_interleave_symint(repeat_value_shape, -3);
+  return std::make_tuple(std::move(key_repeated), std::move(value_repeated));
 }
 
 } // namespace
 
+Tensor _safe_softmax(
+    const Tensor& self,
+    int64_t dim,
+    std::optional<ScalarType> dtype) {
+  auto out = at::softmax(self, dim, dtype);
+  const auto masked = self.isneginf();
+  const auto masked_rows = all(masked, dim, true);
+  const auto zero = at::scalar_tensor(0.0, at::TensorOptions().dtype(out.dtype()).device(out.device()));
+  // reuse storage for out
+  return at::where_out(out, masked_rows, zero, out);
+}
 // Computes scaled dot product attention on query, key and value tensors, using
 // an optional attention mask if passed, and applying dropout if a probability
 // greater than 0.0 is specified.
 //
 // Args:
-//     query (Tensor): Query tensor; shape (N, ..., L, E)
-//     key (Tensor): Key tensor; shape (N, ..., S, E)
-//     value (Tensor): Value tensor; shape (N, ..., S, E)
+//     query (Tensor): Query tensor; shape (N, ..., Hq, L, E)
+//     key (Tensor): Key tensor; shape (N, ..., H, S, E)
+//     value (Tensor): Value tensor; shape (N, ..., H, S, Ev)
 //     attn_mask (optional Tensor): Attention mask; shape must be broadcastable to the shape of attention weights,
-//         which is (N,..., L, S). Two types of masks are supported.
+//         which is (N,..., Hq, L, S). Two types of masks are supported.
 //         A boolean mask where a value of True indicates that the element *should* take part in attention.
 //         A float mask of the same type as query, key, value that is added to the attention score.
 //     dropout_p (float): Dropout probability; if greater than 0.0, dropout is applied
@@ -631,75 +765,146 @@ int64_t handle_private_use(const Tensor& query_, const Tensor& key, const Tensor
 //         sparse masks) via tensor subclassing, allowing for a leaner API.
 //
 // Returns a tensor:
-//     output (Tensor): Attention output; shape (N, ..., L, E)
+//     output (Tensor): Attention output; shape (N, ..., Hq, L, Ev)
 //
 // Shape legend:
 //     N: Batch size
 //     ...: Any number of other batch dimensions (optional)
 //     S: Source sequence length
 //     L: Target sequence length
-//     E: Embedding dimension
+//     E: Embedding dimension of the query and key
+//     Ev: Embedding dimension of the value
+//     Hq: Number of heads of query
+//     H: Number of heads of key and value
 Tensor scaled_dot_product_attention(
     const Tensor& query_,
     const Tensor& key,
     const Tensor& value,
-    const c10::optional<Tensor>& attn_mask_,
+    const std::optional<Tensor>& attn_mask_,
     double dropout_p,
     bool is_causal,
-    c10::optional<double> scale) {
-  validate_sdpa_input(query_, key, value, attn_mask_, dropout_p, is_causal, scale);
-  int64_t choice_int = static_cast<int64_t>(sdp::SDPBackend::math);
-  if (query_.device().type() == DeviceType::CUDA
-      || query_.device().type() == DeviceType::CPU
-      || query_.device().type() == DeviceType::HIP
-      || query_.device().type() == DeviceType::PrivateUse1){
-    if (query_.device().type() == DeviceType::PrivateUse1){
-      choice_int = handle_private_use(
-          query_, key, value, attn_mask_, dropout_p, is_causal, scale);
-    } else {
-      choice_int = _fused_sdp_choice_stub(query_.device().type(),
-          query_, key, value, attn_mask_, dropout_p, is_causal, scale);
+    std::optional<double> scale,
+    bool enable_gqa) {
+  // Give fused backends a batch dimension for unbatched inputs.
+  if (query_.dim() == 3) {
+    auto normalized_params = sdp::normalize_unbatched_input({
+        .query = query_,
+        .key = key,
+        .value = value,
+        .attn_mask = attn_mask_,
+        .dropout = dropout_p,
+        .is_causal = is_causal,
+        .enable_gqa = enable_gqa,
+    });
+    if (normalized_params.query.dim() != query_.dim()) {
+      return at::native::scaled_dot_product_attention(
+                 normalized_params.query,
+                 normalized_params.key,
+                 normalized_params.value,
+                 normalized_params.attn_mask,
+                 dropout_p,
+                 is_causal,
+                 scale,
+                 enable_gqa)
+          .squeeze(0);
     }
   }
-  sdp::SDPBackend backend = static_cast<sdp::SDPBackend>(choice_int);
-  c10::optional<Tensor> attn_mask = convert_boolean_attn_mask(attn_mask_, query_.dtype());
+
+  using sdp::SDPBackend;
+  validate_sdpa_input(query_, key, value, attn_mask_, dropout_p, is_causal, scale);
+  // NB: This op is CompositeImplicitAutograd -- autograd traces through the
+  // implementation rather than using an explicit backward formula.
+  // Return early when the output is truly empty or softmax is undefined.
+  // We guard on value.numel()==0 (covers B, H, L_k, or head_dim_v being 0)
+  // and on L_q==0 (the one output dimension not present in value).
+  // When only head_dim_qk is 0, the result is well-defined (uniform attention)
+  // and falls through to the math backend.
+  // We use the sum()*0 trick (same pattern as _batch_norm_impl_index in
+  // Normalization.cpp) to make the output depend on all inputs so that
+  // backward() produces correctly-shaped zero gradients instead of None.
+  // For nested tensors, dim -2 is irregular so sym_size(-2) is unavailable.
+  // Fall back to checking query numel for nested tensors.
+  if (TORCH_GUARD_OR_FALSE(value.sym_numel().sym_eq(0)) ||
+      (query_.is_nested()
+          ? TORCH_GUARD_OR_FALSE(query_.sym_numel().sym_eq(0))
+          : TORCH_GUARD_OR_FALSE(query_.sym_size(-2).sym_eq(0)))) {
+    auto output_shape = query_.sym_sizes().vec();
+    output_shape[output_shape.size() - 1] = value.sym_size(-1);
+    auto out = at::zeros_symint(output_shape, query_.options());
+    return out + (query_.sum() + key.sum() + value.sum()) * 0;
+  }
+  int64_t choice_int = static_cast<int64_t>(sdp::SDPBackend::math);
+  if (_fused_sdp_choice_stub.is_device_supported(query_.device().type())) {
+    choice_int = _fused_sdp_choice_stub(query_.device().type(),
+          query_, key, value, attn_mask_, dropout_p, is_causal, scale, enable_gqa);
+  }
+  const auto query_device_type = query_.device().type();
+  const auto backend = static_cast<SDPBackend>(choice_int);
+  auto attn_mask = convert_boolean_attn_mask(attn_mask_, query_.dtype());
   switch (backend) {
-    case sdp::SDPBackend::cudnn_attention: {
-      bool compute_logsumexp =
-          (query_.requires_grad() || key.requires_grad() ||
-           value.requires_grad());
+    case SDPBackend::cudnn_attention: {
+      // cuDNN SDPA backward does not support an attn_bias gradient.
+      bool compute_logsumexp = should_compute_logsumexp(query_, key, value);
+      if (attn_mask.has_value()) {
+        attn_mask = align_for_fused_attention(*attn_mask, /*check_strides=*/false);
+      }
       auto out_lse_softmax = at::_scaled_dot_product_cudnn_attention(
-          query_, key, value, dropout_p, is_causal, compute_logsumexp, scale);
-      return std::get<0>(out_lse_softmax);
+          align_for_fused_attention(query_), align_for_fused_attention(key), align_for_fused_attention(value),
+          attn_mask, compute_logsumexp, dropout_p, is_causal, false /*return_debug_mask*/, scale);
+      return std::get<0>(std::move(out_lse_softmax));
     }
-    case sdp::SDPBackend::flash_attention: {
-      if(query_.device().type() == DeviceType::CUDA){
-        c10::SymInt og_size = query_.sym_size(-1);
-        Tensor query_padded = pad_last_dim<8, false>(query_);
-        Tensor key_padded = pad_last_dim<8, false>(key);
-        Tensor value_padded = pad_last_dim<8, false>(value);
+    case SDPBackend::flash_attention: {
+      if(query_device_type == DeviceType::CUDA ||
+         query_device_type == DeviceType::XPU) {
+        c10::SymInt og_size = value.sym_size(-1);
+        int alignment_size = (query_device_type == DeviceType::XPU) ? 1 : 8;
+        Tensor query_padded = pad_last_dim(query_, alignment_size);
+        Tensor key_padded = pad_last_dim(key, alignment_size);
+        Tensor value_padded = pad_last_dim(value, alignment_size);
+        if (query_device_type == DeviceType::CUDA) {
+          query_padded = align_for_fused_attention(query_padded);
+          key_padded = align_for_fused_attention(key_padded);
+          value_padded = align_for_fused_attention(value_padded);
+        }
         // We need to calculate the scale based off the OG head dim size
         auto og_scale = sdp::calculate_scale(query_, scale);
         auto out_lse_softmax = at::_scaled_dot_product_flash_attention(
-            query_padded, key_padded, value_padded, dropout_p, is_causal, false /*return_debug_mask*/, og_scale.as_float_unchecked());
+            query_padded, key_padded, value_padded, dropout_p, is_causal, false /*return_debug_mask*/, og_scale.guard_float("attention.cpp", 735));
         return post_process_flash_output(std::get<0>(out_lse_softmax), og_size);
       }
       // For the CPU case we do not need to pad the last dim
       return std::get<0>(at::_scaled_dot_product_flash_attention_for_cpu(
           query_, key, value, dropout_p, is_causal, attn_mask, scale));
     }
-    case sdp::SDPBackend::efficient_attention: {
-      bool compute_logsumexp =
-          (query_.requires_grad() || key.requires_grad() ||
-           value.requires_grad());
+    case SDPBackend::efficient_attention: {
       if (attn_mask.has_value()) {
-        attn_mask.value() = preprocess_mask(attn_mask.value(), query_, key, value);;
+        attn_mask.value() = preprocess_mask(attn_mask.value(), query_, key, value);
       }
+      bool compute_logsumexp = should_compute_logsumexp_with_attn_mask(
+          query_, key, value, attn_mask);
       auto out_and_lse = at::_scaled_dot_product_efficient_attention(
           query_, key, value, attn_mask, compute_logsumexp, dropout_p, is_causal, scale);
-      return std::get<0>(out_and_lse);
+      return std::get<0>(std::move(out_and_lse));
     }
-    case sdp::SDPBackend::math:
+    case SDPBackend::overrideable: {
+      auto out_lse_softmax = at::_scaled_dot_product_fused_attention_overrideable(
+          query_, key, value, attn_mask, dropout_p, is_causal, false /*return_debug_mask*/, scale);
+      return std::get<0>(std::move(out_lse_softmax));
+    }
+    case SDPBackend::math: {
+      const bool any_inputs_require_grad = query_.requires_grad() || key.requires_grad() || value.requires_grad();
+      if (query_device_type == c10::kMPS && !(at::GradMode::is_enabled() && any_inputs_require_grad)) {
+        return std::get<0>(at::_scaled_dot_product_attention_math_for_mps(
+            query_,
+            key,
+            value,
+            attn_mask,
+            dropout_p,
+            is_causal,
+            std::nullopt, /*dropout_mask*/
+            scale,
+            enable_gqa));
+      }
       return std::get<0>(at::_scaled_dot_product_attention_math(
           query_,
           key,
@@ -707,20 +912,21 @@ Tensor scaled_dot_product_attention(
           attn_mask,
           dropout_p,
           is_causal,
-          c10::nullopt, /*dropout_mask*/
-          scale));
+          std::nullopt, /*dropout_mask*/
+          scale,
+          enable_gqa));
+    }
     default:
       TORCH_CHECK(
           false,
           "No viable backend for scaled_dot_product_attention was found.");
-      return Tensor();
   }
 }
 
 std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math(
         const Tensor& query_, const Tensor& key, const Tensor& value,
-        const c10::optional<Tensor>& attn_mask_, double dropout_p, bool is_causal,
-        const c10::optional<Tensor>& dropout_mask, c10::optional<double> scale) {
+        const std::optional<Tensor>& attn_mask_, double dropout_p, bool is_causal,
+        const std::optional<Tensor>& dropout_mask, std::optional<double> scale, bool enable_gqa) {
   C10_LOG_API_USAGE_ONCE("torch.sdpa.math_fallback");
   if (query_.is_nested() || key.is_nested() || value.is_nested()) {
     TORCH_CHECK(
@@ -728,26 +934,63 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math(
             value.is_contiguous(),
         "scaled_dot_product_attention: If inputs are nested tensors they must be contiguous");
   }
-    auto attn_mask = attn_mask_;
-    // Naive, composite implementation defined here.
+  auto& ctx = at::globalContext();
+  auto origin_dtype = query_.scalar_type();
+  // Keep query, key, value in high precision for accuracy
+  // NestedTensor reports issues for backward with autograd so disabled: must be
+  // contiguous to get buffer.
+  auto query_acc = !ctx.allowFP16BF16ReductionMathSDP() &&
+          (query_.scalar_type() == at::kHalf ||
+           query_.scalar_type() == at::kBFloat16) &&
+          !query_.is_nested()
+      ? query_.to(at::kFloat)
+      : query_;
+  auto key_acc = !ctx.allowFP16BF16ReductionMathSDP() &&
+          (key.scalar_type() == at::kHalf ||
+           key.scalar_type() == at::kBFloat16) &&
+          !key.is_nested()
+      ? key.to(at::kFloat)
+      : key;
+  auto value_acc = !ctx.allowFP16BF16ReductionMathSDP() &&
+          (value.scalar_type() == at::kHalf ||
+           value.scalar_type() == at::kBFloat16) &&
+          !value.is_nested()
+      ? value.to(at::kFloat)
+      : value;
+  auto attn_mask = attn_mask_;
+  // Naive, composite implementation defined here.
 
-    // Scale q, k before matmul for stability see https://tinyurl.com/sudb9s96 for math
-    bool is_negative_scaling = scale.has_value() && scale.value() < 0.0;
-    const auto scaling_factor = sdp::calculate_scale(query_, is_negative_scaling ? std::abs(scale.value()) : scale).sqrt();
+  // Scale q, k before matmul for stability see https://tinyurl.com/sudb9s96 for
+  // math
+  bool is_negative_scaling = scale.has_value() && scale.value() < 0.0;
+  const auto scaling_factor =
+      sdp::calculate_scale(
+          query_acc, is_negative_scaling ? std::abs(scale.value()) : scale)
+          .sqrt();
 
-    const auto query = query_ * (is_negative_scaling ? c10::SymFloat(0.0) - scaling_factor: scaling_factor);
-    if (is_causal) {
-        TORCH_CHECK(!attn_mask.has_value(),
-                "_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True");
-        TORCH_CHECK(!query.is_nested() && !key.is_nested(),
-                "_scaled_dot_product_attention: Nested tensors for query / key are not supported when is_causal=True");
+  const auto query = query_acc *
+      (is_negative_scaling ? c10::SymFloat(0.0) - scaling_factor
+                           : scaling_factor);
+  if (is_causal) {
+    TORCH_CHECK(
+        !attn_mask.has_value(),
+        "_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True");
+    TORCH_CHECK(
+        !query.is_nested() && !key_acc.is_nested(),
+        "_scaled_dot_product_attention: Nested tensors for query / key are not supported when is_causal=True");
 
-        // Replace attn_mask with causal mask; lower triangular elements take part in attention.
-        const auto L = query.sym_size(-2), S = key.sym_size(-2);
-        attn_mask = at::ones_symint({L, S}, query.options().dtype(at::kBool)).tril();
-        attn_mask = convert_boolean_attn_mask(attn_mask, query.dtype());
+    // Replace attn_mask with causal mask; lower triangular elements take part
+    // in attention.
+    const auto L = query.sym_size(-2), S = key_acc.sym_size(-2);
+    attn_mask =
+        at::ones_symint({L, S}, query.options().dtype(at::kBool)).tril();
+    attn_mask = convert_boolean_attn_mask(attn_mask, query.dtype());
     }
-    auto attn = at::matmul(query, key.transpose(-2, -1) * scaling_factor);
+
+
+    // MQA/GQA handling
+    auto [key_expanded, value_expanded] = pre_process_group_query_attention_input(query, key_acc, value_acc, enable_gqa);
+    auto attn = at::matmul(query, key_expanded.transpose(-2, -1) * scaling_factor);
     if (attn_mask.has_value()) {
       if (at::areAnyTensorSubclassLike({attn, *attn_mask})) {
         attn = attn.add(*attn_mask);
@@ -755,7 +998,7 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math(
         attn.add_(*attn_mask);
       }
     }
-    attn = at::softmax(attn, -1);
+    attn = at::_safe_softmax(attn, -1);
     if (dropout_p > 0.0) {
       if (dropout_mask.has_value()) {
         // In order to validate the correctness of the fused kernels, we need to
@@ -763,13 +1006,13 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math(
         TORCH_WARN_ONCE("Dropout mask should only be used for testing purposes.");
         attn = attn.masked_fill(dropout_mask->logical_not(), 0.0);
         auto dropout_scaling = 1.0 / (1 - dropout_p);
-        return std::make_tuple(at::matmul(attn, value * dropout_scaling), attn);
+        return std::make_tuple(at::matmul(attn, value_expanded * dropout_scaling).to(origin_dtype), attn.to(origin_dtype));
       } else {
         attn = at::dropout(attn, dropout_p, true);
       }
     }
 
-    return std::make_tuple(at::matmul(attn, value), attn);
+    return std::make_tuple(at::matmul(attn, value_expanded).to(origin_dtype), attn.to(origin_dtype));
 }
 
 std::tuple<at::Tensor, at::Tensor>
@@ -779,13 +1022,12 @@ _scaled_dot_product_flash_attention_cpu(
     const Tensor& value,
     double dropout_p,
     bool is_causal,
-    const c10::optional<Tensor>& attn_mask,
-    c10::optional<double> scale) {
+    const std::optional<Tensor>& attn_mask,
+    std::optional<double> scale) {
   const auto dtype = query.scalar_type();
   int64_t batchSize = query.size(0);
   int64_t qSize = query.size(2);
   int64_t num_head = query.size(1);
-  int64_t headSize = query.size(3);
 
   TORCH_CHECK(c10::isFloatingType(dtype),
     "scaled_dot_product_attention_flash_attention: Expected data type in FP32, FP64, BF16, FP16, but got ", dtype, " instead.");
@@ -796,13 +1038,14 @@ _scaled_dot_product_flash_attention_cpu(
   TORCH_CHECK((query.size(3) == value.size(3)) && (key.size(3) == value.size(3)),
     "scaled_dot_product_attention_flash_attention: Q/K/V should have the same head size");
   TORCH_CHECK(!attn_mask.has_value() ||
+          attn_mask.value().scalar_type() == at::kFloat ||
           dtype == attn_mask.value().scalar_type(),
     "scaled_dot_product_attention_flash_attention: Attention mask is the same data type as query");
   TORCH_CHECK(!attn_mask.has_value() ||
           (attn_mask.value().dim() == 2 || attn_mask.value().dim() == 4),
     "scaled_dot_product_attention_flash_attention: Attention mask dim in {2, 4}");
 
-  at::Tensor output = at::empty({batchSize, qSize, num_head, headSize}, query.options());
+  at::Tensor output = at::empty_like(query, query.options()).transpose(1, 2);
   const auto accumulate_dtype = toOpMathType(dtype);
   at::Tensor logsumexp = at::empty({batchSize, qSize, num_head},
       query.options().dtype(accumulate_dtype));
@@ -826,8 +1069,8 @@ _scaled_dot_product_flash_attention_cpu_backward(
     const Tensor& logsumexp,
     double dropout_p,
     bool is_causal,
-    const c10::optional<Tensor>& attn_mask,
-    c10::optional<double> scale) {
+    const std::optional<Tensor>& attn_mask,
+    std::optional<double> scale) {
   if (!grad_out.defined()) {
     return std::make_tuple(Tensor{}, Tensor{}, Tensor{});
   }
@@ -853,6 +1096,41 @@ _scaled_dot_product_flash_attention_cpu_backward(
   return std::make_tuple(std::move(grad_q), std::move(grad_k), std::move(grad_v));
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, c10::SymInt, c10::SymInt, at::Tensor, at::Tensor, at::Tensor>
+_scaled_dot_product_fused_attention_overrideable(
+    const at::Tensor & query,
+    const at::Tensor & key,
+    const at::Tensor & value,
+    const std::optional<at::Tensor> & attn_bias,
+    double dropout_p,
+    bool is_causal,
+    bool return_debug_mask,
+    std::optional<double> scale) {
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "_scaled_dot_product_fused_attention_overrideable not implemented. This is an operator for privateuse1 backends, please use TORCH_LIBRARY_IMPL to override this function ");
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+_scaled_dot_product_fused_attention_overrideable_backward(
+    const at::Tensor & grad_out,
+    const at::Tensor & query,
+    const at::Tensor & key,
+    const at::Tensor & value,
+    const at::Tensor & attn_bias,
+    std::array<bool,4> grad_input_mask,
+    const at::Tensor & out,
+    const at::Tensor & logsumexp,
+    const at::Tensor & cum_seq_q,
+    const at::Tensor & cum_seq_k,
+    int64_t max_q,
+    int64_t max_k,
+    double dropout_p,
+    bool is_causal,
+    const at::Tensor & philox_seed,
+    const at::Tensor & philox_offset,
+    std::optional<double> scale) {
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "_scaled_dot_product_fused_attention_overrideable_backward not implemented: This is an operator for privateuse1 backends, please use TORCH_LIBRARY_IMPL to override this function ");
+}
+
 Tensor triton_multi_head_attention(
     const Tensor& query,
     const Tensor& key,
@@ -863,7 +1141,7 @@ Tensor triton_multi_head_attention(
     const Tensor& qkv_bias,
     const Tensor& proj_weight,
     const Tensor& proj_bias,
-    const c10::optional<Tensor>& mask) {
+    const std::optional<Tensor>& mask) {
   // query shape: [B, T, D]
   // qkv_weight shape: [3 * D, D]
   TORCH_CHECK(!mask, "Only causal mask is supported for Triton.");
@@ -951,5 +1229,4 @@ Tensor triton_multi_head_attention(
 #endif
   return proj;
 }
-} // namespace native
-} // namespace at
+} // namespace at::native

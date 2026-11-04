@@ -5,8 +5,7 @@
 #include <torch/enum.h>
 #include <torch/types.h>
 
-namespace torch {
-namespace nn {
+namespace torch::nn {
 
 /// Options for the `L1Loss` module.
 ///
@@ -132,7 +131,7 @@ struct TORCH_API BCELossOptions {
       reduction_t;
 
   /// A manual rescaling weight given to the loss of each batch element.
-  TORCH_ARG(Tensor, weight) = {};
+  TORCH_ARG(Tensor, weight);
   /// Specifies the reduction to apply to the output.
   /// ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``
   TORCH_ARG(reduction_t, reduction) = torch::kMean;
@@ -208,7 +207,7 @@ struct TORCH_API MultiMarginLossOptions {
   /// A manual rescaling weight given to each
   /// class. If given, it has to be a Tensor of size `C`. Otherwise, it is
   /// treated as if having all ones.
-  TORCH_ARG(Tensor, weight) = Tensor();
+  TORCH_ARG(Tensor, weight);
   /// Specifies the reduction to apply to the output:
   /// ``'none'`` | ``'mean'`` | ``'sum'``. ``'none'``: no reduction will be
   /// applied,
@@ -366,7 +365,7 @@ struct TORCH_API MultiLabelSoftMarginLossOptions {
   /// A manual rescaling weight given to each
   /// class. If given, it has to be a Tensor of size `C`. Otherwise, it is
   /// treated as if having all ones.
-  TORCH_ARG(Tensor, weight) = Tensor();
+  TORCH_ARG(Tensor, weight);
 
   /// Specifies the reduction to apply to the output: 'none' | 'mean' | 'sum'.
   /// 'none': no reduction will be applied, 'mean': the sum of the output will
@@ -450,8 +449,8 @@ struct TORCH_API TripletMarginWithDistanceLossOptions {
   /// Specifies a nonnegative, real-valued function that quantifies the
   /// closeness of two tensors. If not specified, `F::pairwise_distance` will
   /// be used. Default: nullopt
-  TORCH_ARG(c10::optional<distance_function_t>, distance_function) =
-      c10::nullopt;
+  TORCH_ARG(std::optional<distance_function_t>, distance_function) =
+      std::nullopt;
   /// Specifies a nonnegative margin representing the minimum difference
   /// between the positive and negative distances required for the loss to be 0.
   /// Larger margins penalize cases where the negative examples are not distance
@@ -548,7 +547,7 @@ struct TORCH_API SmoothL1LossOptions {
   /// Specifies the threshold at which to change between L1 and L2 loss.
   /// If beta is not specified, a value of 1.0 will be used.
   /// Default: nullopt
-  TORCH_ARG(c10::optional<double>, beta) = c10::nullopt;
+  TORCH_ARG(std::optional<double>, beta) = std::nullopt;
 };
 
 namespace functional {
@@ -698,7 +697,7 @@ struct TORCH_API NLLLossOptions {
   /// A manual rescaling weight given to each
   /// class. If given, it has to be a Tensor of size `C`. Otherwise, it is
   /// treated as if having all ones.
-  TORCH_ARG(Tensor, weight) = {};
+  TORCH_ARG(Tensor, weight);
   /// Specifies a target value that is ignored
   /// and does not contribute to the input gradient.
   TORCH_ARG(int64_t, ignore_index) = -100;
@@ -736,7 +735,7 @@ struct TORCH_API CrossEntropyLossOptions {
 
   /// A manual rescaling weight given to each class. If given, has to be a
   /// Tensor of size C
-  TORCH_ARG(Tensor, weight) = {};
+  TORCH_ARG(Tensor, weight);
   /// Specifies a target value that is ignored
   /// and does not contribute to the input gradient.
   TORCH_ARG(int64_t, ignore_index) = -100;
@@ -775,12 +774,12 @@ struct TORCH_API BCEWithLogitsLossOptions {
       reduction_t;
   /// A manual rescaling weight given to the loss of each batch element.
   /// If given, has to be a Tensor of size `nbatch`.
-  TORCH_ARG(Tensor, weight) = {};
+  TORCH_ARG(Tensor, weight);
   /// Specifies the reduction to apply to the output. Default: Mean
   TORCH_ARG(reduction_t, reduction) = torch::kMean;
   /// A weight of positive examples.
   /// Must be a vector with length equal to the number of classes.
-  TORCH_ARG(Tensor, pos_weight) = {};
+  TORCH_ARG(Tensor, pos_weight);
 };
 
 namespace functional {
@@ -798,5 +797,4 @@ namespace functional {
 using BinaryCrossEntropyWithLogitsFuncOptions = BCEWithLogitsLossOptions;
 } // namespace functional
 
-} // namespace nn
-} // namespace torch
+} // namespace torch::nn

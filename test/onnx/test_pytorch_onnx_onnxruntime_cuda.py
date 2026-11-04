@@ -3,11 +3,8 @@
 import unittest
 
 import onnx_test_common
-
-import onnxruntime  # noqa: F401
+import onnxruntime
 import parameterized
-
-import torch
 from onnx_test_common import MAX_ONNX_OPSET_VERSION, MIN_ONNX_OPSET_VERSION
 from pytorch_test_common import (
     skipIfNoBFloat16Cuda,
@@ -16,6 +13,8 @@ from pytorch_test_common import (
     skipScriptTest,
 )
 from test_pytorch_onnx_onnxruntime import _parameterized_class_attrs_and_values
+
+import torch
 from torch.cuda.amp import autocast
 from torch.testing._internal import common_utils
 
@@ -27,6 +26,14 @@ from torch.testing._internal import common_utils
     class_name_func=onnx_test_common.parameterize_class_name,
 )
 class TestONNXRuntime_cuda(onnx_test_common._TestONNXRuntime):
+    ort_backend = "CUDAExecutionProvider"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if cls.ort_backend not in onnxruntime.get_available_providers():
+            raise unittest.SkipTest(f"onnxruntime {cls.ort_backend} is not available")
+
     @skipIfUnsupportedMinOpsetVersion(9)
     @skipIfNoCuda
     def test_gelu_fp16(self):
@@ -50,7 +57,7 @@ class TestONNXRuntime_cuda(onnx_test_common._TestONNXRuntime):
     @skipScriptTest()
     def test_layer_norm_fp16(self):
         class LayerNormModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.layer_norm = torch.nn.LayerNorm([10, 10])
 
@@ -74,7 +81,7 @@ class TestONNXRuntime_cuda(onnx_test_common._TestONNXRuntime):
     @skipScriptTest()
     def test_softmaxCrossEntropy_fusion_fp16(self):
         class FusionModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.loss = torch.nn.NLLLoss(reduction="none")
                 self.m = torch.nn.LogSoftmax(dim=1)
@@ -98,7 +105,7 @@ class TestONNXRuntime_cuda(onnx_test_common._TestONNXRuntime):
     @skipScriptTest()
     def test_apex_o2(self):
         class LinearModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 5)
 
@@ -134,7 +141,7 @@ class TestONNXRuntime_cuda(onnx_test_common._TestONNXRuntime):
     @skipIfNoCuda
     def test_deduplicate_initializers_diff_devices(self):
         class Model(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.w = torch.nn.Parameter(
                     torch.ones(2, 3, device=torch.device("cpu"))

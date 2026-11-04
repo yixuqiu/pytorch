@@ -2,180 +2,90 @@
 
 set -ex
 
-ver() {
-    printf "%3d%03d%03d%03d" $(echo "$1" | tr '.' ' ');
-}
-
-# Map ROCm version to AMDGPU version
-declare -A AMDGPU_VERSIONS=( ["5.0"]="21.50" ["5.1.1"]="22.10.1" ["5.2"]="22.20" )
-
 install_ubuntu() {
     apt-get update
-    if [[ $UBUNTU_VERSION == 18.04 ]]; then
-      # gpg-agent is not available by default on 18.04
-      apt-get install -y --no-install-recommends gpg-agent
-    fi
-    if [[ $UBUNTU_VERSION == 20.04 ]]; then
-      # gpg-agent is not available by default on 20.04
-      apt-get install -y --no-install-recommends gpg-agent
-    fi
-    apt-get install -y kmod
-    apt-get install -y wget
+    # kmod is used by GPU diagnostics; libc++ lets torch._C load at runtime.
+    apt-get install -y --no-install-recommends kmod libc++1 libc++abi1
+    # FIXME: Needed for rocSHMEM in ROCm7.14 since it had a dependency on libnuma.so
+    apt-get install -y libnuma-dev
+    # AOTriton configure calls pkg_search_module(liblzma); liblzma-dev provides the .pc file.
+    apt-get install -y --no-install-recommends liblzma-dev
 
-    # Need the libc++1 and libc++abi1 libraries to allow torch._C to load at runtime
-    apt-get install -y libc++1
-    apt-get install -y libc++abi1
+    install_rocm
 
-    if [[ $(ver $ROCM_VERSION) -ge $(ver 4.5) ]]; then
-        # Add amdgpu repository
-        UBUNTU_VERSION_NAME=`cat /etc/os-release | grep UBUNTU_CODENAME | awk -F= '{print $2}'`
-        local amdgpu_baseurl
-        if [[ $(ver $ROCM_VERSION) -ge $(ver 5.3) ]]; then
-          amdgpu_baseurl="https://repo.radeon.com/amdgpu/${ROCM_VERSION}/ubuntu"
-        else
-          amdgpu_baseurl="https://repo.radeon.com/amdgpu/${AMDGPU_VERSIONS[$ROCM_VERSION]}/ubuntu"
+    # Standalone CMake projects such as rocm-origami call find_package(hip)
+    # directly instead of using PyTorch's ROCM_PATH-aware LoadHIP.cmake.
+    {
+        printf 'export CMAKE_PREFIX_PATH=%q:${CMAKE_PREFIX_PATH:-}\n' "${ROCM_HOME}"
+        printf 'export LD_LIBRARY_PATH=%q:${LD_LIBRARY_PATH:-}\n' "${ROCM_HOME}/lib"
+        if [[ -n "${USE_MSLK:-}" ]]; then
+            printf 'export USE_MSLK=%q\n' "${USE_MSLK}"
         fi
-        echo "deb [arch=amd64] ${amdgpu_baseurl} ${UBUNTU_VERSION_NAME} main" > /etc/apt/sources.list.d/amdgpu.list
+    } >> /etc/rocm_env.sh
+
+    if [[ -e /etc/bash.bashrc ]]; then
+        echo "source /etc/rocm_env.sh" >> /etc/bash.bashrc
+    fi
+    if [[ -e /etc/bashrc ]]; then
+        echo "source /etc/rocm_env.sh" >> /etc/bashrc
     fi
 
-    ROCM_REPO="ubuntu"
-    if [[ $(ver $ROCM_VERSION) -lt $(ver 4.2) ]]; then
-        ROCM_REPO="xenial"
-    fi
-
-    if [[ $(ver $ROCM_VERSION) -ge $(ver 5.3) ]]; then
-        ROCM_REPO="${UBUNTU_VERSION_NAME}"
-    fi
-
-    # Add rocm repository
-    wget -qO - http://repo.radeon.com/rocm/rocm.gpg.key | apt-key add -
-    local rocm_baseurl="http://repo.radeon.com/rocm/apt/${ROCM_VERSION}"
-    echo "deb [arch=amd64] ${rocm_baseurl} ${ROCM_REPO} main" > /etc/apt/sources.list.d/rocm.list
-    apt-get update --allow-insecure-repositories
-
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
-                   rocm-dev \
-                   rocm-utils \
-                   rocm-libs \
-                   rccl \
-                   rocprofiler-dev \
-                   roctracer-dev
-
-    if [[ $(ver $ROCM_VERSION) -ge $(ver 6.1) ]]; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated rocm-llvm-dev
-    fi
-
-    # precompiled miopen kernels added in ROCm 3.5, renamed in ROCm 5.5
-    # search for all unversioned packages
-    # if search fails it will abort this script; use true to avoid case where search fails
-    if [[ $(ver $ROCM_VERSION) -ge $(ver 5.5) ]]; then
-        MIOPENHIPGFX=$(apt-cache search --names-only miopen-hip-gfx | awk '{print $1}' | grep -F -v . || true)
-        if [[ "x${MIOPENHIPGFX}" = x ]]; then
-          echo "miopen-hip-gfx package not available" && exit 1
-        else
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated ${MIOPENHIPGFX}
-        fi
-    else
-        MIOPENKERNELS=$(apt-cache search --names-only miopenkernels | awk '{print $1}' | grep -F -v . || true)
-        if [[ "x${MIOPENKERNELS}" = x ]]; then
-          echo "miopenkernels package not available" && exit 1
-        else
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated ${MIOPENKERNELS}
-        fi
-    fi
-
-    # ROCm 6.0 had a regression where journal_mode was enabled on the kdb files resulting in permission errors at runtime
-    if [[ $(ver $ROCM_VERSION) -ge $(ver 6.0) ]]; then
-        for kdb in /opt/rocm/share/miopen/db/*.kdb
-        do
-            sqlite3 $kdb "PRAGMA journal_mode=off; PRAGMA VACUUM;"
-        done
-    fi
-
-    # Cleanup
     apt-get autoclean && apt-get clean
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 }
 
-install_centos() {
+install_rocm() {
+    # ROCm from the multi-arch TheRock wheel index.
+    # The ROCm SDK unpacks under <site-packages>/_rocm_sdk_*; discover the real
+    # install root via `rocm-sdk path` and export it through /etc/rocm_env.sh.
+    : "${THEROCK_INDEX_URL:?THEROCK_INDEX_URL must be set}"
+    : "${ROCM_VERSION:?ROCM_VERSION must be set}"
 
-  yum update -y
-  yum install -y kmod
-  yum install -y wget
-  yum install -y openblas-devel
+    # Major.minor pins (e.g. 7.14) accept later patches via ==7.14.*.
+    # Fully specified preview pins (e.g. 7.15.0a20260712) stay exact; PEP 440
+    # rejects ==7.15.0a20260712.*.
+    rocm_pip_version="${ROCM_VERSION}"
+    if [[ "${ROCM_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        rocm_pip_version="${ROCM_VERSION}.*"
+    fi
 
-  yum install -y epel-release
-  yum install -y dkms kernel-headers-`uname -r` kernel-devel-`uname -r`
+    echo "=============================================="
+    echo "ROCm Multi-Arch Wheel Installation (TheRock)"
+    echo "Index URL:  ${THEROCK_INDEX_URL}"
+    echo "ROCm version: ${ROCM_VERSION}"
+    echo "ROCm spec:  rocm[libraries,devel,device-all]==${rocm_pip_version}"
+    echo "=============================================="
 
-  if [[ $(ver $ROCM_VERSION) -ge $(ver 4.5) ]]; then
-      # Add amdgpu repository
-      local amdgpu_baseurl
-      if [[ $OS_VERSION == 9 ]]; then
-          amdgpu_baseurl="https://repo.radeon.com/amdgpu/${AMDGPU_VERSIONS[$ROCM_VERSION]}/rhel/9.0/main/x86_64"
-      else
-        if [[ $(ver $ROCM_VERSION) -ge $(ver 5.3) ]]; then
-          amdgpu_baseurl="https://repo.radeon.com/amdgpu/${ROCM_VERSION}/rhel/7.9/main/x86_64"
-        else
-          amdgpu_baseurl="https://repo.radeon.com/amdgpu/${AMDGPU_VERSIONS[$ROCM_VERSION]}/rhel/7.9/main/x86_64"
-        fi
-      fi
-      echo "[AMDGPU]" > /etc/yum.repos.d/amdgpu.repo
-      echo "name=AMDGPU" >> /etc/yum.repos.d/amdgpu.repo
-      echo "baseurl=${amdgpu_baseurl}" >> /etc/yum.repos.d/amdgpu.repo
-      echo "enabled=1" >> /etc/yum.repos.d/amdgpu.repo
-      echo "gpgcheck=1" >> /etc/yum.repos.d/amdgpu.repo
-      echo "gpgkey=http://repo.radeon.com/rocm/rocm.gpg.key" >> /etc/yum.repos.d/amdgpu.repo
-  fi
+    # device-all pulls kernels for every supported gfx target (multi-arch wheel);
+    # libraries+devel provide the runtime libs + headers/hipcc to compile against ROCm.
+    python3 -m pip install --index-url "${THEROCK_INDEX_URL}" "rocm[libraries,devel,device-all]==${rocm_pip_version}"
 
-  local rocm_baseurl="http://repo.radeon.com/rocm/yum/${ROCM_VERSION}"
-  echo "[ROCm]" > /etc/yum.repos.d/rocm.repo
-  echo "name=ROCm" >> /etc/yum.repos.d/rocm.repo
-  echo "baseurl=${rocm_baseurl}" >> /etc/yum.repos.d/rocm.repo
-  echo "enabled=1" >> /etc/yum.repos.d/rocm.repo
-  echo "gpgcheck=1" >> /etc/yum.repos.d/rocm.repo
-  echo "gpgkey=http://repo.radeon.com/rocm/rocm.gpg.key" >> /etc/yum.repos.d/rocm.repo
+    # Discover the real install root/bin via the rocm-sdk CLI (rocm-sdk-core wheel).
+    ROCM_HOME="$(rocm-sdk path --root)"
+    ROCM_BIN="$(rocm-sdk path --bin)"
 
-  yum update -y
+    # Common build-time environment sourced by CI scripts.
+    {
+        echo '# ROCm paths discovered from rocm-sdk.'
+        printf 'export ROCM_PATH=%q\n' "${ROCM_HOME}"
+        printf 'export ROCM_HOME=%q\n' "${ROCM_HOME}"
+        printf 'export PATH=%q:${PATH}\n' "${ROCM_BIN}"
+    } > /etc/rocm_env.sh
 
-  yum install -y \
-                   rocm-dev \
-                   rocm-utils \
-                   rocm-libs \
-                   rccl \
-                   rocprofiler-dev \
-                   roctracer-dev
+    echo "TheRock ROCm wheel install complete: ROCM_HOME=${ROCM_HOME}"
+}
 
-  # precompiled miopen kernels; search for all unversioned packages
-  # if search fails it will abort this script; use true to avoid case where search fails
-  if [[ $(ver $ROCM_VERSION) -ge $(ver 5.5) ]]; then
-      MIOPENHIPGFX=$(yum -q search miopen-hip-gfx | grep miopen-hip-gfx | awk '{print $1}'| grep -F kdb. || true)
-      if [[ "x${MIOPENHIPGFX}" = x ]]; then
-        echo "miopen-hip-gfx package not available" && exit 1
-      else
-        yum install -y ${MIOPENHIPGFX}
-      fi
-  else
-      MIOPENKERNELS=$(yum -q search miopenkernels | grep miopenkernels- | awk '{print $1}'| grep -F kdb. || true)
-      if [[ "x${MIOPENKERNELS}" = x ]]; then
-        echo "miopenkernels package not available" && exit 1
-      else
-        yum install -y ${MIOPENKERNELS}
-      fi
-  fi
+install_almalinux() {
+    # repair_wheel.py copies libnuma.so.1 into torch/lib as libnuma.so so
+    # pre-10.0 rocSHMEM's dlopen("libnuma.so") resolves. The copy fails the
+    # wheel build if numactl-libs is missing.
+    yum install -y numactl-libs
 
-  # ROCm 6.0 had a regression where journal_mode was enabled on the kdb files resulting in permission errors at runtime
-  if [[ $(ver $ROCM_VERSION) -ge $(ver 6.0) ]]; then
-      for kdb in /opt/rocm/share/miopen/db/*.kdb
-      do
-          sqlite3 $kdb "PRAGMA journal_mode=off; PRAGMA VACUUM;"
-      done
-  fi
-
-  # Cleanup
-  yum clean all
-  rm -rf /var/cache/yum
-  rm -rf /var/lib/yum/yumdb
-  rm -rf /var/lib/yum/history
+    # The manywheel build intentionally uses only the common ROCm environment.
+    # Its produced wheel resolves ROCm at runtime via RPATH (see repair_wheel.py),
+    # so unlike Ubuntu CI it must not add ROCm to LD_LIBRARY_PATH.
+    install_rocm
+    echo "source /etc/rocm_env.sh" >> /etc/bashrc || true
 }
 
 # Install Python packages depending on the base OS
@@ -184,8 +94,8 @@ case "$ID" in
   ubuntu)
     install_ubuntu
     ;;
-  centos)
-    install_centos
+  almalinux)
+    install_almalinux
     ;;
   *)
     echo "Unable to determine OS..."

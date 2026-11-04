@@ -5,9 +5,7 @@
 #include <torch/csrc/jit/frontend/script_type_parser.h>
 #include <torch/csrc/utils/pybind.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 // Singleton class provides interface to execute python UDF remote call
 // and deserialize the returned results by running python function
@@ -44,7 +42,7 @@ class PYBIND11_EXPORT PythonRpcHandler {
   void handleException(const py::object& obj);
   // Alternative if the caller is already holding the GIL.
   void handleExceptionGILHeld(const py::object& obj);
-  // Check if obj is an RemoteException instance.
+  // Check if obj is a RemoteException instance.
   bool isRemoteException(const py::object& obj);
 
   // Explicitly clean up py::objects to avoid segment faults when
@@ -57,7 +55,7 @@ class PYBIND11_EXPORT PythonRpcHandler {
   // PythonRpcHandler singleton cleans up py::objects and call dec_ref(), it
   // will crash.
   // The solution is to clean up py::objects earlier when Rpc agent join().
-  // Be note that py::objects can not be cleaned up when Rpc agent is destroyed
+  // Note that py::objects cannot be cleaned up when Rpc agent is destroyed
   // as well, as Rpc agent is global variable and it will have same issue as
   // PythonRpcHandler.
   void cleanup();
@@ -122,12 +120,10 @@ class PYBIND11_EXPORT PythonRpcHandler {
   std::shared_ptr<jit::ScriptTypeParser> typeParser_;
 
   // Indicates whether or not we have properly initialized the handler.
-  bool initialized_;
+  bool initialized_{false};
 
   // Lock to protect initialization.
   std::mutex init_lock_;
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

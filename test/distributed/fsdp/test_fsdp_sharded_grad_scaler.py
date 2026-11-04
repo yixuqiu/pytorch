@@ -5,7 +5,8 @@ import functools
 import itertools
 import sys
 import unittest
-from typing import List, Optional
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch import distributed as dist
@@ -15,16 +16,19 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as FSDP,
     ShardingStrategy,
 )
-from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+from torch.distributed.fsdp.sharded_grad_scaler import (
+    _infer_default_device,
+    ShardedGradScaler,
+)
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn import TransformerDecoderLayer, TransformerEncoderLayer
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
-    CUDAInitMode,
+    DEVICEInitMode,
     DummyProcessGroup,
     FSDPInitMode,
-    FSDPTest,
+    FSDPTestContinuous,
     NestedWrappedModule,
     NonUniformReqGradNWM,
     subtest_name,
@@ -35,8 +39,10 @@ from torch.testing._internal.common_utils import (
     parametrize,
     run_tests,
     TEST_WITH_DEV_DBG_ASAN,
+    TEST_XPU,
     TestCase,
 )
+
 
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
@@ -49,6 +55,8 @@ if TEST_WITH_DEV_DBG_ASAN:
         file=sys.stderr,
     )
     sys.exit(0)
+
+device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
 
 
 params = "cpu_offload,sharding_strategy,mixed_precision,use_orig_params"
@@ -75,11 +83,14 @@ subtest_name = functools.partial(subtest_name, test_name_mapping)
 
 class TestShardGradScaler(TestCase):
     @unittest.skipIf(
-        amp_definitely_not_available(), "no supported device (cuda, xla) found"
+        amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
     )
     def test_grad_scaling(self):
         pg = DummyProcessGroup(0, 1)
-        scaler = ShardedGradScaler(init_scale=2.0, process_group=pg, enabled=True)
+        scaler = ShardedGradScaler(
+            device=device_type, init_scale=2.0, process_group=pg, enabled=True
+        )
         t0 = torch.full((1,), 4.0, dtype=torch.float32, device="cpu")
         t1 = torch.full((1,), 8.0, dtype=torch.float32, device="cpu")
         outputs = [t1.clone(), (t0.clone(), t1.clone()), [t0.clone(), t1.clone()]]
@@ -91,11 +102,14 @@ class TestShardGradScaler(TestCase):
         self.assertTrue(scaler._scale.device == t1.device)
 
     @unittest.skipIf(
-        amp_definitely_not_available(), "no supported device (cuda, xla) found"
+        amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
     )
     def test_scaling_unscaling_sparse(self):
         pg = DummyProcessGroup(0, 1)
-        scaler = ShardedGradScaler(init_scale=2.0, process_group=pg, enabled=True)
+        scaler = ShardedGradScaler(
+            device=device_type, init_scale=2.0, process_group=pg, enabled=True
+        )
         inv_scale = torch.full((1,), 0.5, dtype=torch.float, device="cpu")
         found_inf = torch.full((1,), 0, dtype=torch.float, device="cpu")
 
@@ -136,11 +150,14 @@ class TestShardGradScaler(TestCase):
         self.assertEqual(found_inf, 1.0)
 
     @unittest.skipIf(
-        amp_definitely_not_available(), "no supported device (cuda, xla) found"
+        amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
     )
     def test_inf_gradients_skip_optim_step(self):
         pg = DummyProcessGroup(0, 1)
-        scaler = ShardedGradScaler(init_scale=2.0, process_group=pg, enabled=True)
+        scaler = ShardedGradScaler(
+            device=device_type, init_scale=2.0, process_group=pg, enabled=True
+        )
         loss = torch.full((1,), 4.0, dtype=torch.float32, device="cpu")
         t0 = torch.tensor([float("inf")], dtype=torch.float32, device="cpu")
         t0.grad = t0.clone()
@@ -149,16 +166,171 @@ class TestShardGradScaler(TestCase):
         ret_val = scaler.step(opt)
         self.assertTrue(ret_val is None)
 
+    def test_infer_default_device_fallbacks(self):
+        # Test the inference helper directly so the check is deterministic on
+        # any machine and independent of any out-of-tree replacement of the
+        # ShardedGradScaler class itself.
+        with mock.patch.object(
+            torch.accelerator,
+            "current_accelerator",
+            return_value=SimpleNamespace(type="xpu"),
+        ):
+            self.assertEqual(_infer_default_device(), "xpu")
 
-class TestShardedGradScalerParityWithDDP(FSDPTest):
+        # With no accelerator available, fall back to the historical "cuda"
+        # default to keep CPU-only / CUDA-unavailable behavior unchanged.
+        with mock.patch.object(
+            torch.accelerator,
+            "current_accelerator",
+            return_value=None,
+        ):
+            self.assertEqual(_infer_default_device(), "cuda")
+
+        # A half-registered backend (accelerator hooks registered without a
+        # matching Python device module) makes the probe raise; the error is
+        # deliberately propagated rather than silently disabling the scaler.
+        with mock.patch.object(
+            torch.accelerator,
+            "current_accelerator",
+            side_effect=RuntimeError,
+        ):
+            with self.assertRaises(RuntimeError):
+                _infer_default_device()
+
+        # "mps" is never inferred: no c10d backend supports MPS collectives,
+        # so an inferred default would crash unscale_() under distributed
+        # training. Single-device MPS AMP keeps using the base
+        # ``torch.amp.GradScaler``.
+        with mock.patch.object(
+            torch.accelerator,
+            "current_accelerator",
+            return_value=SimpleNamespace(type="mps"),
+        ):
+            self.assertEqual(_infer_default_device(), "cuda")
+
+    def test_device_default_resolution(self):
+        pg = DummyProcessGroup(0, 1)
+        with mock.patch.object(
+            torch.accelerator,
+            "current_accelerator",
+            return_value=SimpleNamespace(type="xpu"),
+        ):
+            # No device= passed: the inferred default must reach self._device
+            # through __init__. The base class stores _device before any
+            # availability check and only "cuda" has a disable branch, so the
+            # assert holds even where "xpu" itself is not available.
+            scaler = ShardedGradScaler(process_group=pg)
+            self.assertEqual(scaler._device, "xpu")
+
+            # An explicitly passed device wins over the inferred default
+            # (which the no-device= construction above shows is running).
+            scaler = ShardedGradScaler(device="cpu", process_group=pg)
+            self.assertEqual(scaler._device, "cpu")
+
+        # "mps" is never inferred: the historical "cuda" default applies,
+        # matching the behavior before inference was introduced. (Whether
+        # the scaler then ends up enabled depends on CUDA availability, so
+        # only the resolved device is asserted here.)
+        with mock.patch.object(
+            torch.accelerator,
+            "current_accelerator",
+            return_value=SimpleNamespace(type="mps"),
+        ):
+            scaler = ShardedGradScaler(process_group=pg)
+            self.assertEqual(scaler._device, "cuda")
+
+    def test_disabled_scaler_does_not_probe_accelerator(self):
+        pg = DummyProcessGroup(0, 1)
+        probe = mock.Mock(return_value=SimpleNamespace(type="xpu"))
+        with mock.patch.object(torch.accelerator, "current_accelerator", probe):
+            # A disabled scaler never initializes device state, so it must
+            # not touch the accelerator availability check at all (e.g. the
+            # CUDA availability check poisons fork).
+            scaler = ShardedGradScaler(process_group=pg, enabled=False)
+        probe.assert_not_called()
+        self.assertEqual(scaler._device, "cuda")
+
+    @unittest.skipIf(
+        amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
+    )
+    def test_update_growth_and_backoff(self):
+        pg = DummyProcessGroup(0, 1)
+        # No device= passed: on the hosts where this test runs (AMP-capable
+        # CI), the fused update path is exercised through the inferred
+        # default device, which resolves to device_type there.
+        scaler = ShardedGradScaler(
+            init_scale=2.0,
+            growth_factor=2.0,
+            backoff_factor=0.5,
+            growth_interval=2,
+            process_group=pg,
+            enabled=True,
+        )
+        param = torch.full(
+            (1,), 4.0, dtype=torch.float32, device=device_type, requires_grad=True
+        )
+        opt = torch.optim.SGD([param], lr=1.0)
+
+        # Two consecutive unskipped iterations should grow the scale by
+        # growth_factor (growth_interval=2: 2.0 -> 4.0).
+        for _ in range(2):
+            opt.zero_grad()
+            scaler.scale(param.sum()).backward()
+            scaler.step(opt)
+            scaler.update()
+        self.assertEqual(scaler.get_scale(), 4.0)
+
+        # An iteration with an inf gradient should back the scale off by
+        # backoff_factor (4.0 -> 2.0).
+        opt.zero_grad()
+        scaler.scale(param.sum()).backward()
+        param.grad.fill_(float("inf"))
+        scaler.step(opt)
+        scaler.update()
+        self.assertEqual(scaler.get_scale(), 2.0)
+
+    @unittest.skipIf(
+        device_type != "cpu" and amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
+    )
+    def test_update_new_scale_rejects_requires_grad_tensor(self):
+        pg = DummyProcessGroup(0, 1)
+        scaler = ShardedGradScaler(device=device_type, process_group=pg)
+        # Force lazy init: update() requires _scale/_growth_tracker to exist.
+        scaler.scale(torch.full((), 1.0, dtype=torch.float32, device=device_type))
+        bad = torch.full(
+            (), 2.0, dtype=torch.float32, device=device_type, requires_grad=True
+        )
+        with self.assertRaisesRegex(
+            AssertionError, rf"torch tensor on {device_type} with requires_grad"
+        ):
+            scaler.update(new_scale=bad)
+
+    def test_update_new_scale_rejects_device_mismatch(self):
+        pg = DummyProcessGroup(0, 1)
+        # "xpu" has no disable branch in the base scaler, so this stays
+        # enabled even where XPU is unavailable, and the lazy init runs on
+        # the CPU tensors below: the device-mismatch branch of update() is
+        # exercised on every host.
+        scaler = ShardedGradScaler(device="xpu", process_group=pg)
+        scaler.scale(torch.full((), 1.0, dtype=torch.float32, device="cpu"))
+        mismatched = torch.full((), 2.0, dtype=torch.float32, device="cpu")
+        with self.assertRaisesRegex(
+            AssertionError, r"torch tensor on xpu with requires_grad"
+        ):
+            scaler.update(new_scale=mismatched)
+
+
+class TestShardedGradScalerParityWithDDP(FSDPTestContinuous):
     def _get_init_modes_for_test(self, cpu_offload):
-        modes = [CUDAInitMode.CUDA_AFTER, CUDAInitMode.CUDA_BEFORE]
-        # Note that CUDAInitMode.CUDA_NEVER works currently only with CPU
+        modes = [DEVICEInitMode.DEVICE_AFTER, DEVICEInitMode.DEVICE_BEFORE]
+        # Note that DEVICEInitMode.DEVICE_NEVER works currently only with CPU
         # offload as we explicitly bring the param back to CUDA device. In
         # general, it will not work since we try to all_gather p.data which is
         # on CPU but NCCL only supports GPU.
         if cpu_offload.offload_params:
-            modes.append(CUDAInitMode.CUDA_NEVER)
+            modes.append(DEVICEInitMode.DEVICE_NEVER)
 
         return modes
 
@@ -167,9 +339,9 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
     def test_fsdp_ddp_parity_with_grad_scaler(
         self,
         cpu_offload: CPUOffload,
-        sharding_strategy: Optional[ShardingStrategy],
-        mixed_precision: Optional[str],
-        use_orig_params: Optional[str],
+        sharding_strategy: ShardingStrategy | None,
+        mixed_precision: str | None,
+        use_orig_params: str | None,
     ):
         init_modes = self._get_init_modes_for_test(cpu_offload)
         mp = (
@@ -191,11 +363,11 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
             use_orig = False
             model_cls = NestedWrappedModule  # type: ignore[assignment]
             sharded_grad_scaler_kwargs = None
-        for cuda_init_mode in init_modes:
+        for device_init_mode in init_modes:
             self._test_fsdp_parity(
                 model_cls,
                 FSDPInitMode.RECURSIVE,
-                cuda_init_mode=cuda_init_mode,
+                device_init_mode=device_init_mode,
                 cpu_offload=cpu_offload,
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mp,
@@ -212,7 +384,7 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
         model = TransformerWithSharedParams.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
-            CUDAInitMode.CUDA_BEFORE,
+            DEVICEInitMode.DEVICE_BEFORE,
             deterministic=True,
         )
         ref_model = DDP(
@@ -227,8 +399,9 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
                 {
                     TransformerEncoderLayer,
                     TransformerDecoderLayer,
-                }
+                },
             ),
+            "device_id": self.rank,
         }
         model = FSDP(model, **fsdp_kwargs)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -256,10 +429,10 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
             cpu_offload=cpu_offload,
             use_orig_params=use_orig_params,
         )
-        grad_scaler = ShardedGradScaler(init_scale=2.0)
-        ref_grad_scaler = torch.cuda.amp.GradScaler(init_scale=2.0)
-        scaled_losses: List[torch.Tensor] = []
-        device = torch.device("cuda")
+        grad_scaler = ShardedGradScaler(device=device_type, init_scale=2.0)
+        ref_grad_scaler = torch.amp.GradScaler(device=device_type, init_scale=2.0)
+        scaled_losses: list[torch.Tensor] = []
+        device = torch.device(device_type)
         torch.manual_seed(42 + self.rank + 1)
 
         for iter in range(10):
@@ -299,7 +472,7 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
                         _grad_scaler.get_scale(),
                         orig_scale * _grad_scaler.get_backoff_factor(),
                         (
-                            f"rank: {self.rank} iter: {iter} expect origin scale {orig_scale} "
+                            lambda msg: f"{msg}\nrank: {self.rank} iter: {iter} expect origin scale {orig_scale} "
                             f"to be backed off by {_grad_scaler.get_backoff_factor()} "
                             f"but got {_grad_scaler.get_scale()}"
                         ),
@@ -309,7 +482,7 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
                         _grad_scaler.get_scale(),
                         orig_scale,
                         (
-                            f"rank: {self.rank} iter: {iter} expect same scale {orig_scale} "
+                            lambda msg: f"{msg}\nrank: {self.rank} iter: {iter} expect same scale {orig_scale} "
                             f"but got {_grad_scaler.get_scale()}"
                         ),
                     )
@@ -322,7 +495,7 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
                             param,
                             orig_param,
                             (
-                                f"rank: {self.rank} iter: {iter} expect the same params before "
+                                lambda msg: f"{msg}\nrank: {self.rank} iter: {iter} expect the same params before "
                                 f"and after optim.step but got {param} vs {orig_param}"
                             ),
                         )
@@ -331,14 +504,14 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
                             param,
                             orig_param,
                             (
-                                f"rank: {self.rank} iter: {iter} expect the updated params after "
+                                lambda msg: f"{msg}\nrank: {self.rank} iter: {iter} expect the updated params after "
                                 f"optim.step but got {param} vs {orig_param}"
                             ),
                         )
             self.assertEqual(
                 scaled_losses[0],
                 scaled_losses[1],
-                f"iter: {iter} {scaled_losses[0]} vs {scaled_losses[1]}",
+                lambda msg: f"{msg}\niter: {iter} {scaled_losses[0]} vs {scaled_losses[1]}",
             )
 
 

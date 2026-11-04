@@ -1,5 +1,6 @@
 # Owner(s): ["oncall: jit"]
 
+import contextlib
 import os
 import sys
 import warnings
@@ -7,17 +8,23 @@ from typing import Dict, List, Optional
 
 import torch
 
+
 # Make the helper files in test/ importable
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
+from torch.testing._internal.common_utils import raise_on_run_directly
 from torch.testing._internal.jit_utils import JitTestCase
 
-if __name__ == "__main__":
-    raise RuntimeError(
-        "This test file is not meant to be run directly, use:\n\n"
-        "\tpython test/test_jit.py TESTNAME\n\n"
-        "instead."
-    )
+
+@contextlib.contextmanager
+def _catch_warnings_ignoring_jit_deprecation():
+    # torch.jit.script emits a visible FutureWarning; ignore it so these tests
+    # can assert on the absence of *unexpected* warnings.
+    with warnings.catch_warnings(record=True) as w:
+        warnings.filterwarnings(
+            "ignore", ".*Please switch to `torch.", category=FutureWarning
+        )
+        yield w
 
 
 class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
@@ -27,7 +34,7 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
     def test_annotated_falsy_base_type(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: int = 0
 
@@ -35,13 +42,14 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
                 self.x = x
                 return 1
 
-        with warnings.catch_warnings(record=True) as w:
+        with _catch_warnings_ignoring_jit_deprecation() as w:
             self.checkModule(M(), (1,))
-        assert len(w) == 0
+        if len(w) != 0:
+            raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
     def test_annotated_nonempty_container(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: List[int] = [1, 2, 3]
 
@@ -49,13 +57,14 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
                 self.x = x
                 return 1
 
-        with warnings.catch_warnings(record=True) as w:
+        with _catch_warnings_ignoring_jit_deprecation() as w:
             self.checkModule(M(), ([1, 2, 3],))
-        assert len(w) == 0
+        if len(w) != 0:
+            raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
     def test_annotated_empty_tensor(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: torch.Tensor = torch.empty(0)
 
@@ -63,13 +72,14 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
                 self.x = x
                 return self.x
 
-        with warnings.catch_warnings(record=True) as w:
+        with _catch_warnings_ignoring_jit_deprecation() as w:
             self.checkModule(M(), (torch.rand(2, 3),))
-        assert len(w) == 0
+        if len(w) != 0:
+            raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
     def test_annotated_with_jit_attribute(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x = torch.jit.Attribute([], List[int])
 
@@ -77,15 +87,16 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
                 self.x = x
                 return self.x
 
-        with warnings.catch_warnings(record=True) as w:
+        with _catch_warnings_ignoring_jit_deprecation() as w:
             self.checkModule(M(), ([1, 2, 3],))
-        assert len(w) == 0
+        if len(w) != 0:
+            raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
     def test_annotated_class_level_annotation_only(self):
         class M(torch.nn.Module):
             x: List[int]
 
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x = []
 
@@ -93,15 +104,16 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
                 self.x = y
                 return self.x
 
-        with warnings.catch_warnings(record=True) as w:
+        with _catch_warnings_ignoring_jit_deprecation() as w:
             self.checkModule(M(), ([1, 2, 3],))
-        assert len(w) == 0
+        if len(w) != 0:
+            raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
     def test_annotated_class_level_annotation_and_init_annotation(self):
         class M(torch.nn.Module):
             x: List[int]
 
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: List[int] = []
 
@@ -109,15 +121,16 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
                 self.x = y
                 return self.x
 
-        with warnings.catch_warnings(record=True) as w:
+        with _catch_warnings_ignoring_jit_deprecation() as w:
             self.checkModule(M(), ([1, 2, 3],))
-        assert len(w) == 0
+        if len(w) != 0:
+            raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
     def test_annotated_class_level_jit_annotation(self):
         class M(torch.nn.Module):
             x: List[int]
 
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: List[int] = torch.jit.annotate(List[int], [])
 
@@ -125,13 +138,14 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
                 self.x = y
                 return self.x
 
-        with warnings.catch_warnings(record=True) as w:
+        with _catch_warnings_ignoring_jit_deprecation() as w:
             self.checkModule(M(), ([1, 2, 3],))
-        assert len(w) == 0
+        if len(w) != 0:
+            raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
     def test_annotated_empty_list(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: List[int] = []
 
@@ -144,15 +158,32 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         ):
             with self.assertWarnsRegex(
                 UserWarning,
-                "doesn't support "
-                "instance-level annotations on "
-                "empty non-base types",
+                "doesn't support instance-level annotations on empty non-base types",
+            ):
+                torch.jit.script(M())
+
+    def test_annotated_empty_list_lowercase(self):
+        class M(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.x: list[int] = []
+
+            def forward(self, x: list[int]):
+                self.x = x
+                return 1
+
+        with self.assertRaisesRegexWithHighlight(
+            RuntimeError, "Tried to set nonexistent attribute", "self.x = x"
+        ):
+            with self.assertWarnsRegex(
+                UserWarning,
+                "doesn't support instance-level annotations on empty non-base types",
             ):
                 torch.jit.script(M())
 
     def test_annotated_empty_dict(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: Dict[str, int] = {}
 
@@ -165,15 +196,32 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         ):
             with self.assertWarnsRegex(
                 UserWarning,
-                "doesn't support "
-                "instance-level annotations on "
-                "empty non-base types",
+                "doesn't support instance-level annotations on empty non-base types",
+            ):
+                torch.jit.script(M())
+
+    def test_annotated_empty_dict_lowercase(self):
+        class M(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.x: dict[str, int] = {}
+
+            def forward(self, x: dict[str, int]):
+                self.x = x
+                return 1
+
+        with self.assertRaisesRegexWithHighlight(
+            RuntimeError, "Tried to set nonexistent attribute", "self.x = x"
+        ):
+            with self.assertWarnsRegex(
+                UserWarning,
+                "doesn't support instance-level annotations on empty non-base types",
             ):
                 torch.jit.script(M())
 
     def test_annotated_empty_optional(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x: Optional[str] = None
 
@@ -186,15 +234,13 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         ):
             with self.assertWarnsRegex(
                 UserWarning,
-                "doesn't support "
-                "instance-level annotations on "
-                "empty non-base types",
+                "doesn't support instance-level annotations on empty non-base types",
             ):
                 torch.jit.script(M())
 
     def test_annotated_with_jit_empty_list(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x = torch.jit.annotate(List[int], [])
 
@@ -207,15 +253,32 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         ):
             with self.assertWarnsRegex(
                 UserWarning,
-                "doesn't support "
-                "instance-level annotations on "
-                "empty non-base types",
+                "doesn't support instance-level annotations on empty non-base types",
+            ):
+                torch.jit.script(M())
+
+    def test_annotated_with_jit_empty_list_lowercase(self):
+        class M(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.x = torch.jit.annotate(list[int], [])
+
+            def forward(self, x: list[int]):
+                self.x = x
+                return 1
+
+        with self.assertRaisesRegexWithHighlight(
+            RuntimeError, "Tried to set nonexistent attribute", "self.x = x"
+        ):
+            with self.assertWarnsRegex(
+                UserWarning,
+                "doesn't support instance-level annotations on empty non-base types",
             ):
                 torch.jit.script(M())
 
     def test_annotated_with_jit_empty_dict(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x = torch.jit.annotate(Dict[str, int], {})
 
@@ -228,15 +291,32 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         ):
             with self.assertWarnsRegex(
                 UserWarning,
-                "doesn't support "
-                "instance-level annotations on "
-                "empty non-base types",
+                "doesn't support instance-level annotations on empty non-base types",
+            ):
+                torch.jit.script(M())
+
+    def test_annotated_with_jit_empty_dict_lowercase(self):
+        class M(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.x = torch.jit.annotate(dict[str, int], {})
+
+            def forward(self, x: dict[str, int]):
+                self.x = x
+                return 1
+
+        with self.assertRaisesRegexWithHighlight(
+            RuntimeError, "Tried to set nonexistent attribute", "self.x = x"
+        ):
+            with self.assertWarnsRegex(
+                UserWarning,
+                "doesn't support instance-level annotations on empty non-base types",
             ):
                 torch.jit.script(M())
 
     def test_annotated_with_jit_empty_optional(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x = torch.jit.annotate(Optional[str], None)
 
@@ -249,9 +329,7 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         ):
             with self.assertWarnsRegex(
                 UserWarning,
-                "doesn't support "
-                "instance-level annotations on "
-                "empty non-base types",
+                "doesn't support instance-level annotations on empty non-base types",
             ):
                 torch.jit.script(M())
 
@@ -259,7 +337,7 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         from torch import jit
 
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.x = jit.annotate(Optional[str], None)
 
@@ -272,8 +350,10 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
         ):
             with self.assertWarnsRegex(
                 UserWarning,
-                "doesn't support "
-                "instance-level annotations on "
-                "empty non-base types",
+                "doesn't support instance-level annotations on empty non-base types",
             ):
                 torch.jit.script(M())
+
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_jit.py")

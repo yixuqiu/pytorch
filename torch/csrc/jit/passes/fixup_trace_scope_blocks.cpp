@@ -2,15 +2,11 @@
 
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/frontend/schema_matching.h>
-#include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/inliner.h>
 #include <torch/csrc/jit/passes/lower_tuples.h>
 
-#include <algorithm>
-
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 namespace {
 
@@ -170,8 +166,8 @@ struct ConvertTracedAttrReferences {
 
         // Short circuit: if we've already emitted a new Value for this
         // attribute, just use that.
-        if (local_remaps.count(inp)) {
-          n->replaceInput(inp_idx, local_remaps[inp]);
+        if (auto it = local_remaps.find(inp); it != local_remaps.end()) {
+          n->replaceInput(inp_idx, it->second);
           continue;
         }
 
@@ -260,9 +256,9 @@ struct MakeDefsDominateUses {
       // Already lifted to this level by a previously processed Use, switch to
       // remapped value
       Value* inp_remapped = inp;
-      if (remap.count(inp_remapped)) {
-        n->replaceInput(i, remap[inp_remapped]);
-        inp_remapped = remap[inp_remapped];
+      if (auto it = remap.find(inp_remapped); it != remap.end()) {
+        n->replaceInput(i, it->second);
+        inp_remapped = it->second;
       }
 
       // This conditional isn't strictly necessary, but saves a lot of
@@ -367,7 +363,7 @@ void lambdaLiftBlocksAndConvertToGraph(Block* b) {
       auto graph = std::make_shared<Graph>();
       std::unordered_map<Value*, Value*> remaps;
       graph->block()->cloneFrom(n->blocks()[0], [&](Value* v) {
-        if (!remaps.count(v)) {
+        if (!remaps.contains(v)) {
           remaps[v] = graph->addInput()->copyMetadata(v);
           n->addInput(v);
         }
@@ -388,7 +384,7 @@ std::string mangleMethodName(
   for (size_t method_idx = 0;; method_idx++) {
     auto mangled = method_name;
     if (method_idx != 0) {
-      mangled += c10::to_string(method_idx);
+      mangled += std::to_string(method_idx);
     }
     bool found = false;
     for (Function* fn : mod_type->methods()) {
@@ -551,5 +547,4 @@ void FixupTraceScopeBlocks(std::shared_ptr<Graph>& graph, Module* self) {
   }
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

@@ -2,6 +2,7 @@
 
 #include <ATen/Dispatch.h>
 #include <ATen/ScalarOps.h>
+#include <ATen/core/LegacyTypeDispatch.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/core/grad_mode.h>
 
@@ -16,9 +17,7 @@
 
 #include <initializer_list>
 
-namespace torch {
-
-namespace detail {
+namespace torch::detail {
 
 enum class TensorDataContainerType { Scalar, InitList, Tensor };
 
@@ -110,7 +109,6 @@ struct TensorDataContainer {
   // NOTE: For tensors with zero-size dimensions (e.g. `torch::tensor({{},
   // {}})`), the innermost empty braced-init-list `{}` matches the default
   // constructor of the innermost `TensorDataContainer`.
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   TensorDataContainer()
       : sizes_({0}),
         // NOTE: In Python, the dtype of tensors with zero-size dimensions (e.g.
@@ -121,19 +119,14 @@ struct TensorDataContainer {
         type_(TensorDataContainerType::InitList) {}
 #define TENSOR(T, S)                            \
   TensorDataContainer(T value)                  \
-      : sizes_(),                               \
-        scalar_type_(at::k##S),                 \
+      : scalar_type_(at::k##S),                 \
         type_(TensorDataContainerType::Scalar), \
         scalar_(value) {}
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TENSOR)
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   AT_FORALL_COMPLEX_TYPES(TENSOR)
 #undef TENSOR
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   TensorDataContainer(std::initializer_list<TensorDataContainer> init_list)
-      : sizes_(),
-        scalar_type_(init_list.begin()->scalar_type()),
+      : scalar_type_(init_list.begin()->scalar_type()),
         type_(TensorDataContainerType::InitList),
         init_list_(init_list) {
     const TensorDataContainer& first_elem = *(init_list.begin());
@@ -157,7 +150,7 @@ struct TensorDataContainer {
           elem.scalar_type());
     }
     sizes_.reserve(first_elem.sizes().size() + 1);
-    sizes_.push_back(init_list.size());
+    sizes_.push_back(static_cast<int64_t>(init_list.size()));
     sizes_.insert(
         sizes_.end(), first_elem.sizes().begin(), first_elem.sizes().end());
   }
@@ -174,9 +167,7 @@ struct TensorDataContainer {
       tensor_ = at::tensor(values, at::dtype(scalar_type_).device(at::kCPU)); \
     }                                                                         \
   }
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TENSOR)
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   AT_FORALL_COMPLEX_TYPES(TENSOR)
 #undef TENSOR
 
@@ -194,9 +185,7 @@ struct TensorDataContainer {
 #define TENSOR(T, S)                                \
   TensorDataContainer(const std::vector<T>& values) \
       : TensorDataContainer(at::ArrayRef<T>(values)) {}
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   AT_FORALL_SCALAR_TYPES_AND2(Half, BFloat16, TENSOR)
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   AT_FORALL_COMPLEX_TYPES(TENSOR)
 #undef TENSOR
 
@@ -283,7 +272,7 @@ struct TensorDataContainer {
           "TensorDataContainer_pretty_print_scalar",
           [&] { stream << scalar_.to<scalar_t>(); });
     } else if (is_init_list()) {
-      stream << "{";
+      stream << '{';
       for (const TensorDataContainer* it = init_list_.begin();
            it != init_list_.end();
            it++) {
@@ -291,9 +280,9 @@ struct TensorDataContainer {
         if (std::next(it) != init_list_.end())
           stream << ", ";
       }
-      stream << "}";
+      stream << '}';
     } else if (is_tensor()) {
-      stream << "{";
+      stream << '{';
       for (const auto i : c10::irange(tensor_.sizes()[0])) {
         AT_DISPATCH_ALL_TYPES_AND3(
             at::kBool,
@@ -305,7 +294,7 @@ struct TensorDataContainer {
         if (i != tensor_.sizes()[0] - 1)
           stream << ", ";
       }
-      stream << "}";
+      stream << '}';
     } else {
       TORCH_INTERNAL_ASSERT(false, "Invalid TensorDataContainer type");
     }
@@ -328,7 +317,7 @@ struct TensorDataContainer {
           " in its first dimension, but got Tensor with size ",
           tensor.sizes()[0],
           " in its first dimension");
-      size_t index = 0;
+      int64_t index = 0;
       for (const auto& elem : init_list_) {
         at::Tensor slice = tensor[index];
         elem.fill_tensor(slice);
@@ -358,6 +347,4 @@ inline std::ostream& operator<<(
   return stream;
 }
 
-} // namespace detail
-
-} // namespace torch
+} // namespace torch::detail

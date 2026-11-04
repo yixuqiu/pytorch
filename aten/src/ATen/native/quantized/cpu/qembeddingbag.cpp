@@ -3,6 +3,7 @@
 #include <ATen/native/quantized/cpu/EmbeddingPackedParams.h>
 #include <ATen/native/quantized/cpu/fbgemm_utils.h>
 #include <ATen/native/quantized/cpu/qembeddingbag.h>
+#include <ATen/native/quantized/library.h>
 #include <torch/library.h>
 #ifdef USE_FBGEMM
 #include <fbgemm/Fbgemm.h>
@@ -24,7 +25,9 @@
 #include <ATen/ops/resize_native.h>
 #endif
 
-int register_embedding_params();
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 namespace {
 
@@ -38,17 +41,17 @@ at::Tensor& embedding_lookup_fallback_impl(
     const at::Tensor& weight,
     const at::Tensor& indices,
     const at::Tensor& offsets,
-    const c10::optional<at::Tensor>& per_sample_weights_,
-    const c10::optional<at::Tensor>& compressed_indices_mapping,
+    const std::optional<at::Tensor>& per_sample_weights_,
+    const std::optional<at::Tensor>& compressed_indices_mapping,
     at::Tensor& output,
     const int64_t block_size,
     const int64_t output_size,
     bool include_last_offset,
     bool pruned) {
-  auto* output_data = output.data_ptr<float>();
-  const auto weight_data = weight.data_ptr<uint8_t>();
-  const auto indices_data = indices.data_ptr<IndexType>();
-  int32_t* compressed_indices_mapping_data = nullptr;
+  auto* output_data = output.mutable_data_ptr<float>();
+  const auto weight_data = weight.const_data_ptr<uint8_t>();
+  const auto indices_data = indices.const_data_ptr<IndexType>();
+  const int32_t* compressed_indices_mapping_data = nullptr;
   const auto weight_sizes = weight.sizes();
   const int64_t N = weight_sizes[0];
   const int64_t weight_size = weight_sizes[1];
@@ -67,10 +70,9 @@ at::Tensor& embedding_lookup_fallback_impl(
   }
 
   int64_t current = 0;
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  float* per_sample_weights_data;
+  const float* per_sample_weights_data = nullptr;
   if (per_sample_weights_.has_value()) {
-    per_sample_weights_data = per_sample_weights_.value().data_ptr<float>();
+    per_sample_weights_data = per_sample_weights_.value().const_data_ptr<float>();
   }
   for (const auto m : c10::irange(output_size)) {
     memset(output_data, 0, block_size * sizeof(float));
@@ -79,8 +81,7 @@ at::Tensor& embedding_lookup_fallback_impl(
         "Expect the lengths data to be less than indices size");
 
     for (int i = 0; i < lengths_data[m]; ++i, ++current) {
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-      int64_t idx;
+      int64_t idx = -1;
       if (!pruned) {
         idx = indices_data[current];
         TORCH_CHECK((idx >= 0 && idx < N), "Invalid indices data");
@@ -88,7 +89,7 @@ at::Tensor& embedding_lookup_fallback_impl(
         int64_t uncompressed_idx = indices_data[current];
         int compressed_index_size = compressed_indices_mapping.value().numel();
         compressed_indices_mapping_data =
-            compressed_indices_mapping.value().data_ptr<int32_t>();
+            compressed_indices_mapping.value().const_data_ptr<int32_t>();
         TORCH_CHECK(
             uncompressed_idx >= 0 && uncompressed_idx < compressed_index_size,
             "Invalid indices data for Sparse Op.")
@@ -102,9 +103,8 @@ at::Tensor& embedding_lookup_fallback_impl(
       if (per_sample_weights_.has_value()) {
         weight_val = per_sample_weights_data[current];
       }
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-      float scale, bias;
-      if (BIT_RATE == 8) {
+      float scale = std::numeric_limits<float>::quiet_NaN(), bias = std::numeric_limits<float>::quiet_NaN();
+      if constexpr (BIT_RATE == 8) {
         const uint8_t* scale_bias =
             weight_data + (idx + 1) * weight_size - 2 * sizeof(float);
         uint32_t scale_val_int32 = 0;
@@ -190,6 +190,413 @@ at::Tensor& embedding_lookup_fallback_impl(
   return output;
 }
 
+#ifdef __aarch64__
+[[maybe_unused]] static inline void embedding_neon_kernel(
+    const uint8_t* weight_ptr,
+    float32x4_t& output1,
+    float32x4_t& output2,
+    float32x4_t& output3,
+    float32x4_t& output4,
+    const float32x4_t& scale,
+    const uint8x16_t& zero) {
+  auto w_u8 = vld1q_u8(weight_ptr);
+  auto w_lo_u16 = vreinterpretq_u16_u8(vzip1q_u8(w_u8, zero));
+  auto w_hi_u16 = vreinterpretq_u16_u8(vzip2q_u8(w_u8, zero));
+
+  auto w_u32_1 = vreinterpretq_u32_u16(vzip1q_u16(w_lo_u16, vreinterpretq_u16_u8(zero)));
+  auto w_u32_2 = vreinterpretq_u32_u16(vzip2q_u16(w_lo_u16, vreinterpretq_u16_u8(zero)));
+  auto w_u32_3 = vreinterpretq_u32_u16(vzip1q_u16(w_hi_u16, vreinterpretq_u16_u8(zero)));
+  auto w_u32_4 = vreinterpretq_u32_u16(vzip2q_u16(w_hi_u16, vreinterpretq_u16_u8(zero)));
+
+  auto w_1 = vcvtq_f32_u32(w_u32_1);
+  auto w_2 = vcvtq_f32_u32(w_u32_2);
+  auto w_3 = vcvtq_f32_u32(w_u32_3);
+  auto w_4 = vcvtq_f32_u32(w_u32_4);
+
+  output1 = vmlaq_f32(output1, w_1, scale);
+  output2 = vmlaq_f32(output2, w_2, scale);
+  output3 = vmlaq_f32(output3, w_3, scale);
+  output4 = vmlaq_f32(output4, w_4, scale);
+}
+
+[[maybe_unused]] static inline void embedding_neon_kernel(
+    const uint8_t* weight_ptr,
+    float32x4_t& output1,
+    float32x4_t& output2,
+    const float32x4_t& scale,
+    const uint8x16_t& zero) {
+  auto w_u8 = vreinterpretq_u8_u64(vdupq_lane_u64(vreinterpret_u64_u8(vld1_u8(weight_ptr)), 0));
+  auto w_lo_u16 = vreinterpretq_u16_u8(vzip1q_u8(w_u8, zero));
+
+  auto w_u32_1 = vreinterpretq_u32_u16(vzip1q_u16(w_lo_u16, vreinterpretq_u16_u8(zero)));
+  auto w_u32_2 = vreinterpretq_u32_u16(vzip2q_u16(w_lo_u16, vreinterpretq_u16_u8(zero)));
+
+  auto w_1 = vcvtq_f32_u32(w_u32_1);
+  auto w_2 = vcvtq_f32_u32(w_u32_2);
+
+  output1 = vmlaq_f32(output1, w_1, scale);
+  output2 = vmlaq_f32(output2, w_2, scale);
+}
+
+struct load_output_neon {
+  void operator()(float32x4x4_t& output, float* output_data, uint32_t j) {
+    output.val[0] = vld1q_f32(&output_data[j]);
+    output.val[1] = vld1q_f32(&output_data[j+4]);
+    output.val[2] = vld1q_f32(&output_data[j+8]);
+    output.val[3] = vld1q_f32(&output_data[j+12]);
+  }
+  void operator()(float32x4x2_t& output, float* output_data, uint32_t j) {
+    output.val[0] = vld1q_f32(&output_data[j]);
+    output.val[1] = vld1q_f32(&output_data[j+4]);
+  }
+};
+
+struct store_output_neon {
+  void operator()(float32x4x4_t& output, float* output_data, uint32_t j) {
+    vst1q_f32(&output_data[j], output.val[0]);
+    vst1q_f32(&output_data[j+4], output.val[1]);
+    vst1q_f32(&output_data[j+8], output.val[2]);
+    vst1q_f32(&output_data[j+12], output.val[3]);
+  }
+  void operator()(float32x4x2_t& output, float* output_data, uint32_t j) {
+    vst1q_f32(&output_data[j], output.val[0]);
+    vst1q_f32(&output_data[j+4], output.val[1]);
+  }
+};
+
+struct add_bias_neon {
+  void operator()(float32x4x4_t& output, const float32x4_t& bias_vec) {
+    output.val[0] = vaddq_f32(output.val[0], bias_vec);
+    output.val[1] = vaddq_f32(output.val[1], bias_vec);
+    output.val[2] = vaddq_f32(output.val[2], bias_vec);
+    output.val[3] = vaddq_f32(output.val[3], bias_vec);
+  }
+  void operator()(float32x4x2_t& output, const float32x4_t& bias_vec) {
+    output.val[0] = vaddq_f32(output.val[0], bias_vec);
+    output.val[1] = vaddq_f32(output.val[1], bias_vec);
+  }
+};
+
+template <
+    typename IndexType,
+    typename OffsetType>
+at::Tensor& embedding_lookup_byte_neon_impl(
+    const at::Tensor& weight,
+    const at::Tensor& indices,
+    const at::Tensor& offsets,
+    at::Tensor& output,
+    const int64_t block_size,
+    const int64_t output_size,
+    bool include_last_offset) {
+  auto* output_data = output.mutable_data_ptr<float>();
+  const auto weight_data = weight.const_data_ptr<uint8_t>();
+  const auto indices_data = indices.const_data_ptr<IndexType>();
+  const auto weight_sizes = weight.sizes();
+  const int64_t weight_size = weight_sizes[1];
+  const int index_size = indices.numel();
+
+  auto accessor = offsets.accessor<OffsetType, 1>();
+  std::vector<OffsetType> lengths_data;
+
+  int64_t lower = accessor[0];
+  for (const auto i : c10::irange(1, offsets.numel())) {
+    lengths_data.push_back(accessor[i] - lower);
+    lower = accessor[i];
+  }
+  if (!include_last_offset) {
+    lengths_data.push_back(indices.numel() - lower);
+  }
+
+  int64_t current = 0;
+
+  load_output_neon load_output;
+  store_output_neon store_output;
+  add_bias_neon add_bias;
+
+  auto zero_u8 = vdupq_n_u8(0);
+
+  for (const auto m : c10::irange(output_size)) {
+    memset(output_data, 0, block_size * sizeof(float));
+    TORCH_CHECK(
+        current + lengths_data[m] <= index_size,
+        "Expect the lengths data to be less than indices size");
+
+    int i = 0;
+    while (i + 15 < lengths_data[m]) {
+      const uint8_t* wei_ptr[16];
+      float bias = 0.0f;
+      float scale[16];
+      float32x4_t scale_vec[16];
+      for (int j = 0; j < 16; ++j) {
+        wei_ptr[j] = weight_data + indices_data[current + j] * weight_size;
+        bias += *(float*)(wei_ptr[j] + weight_size - sizeof(float));
+        scale[j] = *(float*)(wei_ptr[j] + weight_size - 2 * sizeof(float));
+        scale_vec[j] = vdupq_n_f32(scale[j]);
+      }
+      auto bias_vec = vdupq_n_f32(bias);
+
+      uint32_t j = 0;
+      while (j + 15 < block_size) {
+        float32x4x4_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+#if defined(__GNUC__)
+#pragma GCC unroll 16
+#elif defined(__clang__)
+#pragma clang loop unroll_count(16)
+#endif
+        for (uint32_t jj = 0; jj < 16; ++jj) {
+          embedding_neon_kernel(wei_ptr[jj] + j, output.val[0], output.val[1], output.val[2], output.val[3], scale_vec[jj], zero_u8);
+        }
+
+        store_output(output, output_data, j);
+        j += 16;
+      }
+
+      while (j + 7 < block_size) {
+        float32x4x2_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+#if defined(__GNUC__)
+#pragma GCC unroll 16
+#elif defined(__clang__)
+#pragma clang loop unroll_count(16)
+#endif
+        for (uint32_t jj = 0; jj < 16; ++jj) {
+          embedding_neon_kernel(wei_ptr[jj] + j, output.val[0], output.val[1], scale_vec[jj], zero_u8);
+        }
+
+        store_output(output, output_data, j);
+        j += 8;
+      }
+
+      while (j < block_size) {
+        output_data[j] += bias;
+        for (uint32_t jj = 0; jj < 16; ++jj) {
+          output_data[j] += (float)(*(wei_ptr[jj] + j)) * scale[jj];
+        }
+        j++;
+      }
+      i+=16;
+      current+=16;
+    }
+
+    while (i + 7 < lengths_data[m]) {
+      const uint8_t* wei_ptr[8];
+      float bias = 0.0f;
+      float scale[8];
+      float32x4_t scale_vec[8];
+      for (int j = 0; j < 8; ++j) {
+        wei_ptr[j] = weight_data + indices_data[current + j] * weight_size;
+        bias += *(float*)(wei_ptr[j] + weight_size - sizeof(float));
+        scale[j] = *(float*)(wei_ptr[j] + weight_size - 2 * sizeof(float));
+        scale_vec[j] = vdupq_n_f32(scale[j]);
+      }
+      auto bias_vec = vdupq_n_f32(bias);
+
+      uint32_t j = 0;
+      while (j + 15 < block_size) {
+        float32x4x4_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#elif defined(__clang__)
+#pragma clang loop unroll_count(8)
+#endif
+        for (uint32_t jj = 0; jj < 8; ++jj) {
+          embedding_neon_kernel(wei_ptr[jj] + j, output.val[0], output.val[1], output.val[2], output.val[3], scale_vec[jj], zero_u8);
+        }
+
+        store_output(output, output_data, j);
+        j += 16;
+      }
+
+      while (j + 7 < block_size) {
+        float32x4x2_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#elif defined(__clang__)
+#pragma clang loop unroll_count(8)
+#endif
+        for (uint32_t jj = 0; jj < 8; ++jj) {
+          embedding_neon_kernel(wei_ptr[jj] + j, output.val[0], output.val[1], scale_vec[jj], zero_u8);
+        }
+
+        store_output(output, output_data, j);
+        j += 8;
+      }
+
+      while (j < block_size) {
+        output_data[j] += bias;
+        for (uint32_t jj = 0; jj < 8; ++jj) {
+          output_data[j] += (float)(*(wei_ptr[jj] + j)) * scale[jj];
+        }
+        j++;
+      }
+      i+=8;
+      current+=8;
+    }
+
+    while (i + 3 < lengths_data[m]) {
+      const uint8_t* wei_ptr[4];
+      float bias = 0.0f;
+      float scale[4];
+      float32x4_t scale_vec[4];
+      for (int j = 0; j < 4; ++j) {
+        wei_ptr[j] = weight_data + indices_data[current + j] * weight_size;
+        bias += *(float*)(wei_ptr[j] + weight_size - sizeof(float));
+        scale[j] = *(float*)(wei_ptr[j] + weight_size - 2 * sizeof(float));
+        scale_vec[j] = vdupq_n_f32(scale[j]);
+      }
+      auto bias_vec = vdupq_n_f32(bias);
+
+      uint32_t j = 0;
+      while (j + 15 < block_size) {
+        float32x4x4_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#elif defined(__clang__)
+#pragma clang loop unroll_count(4)
+#endif
+        for (uint32_t jj = 0; jj < 4; ++jj) {
+          embedding_neon_kernel(wei_ptr[jj] + j, output.val[0], output.val[1], output.val[2], output.val[3], scale_vec[jj], zero_u8);
+        }
+
+        store_output(output, output_data, j);
+        j += 16;
+      }
+
+      while (j + 7 < block_size) {
+        float32x4x2_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#elif defined(__clang__)
+#pragma clang loop unroll_count(4)
+#endif
+        for (uint32_t jj = 0; jj < 4; ++jj) {
+          embedding_neon_kernel(wei_ptr[jj] + j, output.val[0], output.val[1], scale_vec[jj], zero_u8);
+        }
+
+        store_output(output, output_data, j);
+        j += 8;
+      }
+
+      while (j < block_size) {
+        output_data[j] += bias;
+        for (uint32_t jj = 0; jj < 4; ++jj) {
+          output_data[j] += (float)(*(wei_ptr[jj] + j)) * scale[jj];
+        }
+        j++;
+      }
+      i+=4;
+      current+=4;
+    }
+
+    while (i + 1 < lengths_data[m]) {
+      const uint8_t* wei_ptr[2];
+      float bias = 0.0f;
+      float scale[2];
+      float32x4_t scale_vec[2];
+      for (int j = 0; j < 2; ++j) {
+        wei_ptr[j] = weight_data + indices_data[current + j] * weight_size;
+        bias += *(float*)(wei_ptr[j] + weight_size - sizeof(float));
+        scale[j] = *(float*)(wei_ptr[j] + weight_size - 2 * sizeof(float));
+        scale_vec[j] = vdupq_n_f32(scale[j]);
+      }
+      auto bias_vec = vdupq_n_f32(bias);
+
+      uint32_t j = 0;
+      while (j + 15 < block_size) {
+        float32x4x4_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+        embedding_neon_kernel(wei_ptr[0] + j, output.val[0], output.val[1], output.val[2], output.val[3], scale_vec[0], zero_u8);
+        embedding_neon_kernel(wei_ptr[1] + j, output.val[0], output.val[1], output.val[2], output.val[3], scale_vec[1], zero_u8);
+
+        store_output(output, output_data, j);
+        j += 16;
+      }
+
+      while (j + 7 < block_size) {
+        float32x4x2_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+        embedding_neon_kernel(wei_ptr[0] + j, output.val[0], output.val[1], scale_vec[0], zero_u8);
+        embedding_neon_kernel(wei_ptr[1] + j, output.val[0], output.val[1], scale_vec[1], zero_u8);
+
+        store_output(output, output_data, j);
+        j += 8;
+      }
+
+      while (j < block_size) {
+        output_data[j] += bias;
+        output_data[j] += (float)(*(wei_ptr[0] + j)) * scale[0];
+        output_data[j] += (float)(*(wei_ptr[1] + j)) * scale[1];
+        j++;
+      }
+      i+=2;
+      current+=2;
+    }
+
+    while (i < lengths_data[m]) {
+      auto wei_ptr = weight_data + indices_data[current] * weight_size;
+      float bias = *(float*)(wei_ptr + weight_size - sizeof(float));
+      auto scale = *(float*)(wei_ptr + weight_size - 2 * sizeof(float));
+      auto bias_vec = vdupq_n_f32(bias);
+      auto scale_vec = vdupq_n_f32(scale);
+
+      uint32_t j = 0;
+      while (j + 15 < block_size) {
+        float32x4x4_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+        embedding_neon_kernel(wei_ptr + j, output.val[0], output.val[1], output.val[2], output.val[3], scale_vec, zero_u8);
+
+        store_output(output, output_data, j);
+        j += 16;
+      }
+
+      while (j + 7 < block_size) {
+        float32x4x2_t output;
+        load_output(output, output_data, j);
+        add_bias(output, bias_vec);
+
+        embedding_neon_kernel(wei_ptr + j, output.val[0], output.val[1], scale_vec, zero_u8);
+
+        store_output(output, output_data, j);
+        j += 8;
+      }
+
+      while (j < block_size) {
+        output_data[j] += bias;
+        output_data[j] += (float)(*(wei_ptr + j)) * scale;
+        j++;
+      }
+      ++i;
+      ++current;
+    }
+    output_data += block_size;
+  } // for each m
+  return output;
+}
+#endif
+
 namespace {
 template <typename IndexType, typename OffsetType>
 void fbgemm_spmdm_report_error_(
@@ -199,7 +606,7 @@ void fbgemm_spmdm_report_error_(
     const OffsetType* offsets,
     const IndexType* indices) {
   for (const auto m : c10::irange(output_size)) {
-    for (OffsetType i = offsets[m]; i < offsets[m + 1]; ++i) {
+    for (const auto i : c10::irange(offsets[m], offsets[m + 1])) {
       TORCH_CHECK(i < index_size);
       IndexType idx = indices[i];
       TORCH_CHECK(
@@ -227,23 +634,23 @@ at::Tensor& embedding_bag_nbit_impl(
     const at::Tensor& indices,
     const at::Tensor& offsets,
     bool pruned_weights,
-    const c10::optional<at::Tensor>& per_sample_weights_,
-    const c10::optional<at::Tensor>& compressed_indices_mapping,
+    const std::optional<at::Tensor>& per_sample_weights_,
+    const std::optional<at::Tensor>& compressed_indices_mapping,
     bool include_last_offset,
     bool is_embedding_op) {
   TORCH_CHECK(weight.dim() == 2);
   TORCH_CHECK(offsets.dim() == 1);
 
-  auto offsets_data = offsets.data_ptr<OffsetType>();
+  const OffsetType* offsets_data = offsets.const_data_ptr<OffsetType>();
 
   // Get compressed indices for pruned_weights op.
-  int32_t* compressed_indices_mapping_data = nullptr;
+  const int32_t* compressed_indices_mapping_data = nullptr;
   int compressed_index_size = 0;
   bool fallback_to_no_sparse = false;
   if (pruned_weights) {
     compressed_index_size = compressed_indices_mapping.value().numel();
     compressed_indices_mapping_data =
-        compressed_indices_mapping.value().data_ptr<int32_t>();
+        compressed_indices_mapping.value().const_data_ptr<int32_t>();
 
     // if compressed_indices_mapping is [0], it is a indicator that
     // we should fallback to non sparse embedding look up kernel.
@@ -277,8 +684,7 @@ at::Tensor& embedding_bag_nbit_impl(
     offsets_data = offsets_include_last_val.data();
   }
   {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<int64_t, 3> shape_arr;
+    std::array<int64_t, 3> shape_arr{};
     c10::IntArrayRef shape;
     if(indices.dim() == 2 && is_embedding_op) {
       const auto indices_sizes = indices.sizes();
@@ -291,12 +697,12 @@ at::Tensor& embedding_bag_nbit_impl(
       shape_arr[1] = D;
       shape = c10::IntArrayRef(&shape_arr[0], 2);
     }
-    at::native::resize_(output, shape, c10::nullopt);
+    at::native::resize_(output, shape, std::nullopt);
   }
 #ifdef USE_FBGEMM
-  const auto indices_data = indices.data_ptr<IndexType>();
-  const auto weight_data = weight.data_ptr<uint8_t>();
-  auto* output_data = output.data_ptr<float>();
+  const auto indices_data = indices.const_data_ptr<IndexType>();
+  const auto weight_data = weight.const_data_ptr<uint8_t>();
+  auto* output_data = output.mutable_data_ptr<float>();
   const int64_t N = weight_sizes[0];
 
   const int64_t block_size = D;
@@ -304,7 +710,11 @@ at::Tensor& embedding_bag_nbit_impl(
   constexpr int prefetch_distance = 16;
   if (!pruned_weights || fallback_to_no_sparse) {
     // Generate the fbgemm kernel
-    auto kernel = fbgemm::GenerateEmbeddingSpMDMNBit<IndexType, OffsetType>(
+    auto kernel = fbgemm::GenerateEmbeddingSpMDMNBitWithStrides<
+        IndexType,
+        OffsetType,
+        /*OutType=*/float,
+        /*THREAD_LOCAL=*/true>(
         /*bit rate=*/bit_width,
         /*block size=*/block_size,
         /*has weights=*/per_sample_weights_.has_value(),
@@ -322,7 +732,7 @@ at::Tensor& embedding_bag_nbit_impl(
         /*offsets=*/offsets_data,
         /*weights=*/
         per_sample_weights_.has_value()
-            ? per_sample_weights_.value().data_ptr<float>()
+            ? per_sample_weights_.value().const_data_ptr<float>()
             : nullptr,
         /*output=*/output_data);
 
@@ -331,8 +741,17 @@ at::Tensor& embedding_bag_nbit_impl(
           output_size, index_size, N, offsets_data, indices_data);
     }
   } else {
+    // OSS builds can pin an FBGEMM that predates the THREAD_LOCAL parameter on
+    // this path, in which case the globally cached kernel is used.
+#ifdef FBGEMM_HAS_SPMDM_NBIT_ROWWISE_SPARSE_THREAD_LOCAL
+    auto kernel = fbgemm::GenerateEmbeddingSpMDMNBitRowWiseSparse<
+        IndexType,
+        OffsetType,
+        /*THREAD_LOCAL=*/true>(
+#else
     auto kernel =
         fbgemm::GenerateEmbeddingSpMDMNBitRowWiseSparse<IndexType, OffsetType>(
+#endif
             /*bit rate=*/bit_width,
             /*block_size=*/block_size,
             /*has weights=*/per_sample_weights_.has_value(),
@@ -349,7 +768,7 @@ at::Tensor& embedding_bag_nbit_impl(
         /*offsets=*/offsets_data,
         /*weights=*/
         per_sample_weights_.has_value()
-            ? per_sample_weights_.value().data_ptr<float>()
+            ? per_sample_weights_.value().const_data_ptr<float>()
             : nullptr,
         /*output=*/output_data,
         /*compressed_indices_table=*/compressed_indices_mapping_data);
@@ -399,23 +818,23 @@ at::Tensor& embedding_bag_byte_impl(
     const at::Tensor& indices,
     const at::Tensor& offsets,
     bool pruned_weights,
-    const c10::optional<at::Tensor>& per_sample_weights_,
-    const c10::optional<at::Tensor>& compressed_indices_mapping,
+    const std::optional<at::Tensor>& per_sample_weights_,
+    const std::optional<at::Tensor>& compressed_indices_mapping,
     bool include_last_offset,
     bool is_embedding_op) {
   TORCH_CHECK(weight.scalar_type() == at::kByte);
   TORCH_CHECK(weight.dim() == 2);
   TORCH_CHECK(offsets.dim() == 1);
-  auto offsets_data = offsets.data_ptr<OffsetType>();
+  const OffsetType* offsets_data = offsets.const_data_ptr<OffsetType>();
 
   // Get compressed indices for pruned_weights.
-  int32_t* compressed_indices_mapping_data = nullptr;
+  const int32_t* compressed_indices_mapping_data = nullptr;
   int compressed_index_size = 0;
   bool fallback_to_no_sparse = false;
   if (pruned_weights) {
     compressed_index_size = compressed_indices_mapping.value().numel();
     compressed_indices_mapping_data =
-        compressed_indices_mapping.value().data_ptr<int32_t>();
+        compressed_indices_mapping.value().const_data_ptr<int32_t>();
 
     // if compressed_indices_mapping is [0], it is a indicator that
     // we should fallback to non sparse embedding look up kernel.
@@ -447,8 +866,7 @@ at::Tensor& embedding_bag_byte_impl(
     offsets_data = offsets_include_last_val.data();
   }
   {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<int64_t, 3> shape_arr;
+    std::array<int64_t, 3> shape_arr{};
     c10::IntArrayRef shape;
     if (indices.dim() == 2 && is_embedding_op) {
       const auto indices_sizes = indices.sizes();
@@ -461,24 +879,48 @@ at::Tensor& embedding_bag_byte_impl(
       shape_arr[1] = D;
       shape = c10::IntArrayRef(&shape_arr[0], 2);
     }
-    at::native::resize_(output, shape, c10::nullopt);
+    at::native::resize_(output, shape, std::nullopt);
   }
 #ifdef USE_FBGEMM
   const int64_t N = weight_sizes[0];
-  const auto weight_data = weight.data_ptr<uint8_t>();
-  const auto indices_data = indices.data_ptr<IndexType>();
-  auto* output_data = output.data_ptr<float>();
+  const auto weight_data = weight.const_data_ptr<uint8_t>();
+  const auto indices_data = indices.const_data_ptr<IndexType>();
+  auto* output_data = output.mutable_data_ptr<float>();
   const int index_size = indices.numel();
 
+  // Each template instantiation keeps one entry per thread to bound state and
+  // optimize stable shapes; alternating keys regenerate. Unkeyed
+  // normalize_by_lengths, prefetch, is_weight_positional, use_offsets, and
+  // process-wide dispatch overrides must remain fixed after first use.
   if (!pruned_weights || fallback_to_no_sparse) {
-    auto kernel_i8 =
-        fbgemm::GenerateEmbeddingSpMDM<uint8_t, IndexType, OffsetType, /*OutType=*/float, /*TRHEAD_LOCAL=*/true>(
-            /*block_size=*/D,
-            /*has_weight=*/per_sample_weights_.has_value(),
-            /*normalize_by_lengths=*/false,
-            /*prefetch=*/16, // NOLINT(cppcoreguidelines-avoid-magic-numbers)
-            /*is_weight_positional=*/false,
-            /*use_offsets=*/true);
+    using KernelType = typename fbgemm::EmbeddingSpMDMKernelSignature<
+        uint8_t,
+        IndexType,
+        OffsetType,
+        /*OutType=*/float>::Type;
+    struct KernelCache {
+      int64_t D = 0;
+      bool has_weight = false;
+      bool valid = false;
+      KernelType kernel;
+    };
+    static thread_local KernelCache kernel_cache;
+    const bool has_weight = per_sample_weights_.has_value();
+    if (!kernel_cache.valid || kernel_cache.D != D ||
+        kernel_cache.has_weight != has_weight) {
+      kernel_cache.kernel =
+          fbgemm::GenerateEmbeddingSpMDM<uint8_t, IndexType, OffsetType, /*OutType=*/float, /*THREAD_LOCAL=*/true>(
+              /*block_size=*/D,
+              /*has_weight=*/has_weight,
+              /*normalize_by_lengths=*/false,
+              /*prefetch=*/16, // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+              /*is_weight_positional=*/false,
+              /*use_offsets=*/true);
+      kernel_cache.D = D;
+      kernel_cache.has_weight = has_weight;
+      kernel_cache.valid = true;
+    }
+    const auto& kernel_i8 = kernel_cache.kernel;
 
     at::parallel_for(
         0, output_size, 1, [&](int64_t start_idx, int64_t end_idx) {
@@ -507,14 +949,34 @@ at::Tensor& embedding_bag_byte_impl(
         });
   } else {
     // pruned weights
-    auto kernel_i8_sparse = fbgemm::
-        GenerateEmbeddingSpMDMRowWiseSparse<uint8_t, IndexType, OffsetType>(
-            /*block_size=*/D,
-            /*has_weight=*/per_sample_weights_.has_value(),
-            /*normalize_by_lengths=*/false,
-            /*prefetch=*/16, // NOLINT(cppcoreguidelines-avoid-magic-numbers)
-            /*is_weight_positional=*/false,
-            /*use_offsets=*/true);
+    using KernelType =
+        typename fbgemm::EmbeddingSpMDMRowWiseSparseKernelSignature<
+            uint8_t,
+            IndexType,
+            OffsetType>::Type;
+    struct KernelCache {
+      int64_t D = 0;
+      bool has_weight = false;
+      bool valid = false;
+      KernelType kernel;
+    };
+    static thread_local KernelCache kernel_cache;
+    const bool has_weight = per_sample_weights_.has_value();
+    if (!kernel_cache.valid || kernel_cache.D != D ||
+        kernel_cache.has_weight != has_weight) {
+      kernel_cache.kernel = fbgemm::
+          GenerateEmbeddingSpMDMRowWiseSparse<uint8_t, IndexType, OffsetType>(
+              /*block_size=*/D,
+              /*has_weight=*/has_weight,
+              /*normalize_by_lengths=*/false,
+              /*prefetch=*/16, // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+              /*is_weight_positional=*/false,
+              /*use_offsets=*/true);
+      kernel_cache.D = D;
+      kernel_cache.has_weight = has_weight;
+      kernel_cache.valid = true;
+    }
+    const auto& kernel_i8_sparse = kernel_cache.kernel;
 
     auto success = kernel_i8_sparse(
         /*output_size=*/output_size,
@@ -525,7 +987,7 @@ at::Tensor& embedding_bag_byte_impl(
         /*offsets=*/offsets_data,
         /*weights=*/
         per_sample_weights_.has_value()
-            ? per_sample_weights_.value().data_ptr<float>()
+            ? per_sample_weights_.value().const_data_ptr<float>()
             : nullptr,
         /*output=*/output_data,
         /*compressed_indices_table=*/compressed_indices_mapping_data);
@@ -540,6 +1002,18 @@ at::Tensor& embedding_bag_byte_impl(
   }
   return output;
 #else
+#if defined(__aarch64__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+  if (!(pruned_weights && !fallback_to_no_sparse) && !per_sample_weights_.has_value()) {
+    return embedding_lookup_byte_neon_impl<IndexType, OffsetType>(
+      weight,
+      indices,
+      offsets,
+      output,
+      D,
+      output_size,
+      include_last_offset);
+  }
+#endif
   return embedding_lookup_fallback_impl<IndexType, OffsetType, 8, 1>(
       weight,
       indices,
@@ -558,10 +1032,10 @@ at::Tensor& embedding_bag_byte_helper(
     at::Tensor& output,
     const at::Tensor& weight,
     const at::Tensor& indices,
-    const c10::optional<at::Tensor>& offsets_in,
+    const std::optional<at::Tensor>& offsets_in,
     bool pruned_weights,
-    const c10::optional<at::Tensor>& per_sample_weights_,
-    const c10::optional<at::Tensor>& compressed_indices_mapping,
+    const std::optional<at::Tensor>& per_sample_weights_,
+    const std::optional<at::Tensor>& compressed_indices_mapping,
     bool include_last_offset,
     bool is_embedding_op) {
   c10::MaybeOwned<at::Tensor> offsets;
@@ -656,10 +1130,10 @@ at::Tensor& _embedding_bag_nbit_helper(
     const at::Tensor& weight,
     const int bit_width,
     const at::Tensor& indices,
-    const c10::optional<at::Tensor>& offsets_in,
+    const std::optional<at::Tensor>& offsets_in,
     bool pruned_weights,
-    const c10::optional<at::Tensor>& per_sample_weights_,
-    const c10::optional<at::Tensor>& compressed_indices_mapping,
+    const std::optional<at::Tensor>& per_sample_weights_,
+    const std::optional<at::Tensor>& compressed_indices_mapping,
     bool include_last_offset,
     bool is_embedding_op) {
   c10::MaybeOwned<at::Tensor> offsets;
@@ -760,10 +1234,10 @@ at::Tensor& _embedding_bag_nbit_helper(
 
 at::Tensor PackedEmbeddingBagWeight::embeddingbag_byte(
     const at::Tensor& indices,
-    const c10::optional<at::Tensor>& offsets_in,
+    const std::optional<at::Tensor>& offsets_in,
     bool pruned_weights,
-    const c10::optional<at::Tensor>& per_sample_weights_,
-    const c10::optional<at::Tensor>& compressed_indices_mapping,
+    const std::optional<at::Tensor>& per_sample_weights_,
+    const std::optional<at::Tensor>& compressed_indices_mapping,
     bool include_last_offset,
     bool is_embedding_op) {
   auto output = at::empty({0}, packed_w.options().dtype(at::kFloat));
@@ -781,10 +1255,10 @@ at::Tensor PackedEmbeddingBagWeight::embeddingbag_byte(
 
 at::Tensor PackedEmbeddingBagWeight::embeddingbag_4bit(
     const at::Tensor& indices,
-    const c10::optional<at::Tensor>& offsets_in,
+    const std::optional<at::Tensor>& offsets_in,
     bool pruned_weights,
-    const c10::optional<at::Tensor>& per_sample_weights_,
-    const c10::optional<at::Tensor>& compressed_indices_mapping,
+    const std::optional<at::Tensor>& per_sample_weights_,
+    const std::optional<at::Tensor>& compressed_indices_mapping,
     bool include_last_offset,
     bool is_embedding_op) {
   if (per_sample_weights_.has_value()) {
@@ -812,19 +1286,18 @@ at::Tensor PackedEmbeddingBagWeight::embeddingbag_4bit(
     is_embedding_op);
 }
 
-namespace at {
-namespace native {
+namespace at::native {
 
 Tensor& embedding_bag_byte_rowwise_offsets_out(
     Tensor& output,
     const Tensor& weight,
     const Tensor& indices,
-    const c10::optional<Tensor>& offsets_in,
+    const std::optional<Tensor>& offsets_in,
     const bool /* scale_grad_by_freq */,
     const int64_t /* mode */,
     bool pruned_weights,
-    const c10::optional<Tensor>& per_sample_weights_,
-    const c10::optional<Tensor>& compressed_indices_mapping,
+    const std::optional<Tensor>& per_sample_weights_,
+    const std::optional<Tensor>& compressed_indices_mapping,
     bool include_last_offset) {
   return embedding_bag_byte_helper(
       output,
@@ -842,12 +1315,12 @@ Tensor& embedding_bag_4bit_rowwise_offsets_out(
     Tensor& output,
     const Tensor& weight,
     const Tensor& indices,
-    const c10::optional<Tensor>& offsets_in,
+    const std::optional<Tensor>& offsets_in,
     const bool /* scale_grad_by_freq */,
     const int64_t /* mode */,
     bool pruned_weights,
-    const c10::optional<Tensor>& per_sample_weights_,
-    const c10::optional<Tensor>& compressed_indices_mapping,
+    const std::optional<Tensor>& per_sample_weights_,
+    const std::optional<Tensor>& compressed_indices_mapping,
     bool include_last_offset) {
 
   if (per_sample_weights_.has_value()) {
@@ -877,12 +1350,12 @@ static Tensor& embedding_bag_2bit_rowwise_offsets_out(
     Tensor& output,
     const Tensor& weight,
     const Tensor& indices,
-    const c10::optional<Tensor>& offsets_in,
+    const std::optional<Tensor>& offsets_in,
     const bool /* scale_grad_by_freq */,
     const int64_t /* mode */,
     bool pruned_weights,
-    const c10::optional<Tensor>& per_sample_weights_,
-    const c10::optional<Tensor>& compressed_indices_mapping,
+    const std::optional<Tensor>& per_sample_weights_,
+    const std::optional<Tensor>& compressed_indices_mapping,
     bool include_last_offset) {
 
   if (per_sample_weights_.has_value()) {
@@ -915,18 +1388,18 @@ inline at::Tensor create_empty_from(
     const at::Tensor& t,
     c10::ScalarType dtype) {
   return at::detail::empty_cpu(
-      {0}, dtype, t.layout(), t.device(), c10::nullopt, c10::nullopt);
+      {0}, dtype, t.layout(), t.device(), std::nullopt, std::nullopt);
 }
 
 Tensor embedding_bag_byte_rowwise_offsets(
     const Tensor& weight,
     const Tensor& indices,
-    const c10::optional<Tensor>& offsets_in,
+    const std::optional<Tensor>& offsets_in,
     const bool /* scale_grad_by_freq */,
     const int64_t /* mode */,
     bool pruned_weights,
-    const c10::optional<Tensor>& per_sample_weights_,
-    const c10::optional<Tensor>& compressed_indices_mapping,
+    const std::optional<Tensor>& per_sample_weights_,
+    const std::optional<Tensor>& compressed_indices_mapping,
     bool include_last_offset) {
   auto output = create_empty_from(weight, at::kFloat);
   embedding_bag_byte_rowwise_offsets_out(
@@ -946,12 +1419,12 @@ Tensor embedding_bag_byte_rowwise_offsets(
 Tensor embedding_bag_4bit_rowwise_offsets(
     const Tensor& weight,
     const Tensor& indices,
-    const c10::optional<Tensor>& offsets_in,
+    const std::optional<Tensor>& offsets_in,
     const bool /* scale_grad_by_freq */,
     const int64_t /* mode */,
     bool pruned_weights,
-    const c10::optional<Tensor>& per_sample_weights_,
-    const c10::optional<Tensor>& compressed_indices_mapping,
+    const std::optional<Tensor>& per_sample_weights_,
+    const std::optional<Tensor>& compressed_indices_mapping,
     bool include_last_offset) {
   auto output = create_empty_from(weight, at::kFloat);
   embedding_bag_4bit_rowwise_offsets_out(
@@ -971,12 +1444,12 @@ Tensor embedding_bag_4bit_rowwise_offsets(
 Tensor embedding_bag_2bit_rowwise_offsets(
     const Tensor& weight,
     const Tensor& indices,
-    const c10::optional<Tensor>& offsets_in,
+    const std::optional<Tensor>& offsets_in,
     const bool /* scale_grad_by_freq */,
     const int64_t /* mode */,
     bool pruned_weights,
-    const c10::optional<Tensor>& per_sample_weights_,
-    const c10::optional<Tensor>& compressed_indices_mapping,
+    const std::optional<Tensor>& per_sample_weights_,
+    const std::optional<Tensor>& compressed_indices_mapping,
     bool include_last_offset) {
   auto output = create_empty_from(weight, at::kFloat);
   embedding_bag_2bit_rowwise_offsets_out(
@@ -996,12 +1469,12 @@ Tensor embedding_bag_2bit_rowwise_offsets(
 Tensor embedding_bag_byte_rowwise_offsets_meta(
     const Tensor& weight,
     const Tensor& indices,
-    const c10::optional<Tensor>& offsets_in,
+    const std::optional<Tensor>& offsets_in,
     const bool /* scale_grad_by_freq */,
     const int64_t /* mode */,
     bool /* pruned_weights */,
-    const c10::optional<Tensor>& /* per_sample_weights_ */,
-    const c10::optional<Tensor>& /* compressed_indices_mapping */,
+    const std::optional<Tensor>& /* per_sample_weights_ */,
+    const std::optional<Tensor>& /* compressed_indices_mapping */,
     bool include_last_offset) {
   TORCH_CHECK(
       indices.dim() == 1 || indices.dim() == 2,
@@ -1038,12 +1511,12 @@ class QEmbeddingBag final {
   static at::Tensor run(
       const c10::intrusive_ptr<EmbeddingPackedParamsBase>& packed_weight,
       const Tensor& indices,
-      const c10::optional<Tensor>& offsets,
+      const std::optional<Tensor>& offsets,
       const bool /* scale_grad_by_freq */,
       const int64_t /* mode */,
       bool pruned_weights,
-      const c10::optional<Tensor>& per_sample_weights_,
-      const c10::optional<Tensor>& compressed_indices_mapping,
+      const std::optional<Tensor>& per_sample_weights_,
+      const std::optional<Tensor>& compressed_indices_mapping,
       bool include_last_offset) {
     if (bit_rate == 8) {
       return packed_weight->embeddingbag_byte(
@@ -1082,13 +1555,15 @@ class QEmbedding final {
     const auto offsets_size = indices.numel();
     at::Tensor offsets = at::arange(0, offsets_size, indices.scalar_type());
     at::Tensor output;
+    static_assert(bit_rate==4 || bit_rate ==8,
+          "Currently only support 8-bit embedding quantization");
     if (bit_rate == 8) {
       return packed_weight->embeddingbag_byte(
           indices,
           offsets,
           pruned_weights,
-          c10::nullopt,
-          c10::nullopt,
+          std::nullopt,
+          std::nullopt,
           false /* include_last_offset */,
           true /* is_embedding_op */);
     } else if (bit_rate == 4) {
@@ -1096,14 +1571,10 @@ class QEmbedding final {
           indices,
           offsets,
           pruned_weights,
-          c10::nullopt,
-          c10::nullopt,
+          std::nullopt,
+          std::nullopt,
           false,
           true);
-    } else {
-      TORCH_INTERNAL_ASSERT(
-          false,
-          "Currently only support 8-bit embedding quantization");
     }
     return output;
   }
@@ -1143,5 +1614,4 @@ TORCH_LIBRARY_IMPL(quantized, Meta, m) {
 }
 
 } // namespace
-} // namespace native
-} // namespace at
+} // namespace at::native

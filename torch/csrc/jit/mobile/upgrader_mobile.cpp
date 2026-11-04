@@ -5,15 +5,13 @@
  * cd ~/pytorch && python torchgen/operator_versions/gen_mobile_upgraders.py
  */
 
-#include <caffe2/serialize/versions.h>
 #include <torch/csrc/jit/mobile/upgrader_mobile.h>
 
 namespace c10 {
 TypePtr parseType(const std::string& pythonStr);
 } // namespace c10
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // clang-format off
 
@@ -423,7 +421,6 @@ const std::vector<ByteCodeFunctionWithOperator>& getUpgraderBytecodeList() {
                                            Instruction{OpCode::STOREN, 1, 7},
                                            Instruction{OpCode::MOVE, 1, 0},
                                            Instruction{OpCode::MOVE, 2, 0},
-                                           Instruction{OpCode::MOVE, 3, 0},
                                            Instruction{OpCode::MOVE, 4, 0},
                                            Instruction{OpCode::MOVE, 5, 0},
                                            Instruction{OpCode::MOVE, 6, 0},
@@ -436,7 +433,7 @@ const std::vector<ByteCodeFunctionWithOperator>& getUpgraderBytecodeList() {
                                7
                            ),
                            std::vector<OperatorString>({
-                                   OperatorString({"aten::full", "names", 7}),
+                                   OperatorString({"aten::full", "", 6}),
                            }), // operators list
                    }),
                    ByteCodeFunctionWithOperator({
@@ -684,5 +681,4 @@ const std::vector<ByteCodeFunctionWithOperator>& getUpgraderBytecodeList() {
 
 // clang-format on
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

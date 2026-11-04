@@ -1,22 +1,15 @@
-#include <ATen/core/symbol.h>
 #include <ATen/record_function.h>
 #include <c10/util/Exception.h>
 #include <c10/util/StringUtil.h>
 #include <c10/util/irange.h>
-#include <torch/csrc/autograd/generated/variable_factories.h>
 #include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/api/module.h>
-#include <torch/csrc/jit/frontend/error_report.h>
-#include <torch/csrc/jit/frontend/ir_emitter.h>
-#include <torch/csrc/jit/frontend/schema_matching.h>
 #include <torch/csrc/jit/jit_log.h>
-#include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/freeze_module.h>
 #include <torch/csrc/jit/passes/frozen_conv_add_relu_fusion.h>
 #include <torch/csrc/jit/passes/frozen_graph_optimizations.h>
 #include <torch/csrc/jit/passes/frozen_linear_transpose.h>
 #include <torch/csrc/jit/passes/frozen_ops_to_mkldnn.h>
-#include <torch/csrc/jit/passes/inliner.h>
 #include <torch/csrc/jit/runtime/operator.h>
 
 #include <iostream>
@@ -43,7 +36,7 @@ void assert_ignored_methods_not_called(
   std::unordered_set<std::string> encountered_ignored_methods;
 
   for (Node* n : all_nodes) {
-    if (ignored_methods.count(n->s(attr::name)) > 0 &&
+    if (ignored_methods.contains(n->s(attr::name)) &&
         getInputDebugName(*n, 0) == "self") {
       encountered_ignored_methods.insert(
           getInputDebugName(*n, 0) + "." + n->s(attr::name));
@@ -80,7 +73,7 @@ void assert_ignored_attributes_not_referenced(
   std::unordered_set<std::string> encountered_ignored_attributes;
 
   for (Node* n : all_nodes) {
-    if (ignored_attributes.count(n->s(attr::name)) > 0 &&
+    if (ignored_attributes.contains(n->s(attr::name)) &&
         getInputDebugName(*n, 0) == "self") {
       encountered_ignored_attributes.insert(
           getInputDebugName(*n, 0) + "." + n->s(attr::name));
@@ -148,7 +141,7 @@ Module::Module(
 // as we bring up the system since it will degrade performance
 // and may introduce bugs. test_jit.py provides context managers
 // that enable it for specific tests.
-thread_local bool inline_everything = false;
+static thread_local bool inline_everything = false;
 bool& getInlineEverythingMode() {
   return inline_everything;
 }
@@ -158,17 +151,17 @@ void Module::to(at::Device device, at::ScalarType dtype, bool non_blocking) {
 }
 
 void Module::to(at::ScalarType dtype, bool non_blocking) {
-  to_impl(/*device=*/c10::nullopt, dtype, non_blocking);
+  to_impl(/*device=*/std::nullopt, dtype, non_blocking);
 }
 
 void Module::to(at::Device device, bool non_blocking) {
-  to_impl(device, /*dtype=*/c10::nullopt, non_blocking);
+  to_impl(device, /*dtype=*/std::nullopt, non_blocking);
 }
 
 static void module_state_to(
     const autograd::Variable& variable,
-    const c10::optional<at::Device>& device,
-    const c10::optional<at::ScalarType>& dtype,
+    const std::optional<at::Device>& device,
+    const std::optional<at::ScalarType>& dtype,
     bool non_blocking) {
   // Need to access the `at::Tensor` as a `Variable` here.
   // Use the data's original device or dtype if not supplied here.
@@ -180,8 +173,8 @@ static void module_state_to(
 }
 
 void Module::to_impl(
-    const c10::optional<at::Device>& device,
-    const c10::optional<at::ScalarType>& dtype,
+    const std::optional<at::Device>& device,
+    const std::optional<at::ScalarType>& dtype,
     bool non_blocking) {
   for (at::Tensor e : parameters()) {
     module_state_to(e, device, dtype, non_blocking);
@@ -317,13 +310,13 @@ Module Module::copy() const {
   return Module(_ivalue()->copy());
 }
 
-Module Module::deepcopy(c10::optional<at::Device> device) const {
+Module Module::deepcopy(std::optional<at::Device> device) const {
   return Module(_ivalue()->deepcopy(device));
 }
 
 Module Module::clone(bool inplace) const {
   std::unordered_map<TypePtr, TypePtr> type_remap;
-  IValue::HashAliasedIValueMap memo;
+  IValue::HashIdentityIValueMap memo;
   const std::unordered_set<std::string> ignored_methods;
   const std::unordered_set<std::string> ignored_attributes;
   return clone_impl(
@@ -335,7 +328,7 @@ Module Module::clone(
     const std::unordered_set<std::string>& ignored_methods,
     const std::unordered_set<std::string>& ignored_attributes) const {
   std::unordered_map<TypePtr, TypePtr> type_remap;
-  IValue::HashAliasedIValueMap memo;
+  IValue::HashIdentityIValueMap memo;
   return clone_impl(
       type_remap, inplace, memo, ignored_methods, ignored_attributes);
 }
@@ -343,7 +336,7 @@ Module Module::clone(
 Module Module::clone_impl(
     std::unordered_map<TypePtr, TypePtr>& type_remap,
     bool inplace,
-    IValue::HashAliasedIValueMap memo,
+    IValue::HashIdentityIValueMap memo,
     const std::unordered_set<std::string>& ignored_methods,
     const std::unordered_set<std::string>& ignored_attributes) const {
   // Create a new _ivalue in the same compilation unit.
@@ -351,7 +344,7 @@ Module Module::clone_impl(
   // ClassType during cloning, so we first need to check if the type
   // is already cloned, if so, we'll create a new module with the cloned
   // ClassType, if not, we'll create a new module and a new ClassType.
-  bool type_already_cloned = type_remap.find(type()) != type_remap.end();
+  bool type_already_cloned = type_remap.contains(type());
   Module r;
   if (type_already_cloned) {
     // if we cloned the class type before, we'll reuse it
@@ -372,7 +365,7 @@ Module Module::clone_impl(
 
     // If this attribute is in the list of ignored attributes, skip it
     // (i.e. do not clone it).
-    if (ignored_attributes.count(attr_name) != 0) {
+    if (ignored_attributes.contains(attr_name)) {
       continue;
     }
 
@@ -416,7 +409,7 @@ Module Module::clone_impl(
     // clone methods, remapping the types to the cloned ones.
     for (auto& fn : type()->methods()) {
       // If this method is not in the list of ignored methods, clone it.
-      if (ignored_methods.count(fn->name()) == 0) {
+      if (!ignored_methods.contains(fn->name())) {
         assert_ignored_methods_not_called(*fn, ignored_methods);
         assert_ignored_attributes_not_referenced(*fn, ignored_attributes);
         r.clone_method(*this, *fn, type_remap);
@@ -451,7 +444,8 @@ IValue Module::create_class(const c10::QualifiedName& name, Stack stack) const {
   const auto classType =
       _ivalue()->compilation_unit()->get_class(c10::QualifiedName(name));
   if (!classType) {
-    AT_ERROR(
+    TORCH_CHECK(
+        false,
         "Could not find class with name: '",
         name.qualifiedName(),
         "' in module.");
@@ -476,7 +470,7 @@ IValue Module::create_class(const c10::QualifiedName& name, Stack stack) const {
 
 Module freeze(
     const Module& module,
-    const c10::optional<std::vector<std::string>>& preserved_attrs,
+    const std::optional<std::vector<std::string>>& preserved_attrs,
     bool optimize_numerics) {
   TORCH_CHECK(
       !module.hasattr("training") || !module.is_training(),
@@ -564,47 +558,46 @@ std::string Module::dump_to_str(
   std::stringstream parameters_ss;
   std::stringstream attributes_ss;
   std::stringstream methods_ss;
-  std::stringstream submodules_ss;
 
   for (const NameTensor& p : named_parameters(/*recurse=*/false)) {
     parameters_ss << p.name << " = ";
     if (print_param_values) {
-      parameters_ss << p.value << std::endl;
+      parameters_ss << p.value << '\n';
     } else {
-      parameters_ss << "..." << std::endl;
+      parameters_ss << "..." << '\n';
     }
   }
 
   for (const NameValue& p : named_attributes(/*recurse=*/false)) {
     attributes_ss << p.name << " = ";
     if (!p.value.isTensor() || print_attr_values) {
-      attributes_ss << p.value << std::endl;
+      attributes_ss << p.value << '\n';
     } else {
-      attributes_ss << "..." << std::endl;
+      attributes_ss << "..." << '\n';
     }
   }
 
   for (const Method& method : get_methods()) {
-    methods_ss << "  method " << method.name() << " {" << std::endl;
+    methods_ss << "  method " << method.name() << " {" << '\n';
     if (print_method_bodies) {
       methods_ss << torch::jit::jit_log_prefix(
                         "    ", method.graph()->toString())
-                 << std::endl;
+                 << '\n';
     }
-    methods_ss << "  }" << std::endl;
+    methods_ss << "  }" << '\n';
   }
 
-  ss << "module " << type()->name()->qualifiedName() << " {" << std::endl;
-  ss << "  parameters {" << std::endl;
-  ss << torch::jit::jit_log_prefix("    ", parameters_ss.str());
-  ss << "  }" << std::endl;
-  ss << "  attributes {" << std::endl;
-  ss << torch::jit::jit_log_prefix("    ", attributes_ss.str());
-  ss << "  }" << std::endl;
-  ss << "  methods {" << std::endl;
-  ss << torch::jit::jit_log_prefix("  ", methods_ss.str());
-  ss << "  }" << std::endl;
-  ss << "  submodules {" << std::endl;
+  ss << "module " << type()->name()->qualifiedName() << " {" << '\n';
+  ss << "  parameters {" << '\n';
+  ss << torch::jit::jit_log_prefix("    ", std::move(parameters_ss).str());
+  ss << "  }" << '\n';
+  ss << "  attributes {" << '\n';
+  ss << torch::jit::jit_log_prefix("    ", std::move(attributes_ss).str());
+  ss << "  }" << '\n';
+  ss << "  methods {" << '\n';
+  ss << torch::jit::jit_log_prefix("  ", std::move(methods_ss).str());
+  ss << "  }" << '\n';
+  ss << "  submodules {" << '\n';
   for (const NameModule& s : named_children()) {
     // We do 4 spaces here, because one level of indentation comes from
     // 'submodules' scope and the other one goes from a specific submodule we're
@@ -614,10 +607,10 @@ std::string Module::dump_to_str(
         s.value.dump_to_str(
             print_method_bodies, print_attr_values, print_param_values));
   }
-  ss << "  }" << std::endl;
-  ss << "}" << std::endl;
+  ss << "  }" << '\n';
+  ss << '}' << '\n';
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
 void Module::dump(
@@ -626,7 +619,7 @@ void Module::dump(
     bool print_param_values = true) const {
   std::cout << dump_to_str(
                    print_method_bodies, print_attr_values, print_param_values)
-            << std::endl;
+            << '\n';
 }
 
 } // namespace torch::jit

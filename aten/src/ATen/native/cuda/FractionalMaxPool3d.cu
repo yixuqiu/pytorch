@@ -2,7 +2,6 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
 #include <ATen/Dispatch.h>
-#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/cuda/detail/IndexUtils.cuh>
@@ -14,6 +13,7 @@
 #include <ATen/native/FractionalMaxPooling.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
+#include <ATen/native/cuda/KernelUtils.cuh>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -60,7 +60,7 @@ __global__ void fractional_max_pool3d_out_frame(
   int64_t poolSizeT, int64_t poolSizeH, int64_t poolSizeW) {
     using accscalar_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
     // Output (t, h, w) point that this thread is responsible for
-    int64_t ourOutputPoint = threadIdx.x + blockIdx.x * blockDim.x;
+    int64_t ourOutputPoint = threadIdx.x + ((int64_t) blockIdx.x) * blockDim.x;
     int64_t plane = blockIdx.y;
     int64_t batch = blockIdx.z;
     // Each thread generates a specific output point
@@ -123,7 +123,7 @@ __global__ void fractional_max_pool3d_backward_out_frame(
   PackedTensorAccessor64<const scalar_t, 5> gradOutput,
   PackedTensorAccessor64<const int64_t, 5> indices) {
   // Output (h, w) point that this thread is responsible for
-  int64_t ourOutputPoint = threadIdx.x + blockIdx.x * blockDim.x;
+  int64_t ourOutputPoint = threadIdx.x + ((int64_t) blockIdx.x) * blockDim.x;
   int64_t plane = blockIdx.y;
   int64_t batch = blockIdx.z;
 
@@ -145,9 +145,10 @@ __global__ void fractional_max_pool3d_backward_out_frame(
       gradInput.size(4));
     CUDA_KERNEL_ASSERT(inputT < gradInput.size(2));
 
-    gpuAtomicAddNoReturn(
-      &gradInput[batch][plane][inputT][inputH][inputW],
-      gradOutput[batch][plane][outputT][outputH][outputW]
+    fastAtomicAdd(
+      gradInput,
+      gradOutput[batch][plane][outputT][outputH][outputW],
+      batch, plane, inputT, inputH, inputW
       );
     }
   }

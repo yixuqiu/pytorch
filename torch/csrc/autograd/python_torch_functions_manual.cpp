@@ -1,7 +1,5 @@
-#include <torch/csrc/Dtype.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Exceptions.h>
-#include <torch/csrc/autograd/function.h>
 #include <torch/csrc/autograd/functions/basic_ops.h>
 #include <torch/csrc/autograd/functions/utils.h>
 #include <torch/csrc/autograd/generated/variable_factories.h>
@@ -14,22 +12,19 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/pycfunction_helpers.h>
 #include <torch/csrc/utils/python_arg_parser.h>
-#include <torch/csrc/utils/structseq.h>
-#include <torch/csrc/utils/tensor_layouts.h>
 #include <torch/csrc/utils/tensor_new.h>
 #include <torch/csrc/utils/tensor_numpy.h>
 
 #include <ATen/ATen.h>
 #include <ATen/FunctionalTensorWrapper.h>
+#include <ATen/native/Resize.h>
+#include <ATen/ops/from_blob.h>
 
-#include <Python.h>
-#include <fmt/format.h>
 #include <pybind11/pybind11.h>
 #include <utility>
 #include <vector>
 
 using at::DeviceGuard;
-using at::DimnameList;
 using at::IntArrayRef;
 using at::OptionalDeviceGuard;
 using at::Scalar;
@@ -40,13 +35,12 @@ using at::TensorOptions;
 using torch::utils::check_out_type_matches;
 using namespace torch::autograd::utils;
 
-namespace torch {
-namespace autograd {
+namespace torch::autograd {
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 PyObject* THPVariableFunctionsModule = nullptr;
 
-inline Tensor dispatch_range(
+inline static Tensor dispatch_range(
     const Scalar& start,
     const Scalar& end,
     const Scalar& step,
@@ -56,7 +50,7 @@ inline Tensor dispatch_range(
   return at::range_out(result, start, end, step);
 }
 
-inline Tensor dispatch_range(
+inline static Tensor dispatch_range(
     const Scalar& start,
     const Scalar& end,
     const Scalar& step,
@@ -68,7 +62,7 @@ inline Tensor dispatch_range(
 }
 
 static PyObject* THPVariable_range(
-    PyObject* self,
+    PyObject* /*self*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
@@ -86,8 +80,7 @@ static PyObject* THPVariable_range(
         "because its behavior is inconsistent with Python's range builtin. "
         "Instead, use torch.arange, which produces values in [start, end).",
         1);
-    if (ret != 0)
-      throw python_error();
+    TORCH_CHECK_PYTHON(ret == 0);
     if (r.isNone(3)) {
       const auto options = TensorOptions()
                                .dtype(r.scalartype(4))
@@ -116,7 +109,7 @@ static PyObject* THPVariable_range(
 // implemented on python object to allow torch.as_tensor to be constructed with
 // arbitrarily nested python objects - list, tuple, np array, scalar, etc.
 static PyObject* THPVariable_as_tensor(
-    PyObject* self,
+    PyObject* /*self*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
@@ -140,7 +133,7 @@ static PyObject* THPVariable_as_tensor(
 
 // implemented on python object here because PyObject currently not natively
 // declarable See: ATen/native/README.md for more context
-static PyObject* THPVariable_from_numpy(PyObject* module, PyObject* arg) {
+static PyObject* THPVariable_from_numpy(PyObject* /*module*/, PyObject* arg) {
   HANDLE_TH_ERRORS
   jit::tracer::warn("torch.from_numpy", jit::tracer::WARN_CONSTRUCTOR);
   return THPVariable_Wrap(torch::utils::tensor_from_numpy(arg));
@@ -216,17 +209,17 @@ THPVARIABLE_SPARSE_COMPRESSED_CTOR(
       "sparse_bsc_tensor(PyObject* ccol_indices, PyObject* row_indices, PyObject* values, *, ScalarType dtype=None, Layout? layout=None, Device? device=None, bool pin_memory=False, bool requires_grad=False, bool check_invariants=None)"}))
 
 static PyObject* THPVariable_sparse_coo_tensor(
-    PyObject* self,
+    PyObject* /*self*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
   static PythonArgParser parser({
-      "sparse_coo_tensor(PyObject* indices, PyObject* values, *, ScalarType dtype=None, Device? device=None, bool requires_grad=False, bool check_invariants=None)",
-      "sparse_coo_tensor(PyObject* indices, PyObject* values, IntArrayRef size, *, ScalarType dtype=None, Device? device=None, bool requires_grad=False, bool check_invariants=None, bool is_coalesced=None)",
+      "sparse_coo_tensor(PyObject* indices, PyObject* values, *, ScalarType dtype=None, Device? device=None, bool pin_memory=False, bool requires_grad=False, bool check_invariants=None, bool is_coalesced=None)",
+      "sparse_coo_tensor(PyObject* indices, PyObject* values, IntArrayRef size, *, ScalarType dtype=None, Device? device=None, bool pin_memory=False, bool requires_grad=False, bool check_invariants=None, bool is_coalesced=None)",
       "sparse_coo_tensor(IntArrayRef size, *, ScalarType dtype=None, Device? device=None, bool requires_grad=False, bool check_invariants=None)",
   });
 
-  ParsedArgs<8> parsed_args;
+  ParsedArgs<9> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
   if (r.has_torch_function()) {
     return handle_torch_function(
@@ -243,15 +236,15 @@ static PyObject* THPVariable_sparse_coo_tensor(
 // implemented on python object to allow torch.tensor to be constructed with
 // arbitrarily nested python objects - list, tuple, np array, scalar, etc.
 static PyObject* THPVariable_tensor(
-    PyObject* self,
+    PyObject* /*self*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
   static PythonArgParser parser({
-      "tensor(PyObject* data, *, ScalarType dtype=None, Device? device=None, bool pin_memory=False, bool requires_grad=False, DimnameList? names=None)",
+      "tensor(PyObject* data, *, ScalarType dtype=None, Device? device=None, bool pin_memory=False, bool requires_grad=False)",
   });
 
-  constexpr int ctor_num_args = 6;
+  constexpr int ctor_num_args = 5;
   ParsedArgs<ctor_num_args> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
   if (r.has_torch_function()) {
@@ -267,7 +260,7 @@ static PyObject* THPVariable_tensor(
 }
 
 static PyObject* THPVariable_get_device(
-    PyObject* self_,
+    PyObject* /*self_*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
@@ -279,6 +272,10 @@ static PyObject* THPVariable_get_device(
 
   ParsedArgs<1> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
+  if (r.has_torch_function()) {
+    return handle_torch_function(
+        r, nullptr, args, kwargs, THPVariableFunctionsModule, "torch");
+  }
 
   if (r.idx == 0) {
     return wrap(r.tensor(0).get_device());
@@ -287,8 +284,53 @@ static PyObject* THPVariable_get_device(
   END_HANDLE_TH_ERRORS
 }
 
-static PyObject* THPVariable_frombuffer(
+// Not registered through native_functions.yaml because from_blob takes a raw
+// pointer and has no autograd or JIT semantics. Exposed as a private API for
+// advanced use cases (e.g. wrapping externally managed memory).
+static PyObject* THPVariable__from_blob(
     PyObject* self_,
+    PyObject* args,
+    PyObject* kwargs) {
+  HANDLE_TH_ERRORS
+  static PythonArgParser parser(
+      {
+          "_from_blob(int64_t data, IntArrayRef sizes, IntArrayRef? strides=None, *, ScalarType? dtype=None, Device? device=None)",
+      },
+      /*traceable=*/false);
+
+  ParsedArgs<5> parsed_args;
+  auto r = parser.parse(args, kwargs, parsed_args);
+
+  if (r.idx == 0) {
+    auto data_ptr = reinterpret_cast<void*>(r.toInt64(0));
+    auto sizes = r.intlist(1);
+    auto strides = r.intlistOptional(2);
+    auto dtype = r.scalartypeOptional(3);
+    auto device = r.deviceOptional(4);
+
+    auto options = at::TensorOptions{};
+    if (dtype.has_value()) {
+      options = options.dtype(*dtype);
+    }
+    if (device.has_value()) {
+      options = options.device(*device);
+    }
+
+    at::Tensor tensor;
+    if (strides.list.has_value()) {
+      tensor = at::from_blob(data_ptr, sizes, *strides.list, options);
+    } else {
+      tensor = at::from_blob(data_ptr, sizes, options);
+    }
+    return THPVariable_Wrap(std::move(tensor));
+  }
+
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+static PyObject* THPVariable_frombuffer(
+    PyObject* /*self_*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
@@ -320,13 +362,13 @@ static PyObject* THPVariable_frombuffer(
 }
 
 static PyObject* THPVariable_asarray(
-    PyObject* self_,
+    PyObject* /*self_*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
   static PythonArgParser parser(
       {
-          "asarray(PyObject* obj, *, ScalarType? dtype=None, Device? device=None, bool? copy=None, bool requires_grad=False)",
+          "asarray(PyObject* obj, *, ScalarType? dtype=None, Device? device=None, bool? copy=None, bool? requires_grad=None)",
       },
       /*traceable=*/false);
 
@@ -343,7 +385,7 @@ static PyObject* THPVariable_asarray(
     auto dtype = r.scalartypeOptional(1);
     auto device = r.deviceOptional(2);
     auto copy = r.toBoolOptional(3);
-    auto requires_grad = r.toBool(4);
+    auto requires_grad = r.toBoolOptional(4);
     return wrap(torch::utils::asarray(obj, dtype, device, copy, requires_grad));
   }
 
@@ -356,396 +398,6 @@ static PyObject* THPVariable_numel(
     PyObject* args,
     PyObject* kwargs);
 
-static PyObject* THPVariable__to_functional_tensor(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_to_functional_tensor(Tensor t)"},
-      /*traceable=*/true);
-
-  ParsedArgs<2> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  auto wrapped = at::functionalization::impl::to_functional_tensor(self_);
-  return wrap(std::move(wrapped));
-  END_HANDLE_TH_ERRORS
-}
-
-// Given source and dest tensors,
-// Sets **some** (but not all) autograd metadata on dest, according to source:
-// - requires_grad
-// - grad_fn
-//   (If src has a grad_fn, we install an error grad_fn on dest to avoid
-//   difficult bugs.
-//    The main purpose is to ensure that dst.is_leaf == src.is_leaf)
-static PyObject* THPVariable__mirror_autograd_meta_to(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_mirror_autograd_meta_to(Tensor source, Tensor dest)"},
-      /*traceable=*/true);
-
-  ParsedArgs<2> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto src_ = r.tensor(0);
-  auto dst_ = r.tensor(1);
-  // Here, we unsafely set the grad function on the wrapper to be the same as
-  // the inner. We expect this grad_fn to NEVER be used. It's needed so that
-  // .is_leaf metadata is accurate on the wrapper
-  auto inner_autograd_meta = impl::get_autograd_meta(src_);
-  if (inner_autograd_meta) {
-    dst_.set_requires_grad(src_.requires_grad());
-    if (dst_.requires_grad()) {
-      auto new_grad_fn = std::shared_ptr<torch::autograd::Error>(
-          new torch::autograd::Error(
-              "Cannot backprop through mirrored meta, file a bug in PyTorch"),
-          torch::autograd::deleteNode);
-      torch::autograd::set_history(dst_, new_grad_fn);
-    }
-  }
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__from_functional_tensor(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_from_functional_tensor(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  auto unwrapped = at::functionalization::impl::from_functional_tensor(self_);
-  return wrap(std::move(unwrapped));
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__freeze_functional_tensor(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_freeze_functional_tensor(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  at::functionalization::impl::freeze_functional_tensor(self_);
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__is_functional_tensor(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_is_functional_tensor(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  if (at::functionalization::impl::isFunctionalTensor(self_)) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_was_storage_changed(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_was_storage_changed(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  auto wrapper = at::functionalization::impl::unsafeGetFunctionalWrapper(self_);
-  if (wrapper->was_storage_changed()) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_has_data_mutation(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_has_data_mutation(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  auto wrapper = at::functionalization::impl::unsafeGetFunctionalWrapper(self_);
-  if (wrapper->has_data_mutation()) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_has_metadata_mutation(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_has_metadata_mutation(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  auto wrapper = at::functionalization::impl::unsafeGetFunctionalWrapper(self_);
-  if (wrapper->has_metadata_mutation()) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__enable_functionalization(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_enable_functionalization(*, bool reapply_views=False)"},
-      /*traceable=*/true);
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  const auto reapply_views = r.toBool(0);
-
-  if (c10::impl::tls_is_dispatch_key_included(at::DispatchKey::Functionalize)) {
-    TORCH_INTERNAL_ASSERT(
-        false,
-        "multiple layers of mode-style functionalization nesting is not"
-        " currently supported, outside of the functionalize() transform");
-  }
-  c10::impl::tls_set_dispatch_key_included(
-      at::DispatchKey::Functionalize, true);
-  if (reapply_views) {
-    at::functionalization::impl::setFunctionalizationReapplyViewsTLS(true);
-  }
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_enable_reapply_views(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_enable_reapply_views(bool reapply_views=False)"},
-      /*traceable=*/true);
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  const auto reapply_views = r.toBool(0);
-  auto old = at::functionalization::impl::getFunctionalizationReapplyViewsTLS();
-  if (reapply_views) {
-    at::functionalization::impl::setFunctionalizationReapplyViewsTLS(true);
-  } else {
-    at::functionalization::impl::setFunctionalizationReapplyViewsTLS(false);
-  }
-  if (old) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_is_multi_output_view(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_is_multi_output_view(Tensor t)"},
-      /*traceable=*/true);
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto t = r.tensor(0);
-  TORCH_CHECK(at::functionalization::impl::isFunctionalTensor(t));
-  auto t_impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
-  if (t_impl->is_multi_output_view()) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__disable_functionalization(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  c10::impl::tls_set_dispatch_key_included(
-      at::DispatchKey::Functionalize, false);
-  at::functionalization::impl::setFunctionalizationReapplyViewsTLS(false);
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_replace(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_replace(Tensor t, Tensor o)"}, /*traceable=*/true);
-
-  ParsedArgs<2> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  auto other = r.tensor(1);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  TORCH_INTERNAL_ASSERT(
-      !at::functionalization::impl::isFunctionalTensor(other));
-  at::functionalization::impl::replace_(self_, other);
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_commit_update(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_commit_update(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  at::functionalization::impl::commit_update(self_);
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_sync(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_sync(Tensor t)"}, /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  at::functionalization::impl::sync(self_);
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_apply_view_metas(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_apply_view_metas(Tensor tensor, Tensor base)"},
-      /*traceable=*/true);
-
-  ParsedArgs<4> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto tensor = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(
-      at::functionalization::impl::isFunctionalTensor(tensor));
-  auto impl = at::functionalization::impl::unsafeGetFunctionalWrapper(tensor);
-  return wrap(impl->apply_view_metas(r.tensor(1)));
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject* THPVariable__functionalize_mark_mutation_hidden_from_autograd(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_mark_mutation_hidden_from_autograd(Tensor t)"},
-      /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  at::functionalization::impl::mark_mutation_hidden_from_autograd(self_);
-  Py_RETURN_NONE;
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject*
-THPVariable__functionalize_are_all_mutations_hidden_from_autograd(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_are_all_mutations_hidden_from_autograd(Tensor t)"},
-      /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  if (at::functionalization::impl::are_all_mutations_hidden_from_autograd(
-          self_)) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
-
-static PyObject*
-THPVariable__functionalize_are_all_mutations_under_no_grad_or_inference_mode(
-    PyObject* self,
-    PyObject* args,
-    PyObject* kwargs) {
-  HANDLE_TH_ERRORS
-  static PythonArgParser parser(
-      {"_functionalize_are_all_mutations_under_no_grad_or_inference_mode(Tensor t)"},
-      /*traceable=*/true);
-
-  ParsedArgs<1> parsed_args;
-  auto r = parser.parse(args, kwargs, parsed_args);
-  auto self_ = r.tensor(0);
-  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self_));
-  if (at::functionalization::impl::
-          are_all_mutations_under_no_grad_or_inference_mode(self_)) {
-    Py_RETURN_TRUE;
-  } else {
-    Py_RETURN_FALSE;
-  }
-  END_HANDLE_TH_ERRORS
-}
 // XXX: ops that are bound here are not exposed to the C++ api nor the JIT.
 // Any new ops added here should be accompanied with a comment why they are not
 // being registered through native_functions.yaml, and be tagged cpp / JIT
@@ -760,91 +412,12 @@ static PyMethodDef torch_functions_manual[] = {
      METH_VARARGS | METH_KEYWORDS | METH_STATIC,
      nullptr},
     {"from_numpy", THPVariable_from_numpy, METH_STATIC | METH_O, nullptr},
+    {"_from_blob",
+     castPyCFunctionWithKeywords(THPVariable__from_blob),
+     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
+     nullptr},
     {"frombuffer",
      castPyCFunctionWithKeywords(THPVariable_frombuffer),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_is_functional_tensor",
-     castPyCFunctionWithKeywords(THPVariable__is_functional_tensor),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_to_functional_tensor",
-     castPyCFunctionWithKeywords(THPVariable__to_functional_tensor),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_mirror_autograd_meta_to",
-     castPyCFunctionWithKeywords(THPVariable__mirror_autograd_meta_to),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_from_functional_tensor",
-     castPyCFunctionWithKeywords(THPVariable__from_functional_tensor),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_freeze_functional_tensor",
-     castPyCFunctionWithKeywords(THPVariable__freeze_functional_tensor),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_replace",
-     castPyCFunctionWithKeywords(THPVariable__functionalize_replace),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_commit_update",
-     castPyCFunctionWithKeywords(THPVariable__functionalize_commit_update),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_sync",
-     castPyCFunctionWithKeywords(THPVariable__functionalize_sync),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_apply_view_metas",
-     castPyCFunctionWithKeywords(THPVariable__functionalize_apply_view_metas),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_enable_functionalization",
-     castPyCFunctionWithKeywords(THPVariable__enable_functionalization),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_disable_functionalization",
-     castPyCFunctionWithKeywords(THPVariable__disable_functionalization),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_has_metadata_mutation",
-     castPyCFunctionWithKeywords(
-         THPVariable__functionalize_has_metadata_mutation),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_mark_mutation_hidden_from_autograd",
-     castPyCFunctionWithKeywords(
-         THPVariable__functionalize_mark_mutation_hidden_from_autograd),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_are_all_mutations_hidden_from_autograd",
-     castPyCFunctionWithKeywords(
-         THPVariable__functionalize_are_all_mutations_hidden_from_autograd),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_are_all_mutations_under_no_grad_or_inference_mode",
-     castPyCFunctionWithKeywords(
-         THPVariable__functionalize_are_all_mutations_under_no_grad_or_inference_mode),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_is_multi_output_view",
-     castPyCFunctionWithKeywords(
-         THPVariable__functionalize_is_multi_output_view),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_has_data_mutation",
-     castPyCFunctionWithKeywords(THPVariable__functionalize_has_data_mutation),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_was_storage_changed",
-     castPyCFunctionWithKeywords(
-         THPVariable__functionalize_was_storage_changed),
-     METH_VARARGS | METH_KEYWORDS | METH_STATIC,
-     nullptr},
-    {"_functionalize_enable_reapply_views",
-     castPyCFunctionWithKeywords(
-         THPVariable__functionalize_enable_reapply_views),
      METH_VARARGS | METH_KEYWORDS | METH_STATIC,
      nullptr},
     {"nonzero",
@@ -894,7 +467,7 @@ static PyMethodDef torch_functions_manual[] = {
 };
 
 static PyObject* THPVariable_nonzero(
-    PyObject* self,
+    PyObject* /*self*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
@@ -929,7 +502,7 @@ static PyObject* THPVariable_nonzero(
 }
 
 static PyObject* THPVariable_numel(
-    PyObject* self_,
+    PyObject* /*self_*/,
     PyObject* args,
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
@@ -955,11 +528,14 @@ static PyObject* THPVariable_numel(
 }
 
 // Sharded function definitions
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 void gatherTorchFunctions_0(std::vector<PyMethodDef>& torch_functions);
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 void gatherTorchFunctions_1(std::vector<PyMethodDef>& torch_functions);
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 void gatherTorchFunctions_2(std::vector<PyMethodDef>& torch_functions);
 
-void gatherTorchFunctions(std::vector<PyMethodDef>& torch_functions) {
+static void gatherTorchFunctions(std::vector<PyMethodDef>& torch_functions) {
   constexpr size_t num_functions =
       sizeof(torch_functions_manual) / sizeof(torch_functions_manual[0]);
   torch_functions.assign(
@@ -1001,9 +577,8 @@ void gatherTorchFunctions(std::vector<PyMethodDef>& torch_functions) {
 }
 
 static PyTypeObject THPVariableFunctions = {
-    PyVarObject_HEAD_INIT(
-        nullptr,
-        0) "torch._C._VariableFunctionsClass", /* tp_name */
+    PyVarObject_HEAD_INIT(nullptr, 0)
+    "torch._C._VariableFunctionsClass", /* tp_name */
     0, /* tp_basicsize */
     0, /* tp_itemsize */
     nullptr, /* tp_dealloc */
@@ -1047,28 +622,245 @@ void initTorchFunctions(PyObject* module) {
   gatherTorchFunctions(torch_functions);
   THPVariableFunctions.tp_methods = torch_functions.data();
 
-  if (PyType_Ready(&THPVariableFunctions) < 0) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(PyType_Ready(&THPVariableFunctions) >= 0);
   Py_INCREF(&THPVariableFunctions);
 
   // Steals
   Py_INCREF(&THPVariableFunctions);
-  if (PyModule_AddObject(
+  TORCH_CHECK_PYTHON(
+      PyModule_AddObject(
           module,
           "_VariableFunctionsClass",
-          reinterpret_cast<PyObject*>(&THPVariableFunctions)) < 0) {
-    throw python_error();
-  }
+          reinterpret_cast<PyObject*>(&THPVariableFunctions)) >= 0);
   // PyType_GenericNew returns a new reference
   THPVariableFunctionsModule =
       PyType_GenericNew(&THPVariableFunctions, Py_None, Py_None);
   // PyModule_AddObject steals a reference
-  if (PyModule_AddObject(
-          module, "_VariableFunctions", THPVariableFunctionsModule) < 0) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(
+      PyModule_AddObject(
+          module, "_VariableFunctions", THPVariableFunctionsModule) >= 0);
+
+  // pybind registrations to torch module
+  // TODO: move these from torch.* to torch._C.*
+  auto py_module = py::module::import("torch");
+
+  py_module.def(
+      "_functionalize_are_all_mutations_under_no_grad_or_inference_mode",
+      [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        return at::functionalization::impl::
+            are_all_mutations_under_no_grad_or_inference_mode(t);
+      });
+  py_module.def(
+      "_functionalize_was_inductor_storage_resized", [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        auto impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+        return impl->was_inductor_storage_resized();
+      });
+  py_module.def(
+      "_functionalize_was_shallow_copy_data", [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        auto impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+        return impl->was_shallow_copy_data();
+      });
+  py_module.def(
+      "_functionalize_inductor_storage_resized_counter",
+      [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        auto impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+        return impl->inductor_storage_resized_counter();
+      });
+  py_module.def(
+      "_functionalize_are_all_mutations_hidden_from_autograd",
+      [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        return at::functionalization::impl::
+            are_all_mutations_hidden_from_autograd(t);
+      });
+  py_module.def(
+      "_functionalize_mark_mutation_hidden_from_autograd",
+      [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        at::functionalization::impl::mark_mutation_hidden_from_autograd(t);
+      });
+  py_module.def("_functionalize_is_symbolic", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    auto impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+    return impl->is_symbolic();
+  });
+  py_module.def("_functionalize_sync", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    at::functionalization::impl::sync(t);
+  });
+  py_module.def("_functionalize_commit_update", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    at::functionalization::impl::commit_update(t);
+  });
+  py_module.def(
+      "_functionalize_replace", [](const at::Tensor& t, const at::Tensor& o) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        TORCH_INTERNAL_ASSERT(
+            !at::functionalization::impl::isFunctionalTensor(o));
+        at::functionalization::impl::replace_(t, o);
+      });
+  py_module.def("_is_functional_tensor_base", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    return at::functionalization::impl::isBaseTensor(t);
+  });
+  py_module.def("_functionalize_is_multi_output_view", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    auto t_impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+    return t_impl->is_multi_output_view();
+  });
+  py_module.def(
+      "_functionalize_enable_reapply_views",
+      [](bool reapply_views = false) {
+        auto old =
+            at::functionalization::impl::getFunctionalizationReapplyViewsTLS();
+        at::functionalization::impl::setFunctionalizationReapplyViewsTLS(
+            reapply_views);
+        return old;
+      },
+      py::arg("reapply_views") = false);
+  py_module.def(
+      "_functionalize_has_metadata_mutation", [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        auto t_impl =
+            at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+        return t_impl->has_metadata_mutation();
+      });
+  py_module.def("_functionalize_has_data_mutation", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    auto t_impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+    return t_impl->has_data_mutation();
+  });
+  py_module.def("_functionalize_mutation_counter", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    auto t_impl = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+    return t_impl->mutation_counter();
+  });
+  py_module.def(
+      "_functionalize_get_storage_size", [](const at::Tensor& t, bool before) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        auto wrapper =
+            at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+        auto size = wrapper->get_storage_size(/*before=*/before);
+        return size;
+      });
+  py_module.def("_functionalize_mark_storage_changed", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    auto wrapper = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+    wrapper->mark_storage_changed();
+  });
+  py_module.def("_functionalize_was_storage_changed", [](const at::Tensor& t) {
+    TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(t));
+    auto wrapper = at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+    return wrapper->was_storage_changed();
+  });
+  py_module.def(
+      "_functionalize_storage_changed_counter", [](const at::Tensor& t) {
+        TORCH_INTERNAL_ASSERT(
+            at::functionalization::impl::isFunctionalTensor(t));
+        auto t_impl =
+            at::functionalization::impl::unsafeGetFunctionalWrapper(t);
+        return t_impl->storage_changed_counter();
+      });
+  py_module.def(
+      "_functionalize_unsafe_set", [](at::Tensor& dst, const at::Tensor& src) {
+        // Forcefully/unsafely dumps src.storage into dst.
+        // This API is technically and not specific to functionalization
+        // (it just runs set_() without the safety checks).
+        // But its main intended purpose today is during functionalization.
+        // In particular: when we generate a new FunctionalTensor from a view
+        // op, we need to ensure it shares a storage with the view input.
+        //
+        // Other subclasses shouldn't really need to care about this,
+        // because we define aliasing on wrapper subclasses such that:
+        // - differentiable aliasing: subclass_x and subclass_y share a ._base.
+        // - non-differentiable aliasing: aliasing of subclass_x and subclass_y
+        //   is defined recursively based on the aliasing of their inner
+        //   tensors.
+        if (dst.device() == src.device()) {
+          at::native::checkSetStorage(
+              dst,
+              src.storage(),
+              dst.sym_storage_offset(),
+              dst.sym_sizes(),
+              dst.sym_strides(),
+              /*check_offset_in_bounds=*/false);
+        } else {
+          TORCH_CHECK(
+              dst.sym_sizes() == src.sym_sizes() &&
+                  dst.sym_strides() == src.sym_strides() &&
+                  dst.dtype() == src.dtype(),
+              "cross-device .data requires matching dtype, sizes, "
+              "and strides");
+          dst.unsafeGetTensorImpl()->_change_backend_component_keys(
+              src.device());
+          dst.unsafeGetTensorImpl()->set_storage_keep_dtype(src.storage());
+        }
+      });
+  py_module.def("_is_functional_tensor", [](const at::Tensor& t) {
+    return at::functionalization::impl::isFunctionalTensor(t);
+  });
+  py_module.def("_to_functional_tensor", [](const at::Tensor& t) {
+    return at::functionalization::impl::to_functional_tensor(t);
+  });
+  py_module.def("_from_functional_tensor", [](const at::Tensor& t) {
+    return at::functionalization::impl::from_functional_tensor(t);
+  });
+  py_module.def("_freeze_functional_tensor", [](const at::Tensor& t) {
+    at::functionalization::impl::freeze_functional_tensor(t);
+  });
+  py_module.def(
+      "_enable_functionalization",
+      [](bool reapply_views = false) {
+        if (c10::impl::tls_is_dispatch_key_included(
+                at::DispatchKey::Functionalize)) {
+          TORCH_INTERNAL_ASSERT(
+              false,
+              "multiple layers of mode-style functionalization nesting is not"
+              " currently supported, outside of the functionalize() transform");
+        }
+        c10::impl::tls_set_dispatch_key_included(
+            at::DispatchKey::Functionalize, true);
+        if (reapply_views) {
+          at::functionalization::impl::setFunctionalizationReapplyViewsTLS(
+              true);
+        }
+      },
+      py::arg("reapply_views") = false);
+  py_module.def("_disable_functionalization", []() {
+    c10::impl::tls_set_dispatch_key_included(
+        at::DispatchKey::Functionalize, false);
+    at::functionalization::impl::setFunctionalizationReapplyViewsTLS(false);
+  });
+  py_module.def(
+      "_mirror_autograd_meta_to",
+      [](const at::Tensor& src_, const at::Tensor& dst_) {
+        // Here, we unsafely set the grad function on the wrapper to be the same
+        // as the inner. We expect this grad_fn to NEVER be used. It's needed so
+        // that .is_leaf metadata is accurate on the wrapper
+        auto inner_autograd_meta = impl::get_autograd_meta(src_);
+        if (inner_autograd_meta) {
+          dst_.set_requires_grad(src_.requires_grad());
+          if (dst_.requires_grad()) {
+            auto new_grad_fn = c10::make_intrusive<torch::autograd::Error>(
+                "Cannot backprop through mirrored meta, file a bug in PyTorch");
+            torch::autograd::set_history(dst_, new_grad_fn);
+            torch::autograd::fire_node_creation_hooks(new_grad_fn);
+          }
+        }
+      });
 }
 
-} // namespace autograd
-} // namespace torch
+} // namespace torch::autograd

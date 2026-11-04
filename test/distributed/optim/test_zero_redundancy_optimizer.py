@@ -8,14 +8,14 @@
 import copy
 import os
 import sys
-import unittest
-from contextlib import nullcontext
-from typing import Any, cast, List
+from contextlib import contextmanager, nullcontext
+from typing import Any, cast
 
 import numpy as np
 
 import torch
 import torch.distributed as dist
+
 
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
@@ -30,15 +30,25 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.distributed.optim.zero_redundancy_optimizer import _broadcast_object
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW, SGD
-from torch.testing._internal import common_distributed
+from torch.testing._internal.common_distributed import (
+    DistributedTestBase,
+    logger,
+    MultiProcContinuousTest,
+    requires_accelerator_dist_backend,
+    requires_ddp_rank,
+    requires_gloo,
+    skip_if_lt_x_gpu,
+    skip_if_no_gpu,
+    skip_if_win32,
+    TEST_SKIPS,
+)
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
-    IS_WINDOWS,
     parametrize,
     run_tests,
-    TEST_WITH_ASAN,
-    TEST_WITH_DEV_DBG_ASAN,
+    skipIfHpu,
 )
+
 
 try:
     import torchvision
@@ -48,66 +58,51 @@ except ImportError:
     HAS_TORCHVISION = False
 
 
-# Use GLOO on GPU when running CUDA + Windows
-def _get_backend_for_tests():
-    return (
-        dist.Backend.NCCL
-        if not IS_WINDOWS and torch.cuda.is_available()
-        # Windows only has GLOO, but GLOO GPU works. And use GLOO CPU when
-        # no GPUs are available.
-        else dist.Backend.GLOO
-    )
+device_type = (
+    acc.type
+    if (acc := torch.accelerator.current_accelerator(check_available=True))
+    else "cpu"
+)
 
 
-BACKEND = _get_backend_for_tests()
+@contextmanager
+def deterministic_algorithms(enabled=True):
+    prev_state = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(enabled)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(prev_state)
 
 
-@unittest.skipIf(TEST_WITH_ASAN or TEST_WITH_DEV_DBG_ASAN, "CUDA + ASAN does not work.")
-class TestZeroRedundancyOptimizer(common_distributed.MultiProcessTestCase):
-    def setUp(self):
-        super().setUp()
-        os.environ["WORLD_SIZE"] = str(self.world_size)
-        self._spawn_processes()
-
+class TestZeroRedundancyOptimizerContinuous(MultiProcContinuousTest):
     @property
     def device(self):
-        return (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        )
+        return device_type
 
-    @property
-    def world_size(self):
-        return 1
+    @classmethod
+    def backend_str(cls):
+        return {"cuda": "nccl", "hpu": "hccl", "xpu": "xccl"}.get(device_type, "gloo")
 
-    def tearDown(self):
-        try:
-            torch.distributed.destroy_process_group()
-        except AssertionError:
-            pass
-        try:
-            os.remove(self.file_name)
-        except OSError:
-            pass
-
-    def dist_init(self, rank, world_size=-1, backend=BACKEND):
-        if world_size < 1:
-            world_size = self.world_size
-        store = dist.FileStore(self.file_name, world_size)
-        return dist.init_process_group(
-            backend=backend,
-            store=store,
-            rank=rank,
-            world_size=world_size,
-        )
+    @classmethod
+    def _init_pg(cls, rank, world_size, rdvz_file):
+        # Read by skip_if_no_gpu.
+        os.environ["WORLD_SIZE"] = str(world_size)
+        if cls.backend_str() in ("nccl", "xccl"):
+            if torch.accelerator.device_count() < world_size:
+                sys.exit(TEST_SKIPS[f"multi-device-{world_size}"].exit_code)
+            device = torch.device(f"{device_type}:{rank}")
+            torch.set_default_device(device)
+            torch.accelerator.set_device_index(device)
+        super()._init_pg(rank, world_size, rdvz_file)
 
 
-# TODO: skip_but_pass_in_sandcastle_if does not work here.
-@unittest.skipIf(TEST_WITH_ASAN or TEST_WITH_DEV_DBG_ASAN, "CUDA + ASAN does not work.")
-class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
+class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizerContinuous):
+    world_size = 1
+
     def test_state_dict(self):
         """Check that ZeroRedundancyOptimizer exposes the expected state dict
         interface, irrespective of the sharding."""
-        self.dist_init(self.rank)
         LR1 = 0.1
         LR2 = 0.01
         MOMENTUM = 0.9
@@ -175,7 +170,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
     def test_lr_scheduler(self):
         """Check that a normal PyTorch ``lr_scheduler`` is usable with
         ZeroRedundancyOptimizer."""
-        self.dist_init(self.rank)
         NUM_ITERS = 5
         LR = 0.01
         x = torch.tensor([1.0], device=self.device, requires_grad=True)
@@ -197,7 +191,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
 
     def test_step_with_kwargs(self):
         """Check that the ``step(**kwargs)`` interface is properly exposed."""
-        self.dist_init(self.rank)
         LR = 0.1
 
         class SGDWithStepKWArg(torch.optim.SGD):
@@ -205,7 +198,7 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
                 super().step()
                 kwarg.append(5)
 
-        kwarg: List[Any] = []
+        kwarg: list[Any] = []
         x = torch.tensor([1.0], device=self.device, requires_grad=True)
         o = ZeroRedundancyOptimizer(
             [x],
@@ -221,7 +214,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         """Check that ZeroRedundancyOptimizer wrapping an optimizer that adds
         extra keys to ``param_groups`` exposes those keys through ZeRO's own
         ``param_groups``."""
-        self.dist_init(self.rank)
         LR = 0.1
 
         class SGDWithNewKey(torch.optim.SGD):
@@ -240,7 +232,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
     def test_step_without_closure(self):
         """Check that the ``step()`` method (without closure) is handled as
         expected."""
-        self.dist_init(self.rank)
         LR = 0.1
 
         class SGDWithoutClosure(torch.optim.SGD):
@@ -259,7 +250,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
 
     def test_zero_grad(self):
         """Check that the ``zero_grad`` method is properly handled."""
-        self.dist_init(self.rank)
         LR = 0.01
         x = torch.rand(1)
         m = torch.nn.Linear(1, 1)
@@ -275,7 +265,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
     def test_constructor(self):
         """Check the robustness of the ZeroRedundancyOptimizer constructor by
         passing different values for the ``params`` argument."""
-        self.dist_init(self.rank)
         LR = 0.01
         m = torch.nn.Sequential(
             torch.nn.Linear(5, 10),
@@ -325,13 +314,15 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
             betas=BETAS,
             eps=EPS,
         )
-        assert (
-            len(o.param_groups) == 2
-        ), f"Expected 2 ZeRO param groups, but got {len(o.param_groups)}"
-        assert len(o.optim.param_groups) == 2, (
-            "Expected 2 local optimizer param groups, but got "
-            f"{len(o.optim.param_groups)}"
-        )
+        if not (len(o.param_groups) == 2):
+            raise AssertionError(
+                f"Expected 2 ZeRO param groups, but got {len(o.param_groups)}"
+            )
+        if not (len(o.optim.param_groups) == 2):
+            raise AssertionError(
+                "Expected 2 local optimizer param groups, but got "
+                f"{len(o.optim.param_groups)}"
+            )
 
     def test_same_dense_param_type(self):
         """Check that ZeroRedundancyOptimizer raises an exception if the input
@@ -340,7 +331,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         NOTE: This test should be removed once support for sparse parameters
         and varying parameter types is added.
         """
-        self.dist_init(self.rank)
         LR = 0.01
         inputs = [
             [torch.sparse_coo_tensor(size=(2, 3))],
@@ -356,26 +346,15 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
                 ZeroRedundancyOptimizer(input, optimizer_class=SGD, lr=LR)
 
 
-class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
-    @property
-    def device(self):
-        return (
-            torch.device(self.rank)
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
-
-    @property
-    def world_size(self):
-        return min(4, max(2, torch.cuda.device_count()))
+class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizerContinuous):
+    world_size = min(4, max(2, torch.get_device_module(device_type).device_count()))
 
     @property
     def context(self):
-        return (
-            nullcontext()
-            if not torch.cuda.is_available()
-            else torch.cuda.device(self.rank)
-        )
+        if requires_ddp_rank(self.device):
+            return torch.get_device_module(self.device).device(self.rank)
+        else:
+            return nullcontext()
 
     def _check_same_model_params(
         self,
@@ -400,12 +379,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 msg=f"Model buffers differ:\n{b_a} {b_b}\n" + message,
             )
 
-    @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @skip_if_no_gpu
     def test_step(self):
         """Check that ZeroRedundancyOptimizer properly exposes the ``step()``
         interface."""
-        self.dist_init(self.rank, world_size=self.world_size)
         LR = 0.01
 
         with self.context:
@@ -440,13 +417,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             self.assertEqual(m.weight, m_zero.weight)
             self.assertEqual(m.bias, m_zero.bias)
 
-    @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @skip_if_no_gpu
     def test_step_with_closure(self):
         """Check that ZeroRedundancyOptimizer properly exposes the
         ``step(closure)`` interface."""
-        self.dist_init(self.rank, world_size=self.world_size)
-
         with self.context:
             for bucket_view in [False, True]:
                 x_val = self.rank + 1
@@ -491,11 +465,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 self.assertEqual(m.weight, torch.tensor([[1.1]]))
                 self.assertEqual(m.bias, torch.tensor([2.1]))
 
-    @common_distributed.skip_if_no_gpu
+    @skip_if_no_gpu
     def test_lr_scheduler(self):
         """Check that a normal PyTorch ``lr_scheduler`` is usable with
         ZeroRedundancyOptimizer."""
-        self.dist_init(self.rank)
         x = torch.tensor([1.0], device=self.device, requires_grad=True)
         x2 = torch.tensor([1.0], device=self.device, requires_grad=True)
         o = ZeroRedundancyOptimizer([x], optimizer_class=SGD, lr=0.01)
@@ -523,7 +496,6 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         ``ZeroRedundancyOptimizer._partition_parameters()`` in
         zero_redundancy_optimizer.py.
         """
-        self.dist_init(self.rank)
         LR = 0.01
         sizes = [9, 7, 5, 3]
         params = []
@@ -545,7 +517,6 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         ``ZeroRedundancyOptimizer._partition_parameters()`` in
         zero_redundancy_optimizer.py.
         """
-        self.dist_init(self.rank)
         LR = 0.01
 
         # Test with all parameters trainable to begin with
@@ -593,14 +564,13 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         all_trainable()
         some_trainable()
 
-    @common_distributed.skip_if_no_gpu
+    @skip_if_no_gpu
     def test_multiple_param_groups(self):
         """
         Check parity between constructing ZeRO with multiple parameter groups
         upfront versus adding parameter groups to ZeRO after construction
         versus a non-sharded optimizer.
         """
-        self.dist_init(self.rank)
         BATCH_SIZE, NUM_ITERS = 8, 3
         INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM = 5, 10, 5
         WD, LR = 0.01, 0.01
@@ -660,12 +630,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 torch.testing.assert_close(layer1.bias, layer2.bias)
                 torch.testing.assert_close(layer1.bias, layer3.bias)
 
-    @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @skip_if_no_gpu
     def test_collect_shards(self):
         """Check the state consolidation mechanism and the state dict exposed
         by ZeroRedundancyOptimizer."""
-        self.dist_init(self.rank)
         LR = 1e-3
         MOMENTUM = 0.99
         BATCH_SIZE, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM = 3, 20, 10, 5
@@ -723,28 +691,18 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         # trivial
         MIN_WORLD_SIZE = 4
         if self.world_size < MIN_WORLD_SIZE:
-            common_distributed.logger.info(
+            logger.info(
                 "Skipping `test_nondefault_process_group()` since world size "
                 "of %s is less than %s",
                 self.world_size,
                 MIN_WORLD_SIZE,
             )
             return
-        BACKEND = dist.Backend.GLOO
-        self.dist_init(self.rank, self.world_size, BACKEND)
-        # Use GPU if enough are available, or fall back to CPU otherwise, which
-        # is fine since Gloo backend supports both
-        if torch.cuda.is_available() and torch.cuda.device_count() >= self.world_size:
-            device = torch.device(self.rank)
-        else:
-            device = torch.device("cpu")
+        device = torch.device(self.device)
         # Create a new process group consisting of the even ranks to exercise
         # the case where the global and local ranks do not necessarily match
         subgroup_ranks = [r for r in range(self.world_size) if r % 2 == 0]
-        process_group = dist.new_group(
-            ranks=subgroup_ranks,
-            backend=BACKEND,
-        )
+        process_group = dist.new_group(ranks=subgroup_ranks)
         # Ranks not participating in the new process group are no longer needed
         if self.rank not in subgroup_ranks:
             return
@@ -758,9 +716,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         LR = 1e-3
         MOMENTUM = 0.99
         REFERENCE_RANK = 0
-        assert (
-            REFERENCE_RANK in subgroup_ranks
-        ), "Reference rank must be in the new process group"
+        if REFERENCE_RANK not in subgroup_ranks:
+            raise AssertionError("Reference rank must be in the new process group")
         loss_fn = torch.nn.L1Loss().to(device)
 
         def check(optimizer):
@@ -815,7 +772,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         )
         check(optimizer)
 
-    @common_distributed.skip_if_no_gpu
+    @skip_if_no_gpu
     @parametrize(
         "optimizer_class_str",
         ["Adam", "AdamW", "SGD"],
@@ -832,7 +789,6 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
     ):
         """When combined with DDP, check that a local optimizer gives the same
         results as wrapping that optimizer with ZeroRedundancyOptimizer."""
-        self.dist_init(self.rank)
         BATCHES = 20
         BATCH_SIZE = 64
         LR = 1e-3
@@ -848,7 +804,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         elif optimizer_class_str == "SGD":
             optimizer_class = torch.optim.SGD
         else:
-            assert 0, f"Unsupported optimizer class: {optimizer_class_str}"
+            raise AssertionError(f"Unsupported optimizer class: {optimizer_class_str}")
 
         with self.context:
             # Define a base model with a different buffer for each rank
@@ -857,8 +813,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 torch.nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
                 torch.nn.Linear(HIDDEN_DIM, OUTPUT_DIM),
             ).to(self.device)
-            model.register_buffer(
-                "test_buffer",
+            model.test_buffer = torch.nn.Buffer(
                 torch.ones((1), device=self.device) * self.rank,
             )
             # Define models/optimizers for DDP with ZeRO and DDP with local
@@ -872,7 +827,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             )
             sharded_ddp_model = DDP(
                 module=model,
-                device_ids=[self.rank],
+                device_ids=[self.rank] if requires_ddp_rank(self.device) else None,
                 broadcast_buffers=True,
                 find_unused_parameters=True,
             )
@@ -884,7 +839,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             )
             ddp_model = DDP(
                 local_model,
-                device_ids=[self.rank],
+                device_ids=[self.rank] if requires_ddp_rank(self.device) else None,
                 broadcast_buffers=True,
                 find_unused_parameters=True,
             )
@@ -897,7 +852,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             )
 
             def check_step():
-                input_tensor = torch.rand((BATCH_SIZE, INPUT_DIM))
+                input_tensor = torch.rand((BATCH_SIZE, INPUT_DIM)).to(self.device)
 
                 def closure_ddp(input_tensor=input_tensor):
                     ddp_optimizer.zero_grad()
@@ -968,280 +923,6 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             sharded_optimizer.load_state_dict(sharded_optim_state_dict)
             check_step()
 
-    def _test_zero_join(self, device):
-        """Check that the ZeRO join hook allows training with uneven inputs
-        when using the given device."""
-        NUM_INPUTS = 3
-        NUM_EPOCHS = 2
-        LR = 0.01
-        torch.manual_seed(0)
-        torch.cuda.manual_seed(0)
-
-        rank = self.rank
-        world_size = self.world_size
-        is_gpu = device.type == "cuda"
-        backend = _get_backend_for_tests() if is_gpu else dist.Backend.GLOO
-        self.dist_init(rank, world_size, backend)
-
-        model = torch.nn.Sequential(
-            torch.nn.Linear(2, 3),
-            torch.nn.Linear(3, 3),
-            torch.nn.Linear(3, 3),
-        )
-        model.to(device)
-
-        # DDP ensures correct gradients in data parallel training, so DDP with
-        # local optimizers on uneven inputs should be equivalent to ZeRO on
-        # uneven inputs with gradients being manually set
-        ddp_model = DDP(model, device_ids=[rank]) if is_gpu else DDP(model)
-        local_optim = torch.optim.Adam(ddp_model.parameters(), lr=LR)
-        zero_model = copy.deepcopy(model)
-        zero_model.to(device)
-        zero_optim = ZeroRedundancyOptimizer(
-            zero_model.parameters(),
-            torch.optim.Adam,
-            lr=LR,
-        )
-        loss_fn = torch.nn.MSELoss()
-
-        # Use uneven inputs: rank i has i extra inputs
-        inputs = [torch.randn(20, 2).to(device) for _ in range(NUM_INPUTS + rank)]
-        labels = torch.randn(20, 3).to(device)
-
-        # Save the gradients and parameters from DDP as the ground truth; do
-        # so on the last-joining rank (in this case, the largest rank)
-        grads_at_each_iter = []
-        params_at_each_iter = []
-        with ddp_model.join():
-            for _ in range(NUM_EPOCHS):
-                for input in inputs:
-                    output = ddp_model(input)
-                    loss_fn(output, labels).backward()
-                    if rank == world_size - 1:
-                        grads = []
-                        for p in ddp_model.parameters():
-                            grads.append(p.grad.detach().clone().to(device))
-                    local_optim.step()
-                    if rank == world_size - 1:
-                        params = []
-                        for p in ddp_model.parameters():
-                            params.append(p.detach().clone().to(device))
-                        grads_at_each_iter.append(grads)
-                        params_at_each_iter.append(params)
-
-        # Broadcast the saved gradients and parameters to all of the other
-        # ranks (which joined early)
-        grads_and_params = [grads_at_each_iter, params_at_each_iter]
-        grads_and_params = _broadcast_object(
-            grads_and_params,
-            src_rank=world_size - 1,
-            group=dist.group.WORLD,
-            device=device,
-        )
-        grads_at_each_iter = grads_and_params[0]
-        params_at_each_iter = grads_and_params[1]
-        # TODO: Replace this `_broadcast_object` with `broadcast_object_list`
-        # once the latter supports loading to the destination device instead
-        # of the source device
-
-        # A process must still set the remaining gradients after joining, so we
-        # define a join hook to do this before the ZeRO join hook
-        class _JoinGradInfo:
-            def __init__(self, grads):
-                self.grads = grads  # remaining gradients to set (in order)
-                self.index = 0
-
-        class _SetGradsJoinHook(JoinHook):
-            def __init__(self, zero_optim, grads):
-                zero_optim._join_grad_info = _JoinGradInfo(grads)
-                self.zero = zero_optim
-                super().__init__()
-
-            def main_hook(self):
-                join_grad_info = self.zero._join_grad_info
-                grads = self.zero._join_grad_info.grads[join_grad_info.index]
-                join_grad_info.index += 1
-                for p, grad in zip(self.zero._all_params, grads):
-                    p.grad = grad.detach().clone().to(device)
-
-        class _GradientSetter(Joinable):
-            def __init__(self):
-                super().__init__()
-
-            def join_hook(self, **kwargs):
-                assert "zero_optim" in kwargs
-                assert "grads" in kwargs
-                zero_optim = kwargs["zero_optim"]
-                grads = kwargs["grads"]
-                return _SetGradsJoinHook(zero_optim, grads)
-
-            @property
-            def join_device(self):
-                return device
-
-            @property
-            def join_process_group(self):
-                return dist.group.WORLD
-
-        num_grads_after_joining = NUM_EPOCHS * (world_size - rank - 1)
-        grads = grads_at_each_iter[-num_grads_after_joining:]
-        gradient_setter = _GradientSetter()
-        iter = 0
-        with Join(
-            [gradient_setter, zero_optim],
-            zero_optim=zero_optim,
-            grads=grads,
-        ):
-            for _ in range(NUM_EPOCHS):
-                for input in inputs:
-                    # Notify join context that this process has not joined
-                    Join.notify_join_context(gradient_setter)
-                    # Set gradients manually
-                    for p, grad in zip(
-                        zero_model.parameters(),
-                        grads_at_each_iter[iter],
-                    ):
-                        p.grad = grad.detach().clone().to(device)
-                    # Perform optimizer step and check parity
-                    zero_optim.step()
-                    for p, ddp_p in zip(
-                        zero_model.parameters(),
-                        params_at_each_iter[iter],
-                    ):
-                        torch.testing.assert_close(
-                            p,
-                            ddp_p,
-                            msg="Parameters differ between using ZeRO and "
-                            "local optimizer",
-                        )
-                    iter += 1
-
-    @common_distributed.requires_nccl()
-    @common_distributed.skip_if_no_gpu
-    def test_zero_join_gpu(self):
-        """Check that the ZeRO join hook allows training with uneven inputs
-        on GPU."""
-        self._test_zero_join(self.device)
-
-    @common_distributed.requires_gloo()
-    def test_zero_join_cpu(self):
-        """Check that the ZeRO join hook allows training with uneven inputs
-        on CPU."""
-        self._test_zero_join(torch.device("cpu"))
-
-    def _test_zero_model_parallel(self, parameters_as_bucket_view: bool):
-        # Use two processes each with two GPUs
-        assert self.rank < 2
-        NUM_EPOCHS = 2
-        NUM_INPUTS = 4
-        LR = 0.01
-        torch.manual_seed(0)
-        torch.cuda.manual_seed(0)
-
-        class ModelParallelModel(torch.nn.Module):
-            def __init__(self, dev0, dev1):
-                super().__init__()
-                self.dev0 = dev0
-                self.dev1 = dev1
-                self.net0 = torch.nn.Linear(10, 10).to(dev0)
-                self.relu = torch.nn.ReLU()
-                self.net1 = torch.nn.Linear(10, 5).to(dev1)
-
-            def forward(self, x):
-                x = x.to(self.dev0)
-                x = self.relu(self.net0(x))
-                x = x.to(self.dev1)
-                return self.net1(x)
-
-        class LocalModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.net0 = torch.nn.Linear(10, 10)
-                self.relu = torch.nn.ReLU()
-                self.net1 = torch.nn.Linear(10, 5)
-
-            def forward(self, x):
-                return self.net1(self.relu(self.net0(x)))
-
-        dev0 = torch.device(2 * self.rank)
-        dev1 = torch.device(2 * self.rank + 1)
-        mp_model = ModelParallelModel(dev0, dev1)
-        ddp_model = DDP(mp_model)
-        local_model = LocalModel().to(dev0)
-
-        # Ensure the parameters are the same across the two models
-        def copy_param(p):
-            return torch.nn.Parameter(p.detach().clone().to(dev0))
-
-        local_model.net0.weight = copy_param(mp_model.net0.weight)
-        local_model.net0.bias = copy_param(mp_model.net0.bias)
-        local_model.net1.weight = copy_param(mp_model.net1.weight)
-        local_model.net1.bias = copy_param(mp_model.net1.bias)
-
-        # Compare parity between DDP with model parallelism using ZeRO and
-        # a local model using a local optimizer
-        zero_optim = ZeroRedundancyOptimizer(
-            ddp_model.parameters(),
-            optimizer_class=torch.optim.Adam,
-            parameters_as_bucket_view=parameters_as_bucket_view,
-            lr=LR,
-        )
-        local_optim = torch.optim.Adam(local_model.parameters(), lr=LR)
-        inputs = [torch.randn(20, 10).to(dev0) for _ in range(NUM_INPUTS)]
-
-        for _ in range(NUM_EPOCHS):
-            for input in inputs:
-
-                def closure_local():
-                    local_optim.zero_grad()
-                    local_loss = local_model(input).abs().sum()
-                    local_loss.backward()
-                    return local_loss
-
-                def closure_ddp():
-                    zero_optim.zero_grad()
-                    ddp_loss = ddp_model(input).abs().sum()
-                    ddp_loss.backward()
-                    return ddp_loss
-
-                local_loss = cast(torch.Tensor, local_optim.step(closure=closure_local))
-                ddp_loss = cast(torch.Tensor, zero_optim.step(closure=closure_ddp))
-
-                # Increased tolerances are needed to pass when using TF32
-                # See: https://github.com/pytorch/pytorch/issues/67764
-                torch.testing.assert_close(
-                    local_loss.cpu(),
-                    ddp_loss.cpu(),
-                    rtol=1e-03,
-                    atol=1e-08,
-                ), "Losses differ between local optimizer and ZeRO"
-
-                for local_p, ddp_p in zip(
-                    local_model.parameters(), ddp_model.parameters()
-                ):
-                    torch.testing.assert_close(
-                        local_p.cpu(),
-                        ddp_p.cpu(),
-                        rtol=1e-03,
-                        atol=1e-04,
-                    ), "Models differ after a step"
-
-    @common_distributed.skip_if_lt_x_gpu(4)
-    @parametrize(
-        "parameters_as_bucket_view",
-        [False, True],
-    )
-    def test_zero_model_parallel(
-        self,
-        parameters_as_bucket_view: bool,
-    ):
-        """Check that ZeRO works with model parallelism where the model's
-        layers are assigned to different devices."""
-        if self.rank >= 2:
-            return
-        self.dist_init(self.rank, world_size=2)
-        self._test_zero_model_parallel(parameters_as_bucket_view)
-
     def _test_ddp_zero_overlap(
         self,
         device,
@@ -1255,12 +936,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         SGD_WEIGHT_DECAY = 0.001
         NUM_INPUTS = 5
         torch.manual_seed(0)
-        torch.cuda.manual_seed(0)
+        if "cpu" not in device:
+            torch.get_device_module(device).manual_seed(0)
 
         rank = self.rank
-        is_gpu = device.type == "cuda"
-        if is_gpu:
-            torch.cuda.set_device(device)
         models_to_test = [
             (
                 torch.nn.Sequential(
@@ -1278,11 +957,16 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 )
             )
         for model, inputs in models_to_test:
-            # Enable determinism in cudnn operators
-            with torch.backends.cudnn.flags(
-                enabled=True, deterministic=True, benchmark=False
-            ):
-                device_ids = [rank] if is_gpu else None
+            # Select deterministic context based on device
+            det_ctx = (
+                torch.backends.cudnn.flags(
+                    enabled=True, deterministic=True, benchmark=False
+                )
+                if "cuda" in device
+                else deterministic_algorithms(True)
+            )
+            with det_ctx:
+                device_ids = [rank] if requires_ddp_rank(device) else None
                 # Set up the DDP model overlapping with ZeRO
                 ddp_model_overlap = DDP(
                     copy.deepcopy(model).to(device),
@@ -1354,6 +1038,17 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                     loss.backward()
 
                 # Run the DDP model with local optimizer
+                # NOTE: The reference model needs the same warmup iterations so
+                # that it has also rebuilt its DDP buckets before the compared
+                # iterations. Otherwise its first compared iteration all-reduces
+                # every gradient as one bucket instead of the rebuilt buckets
+                # used by `ddp_model_overlap`, and a different all-reduce message
+                # layout gives a different floating-point reduction order once
+                # there are more than two ranks.
+                for input in inputs[:num_warmup_inputs]:
+                    output = ddp_model_local(input)
+                    loss = output.sum()
+                    loss.backward()
                 for input in inputs:
                     local_optim.zero_grad()
                     output = ddp_model_local(input)
@@ -1379,10 +1074,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
     # NOTE: The test is skipped if using Windows since functional optimizers
     # are not currently supported.
-    @common_distributed.skip_if_win32()
-    @common_distributed.requires_nccl()
-    @common_distributed.skip_if_no_gpu
-    @common_distributed.skip_if_rocm
+    @skip_if_win32()
+    @requires_accelerator_dist_backend()
+    @skip_if_no_gpu
     @parametrize(
         "use_gpu",
         [True],
@@ -1418,9 +1112,6 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         by ``hook_constructor`` and ``shard_buckets`` and using the given ZeRO
         and DDP arguments achieves parity with DDP using a local optimizer.
         """
-        device = torch.device(self.rank) if use_gpu else torch.device("cpu")
-        backend = _get_backend_for_tests()
-        self.dist_init(self.rank, self.world_size, backend)
         hook_constructor = (
             hook_with_zero_step
             if not use_interleaved_hook
@@ -1428,7 +1119,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         )
 
         self._test_ddp_zero_overlap(
-            device,
+            self.device if use_gpu else "cpu",
             hook_constructor,
             gradient_as_bucket_view,
             static_graph,
@@ -1436,8 +1127,303 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         )
 
 
+# These tests need a default process group with a different backend or world
+# size, so they cannot reuse the continuous workers.
+class TestZeroRedundancyOptimizerDistributedFreshPG(DistributedTestBase):
+    @property
+    def device(self):
+        return device_type
+
+    @property
+    def world_size(self):
+        return min(4, max(2, torch.get_device_module(self.device).device_count()))
+
+    def _test_zero_join(self, device):
+        """Check that the ZeRO join hook allows training with uneven inputs
+        when using the given device."""
+        NUM_INPUTS = 3
+        NUM_EPOCHS = 2
+        LR = 0.01
+        torch.manual_seed(0)
+        if "cpu" not in device:
+            torch.get_device_module(device).manual_seed(0)
+
+        rank = self.rank
+        world_size = self.world_size
+        self.create_pg(device)
+
+        model = torch.nn.Sequential(
+            torch.nn.Linear(2, 3),
+            torch.nn.Linear(3, 3),
+            torch.nn.Linear(3, 3),
+        )
+        model.to(device)
+
+        # DDP ensures correct gradients in data parallel training, so DDP with
+        # local optimizers on uneven inputs should be equivalent to ZeRO on
+        # uneven inputs with gradients being manually set
+        ddp_model = (
+            DDP(model, device_ids=[rank]) if requires_ddp_rank(device) else DDP(model)
+        )
+        local_optim = torch.optim.Adam(ddp_model.parameters(), lr=LR)
+        zero_model = copy.deepcopy(model)
+        zero_model.to(device)
+        zero_optim = ZeroRedundancyOptimizer(
+            zero_model.parameters(),
+            torch.optim.Adam,
+            lr=LR,
+        )
+        loss_fn = torch.nn.MSELoss()
+
+        # Use uneven inputs: rank i has i extra inputs
+        inputs = [torch.randn(20, 2).to(device) for _ in range(NUM_INPUTS + rank)]
+        labels = torch.randn(20, 3).to(device)
+
+        # Save the gradients and parameters from DDP as the ground truth; do
+        # so on the last-joining rank (in this case, the largest rank)
+        grads_at_each_iter = []
+        params_at_each_iter = []
+        with ddp_model.join():
+            for _ in range(NUM_EPOCHS):
+                for input in inputs:
+                    output = ddp_model(input)
+                    loss_fn(output, labels).backward()
+                    if rank == world_size - 1:
+                        grads = []
+                        for p in ddp_model.parameters():
+                            grads.append(p.grad.detach().clone().to(device))
+                    local_optim.step()
+                    if rank == world_size - 1:
+                        params = []
+                        for p in ddp_model.parameters():
+                            params.append(p.detach().clone().to(device))
+                        grads_at_each_iter.append(grads)
+                        params_at_each_iter.append(params)
+
+        # Broadcast the saved gradients and parameters to all of the other
+        # ranks (which joined early)
+        grads_and_params = [grads_at_each_iter, params_at_each_iter]
+        grads_and_params = _broadcast_object(
+            grads_and_params,
+            src_rank=world_size - 1,
+            group=dist.group.WORLD,
+            device=device,
+        )
+        grads_at_each_iter = grads_and_params[0]
+        params_at_each_iter = grads_and_params[1]
+        # TODO: Replace this `_broadcast_object` with `broadcast_object_list`
+        # once the latter supports loading to the destination device instead
+        # of the source device
+
+        # A process must still set the remaining gradients after joining, so we
+        # define a join hook to do this before the ZeRO join hook
+        class _JoinGradInfo:
+            def __init__(self, grads):
+                self.grads = grads  # remaining gradients to set (in order)
+                self.index = 0
+
+        class _SetGradsJoinHook(JoinHook):
+            def __init__(self, zero_optim, grads):
+                zero_optim._join_grad_info = _JoinGradInfo(grads)
+                self.zero = zero_optim
+                super().__init__()
+
+            def main_hook(self):
+                join_grad_info = self.zero._join_grad_info
+                grads = self.zero._join_grad_info.grads[join_grad_info.index]
+                join_grad_info.index += 1
+                for p, grad in zip(self.zero._all_params, grads):
+                    p.grad = grad.detach().clone().to(device)
+
+        class _GradientSetter(Joinable):
+            def __init__(self) -> None:
+                super().__init__()
+
+            def join_hook(self, **kwargs):
+                if "zero_optim" not in kwargs:
+                    raise AssertionError("Expected 'zero_optim' in kwargs")
+                if "grads" not in kwargs:
+                    raise AssertionError("Expected 'grads' in kwargs")
+                zero_optim = kwargs["zero_optim"]
+                grads = kwargs["grads"]
+                return _SetGradsJoinHook(zero_optim, grads)
+
+            @property
+            def join_device(self):
+                return device
+
+            @property
+            def join_process_group(self):
+                return dist.group.WORLD
+
+        num_grads_after_joining = NUM_EPOCHS * (world_size - rank - 1)
+        grads = grads_at_each_iter[-num_grads_after_joining:]
+        gradient_setter = _GradientSetter()
+        iter = 0
+        with Join(
+            [gradient_setter, zero_optim],
+            zero_optim=zero_optim,
+            grads=grads,
+        ):
+            for _ in range(NUM_EPOCHS):
+                for _input in inputs:
+                    # Notify join context that this process has not joined
+                    Join.notify_join_context(gradient_setter)
+                    # Set gradients manually
+                    for p, grad in zip(
+                        zero_model.parameters(),
+                        grads_at_each_iter[iter],
+                    ):
+                        p.grad = grad.detach().clone().to(device)
+                    # Perform optimizer step and check parity
+                    zero_optim.step()
+                    for p, ddp_p in zip(
+                        zero_model.parameters(),
+                        params_at_each_iter[iter],
+                    ):
+                        torch.testing.assert_close(
+                            p,
+                            ddp_p,
+                            msg="Parameters differ between using ZeRO and "
+                            "local optimizer",
+                        )
+                    iter += 1
+
+    @requires_accelerator_dist_backend()
+    @skip_if_no_gpu
+    def test_zero_join_gpu(self):
+        """Check that the ZeRO join hook allows training with uneven inputs
+        on GPU."""
+        self._test_zero_join(self.device)
+
+    @requires_gloo()
+    def test_zero_join_cpu(self):
+        """Check that the ZeRO join hook allows training with uneven inputs
+        on CPU."""
+        self._test_zero_join("cpu")
+
+    def _test_zero_model_parallel(self, parameters_as_bucket_view: bool, device: str):
+        # Use two processes each with two GPUs
+        if not (self.rank < 2):
+            raise AssertionError(f"Expected rank < 2, got {self.rank}")
+        NUM_EPOCHS = 2
+        NUM_INPUTS = 4
+        LR = 0.01
+        torch.manual_seed(0)
+        if "cpu" not in device:
+            torch.get_device_module(device).manual_seed(0)
+
+        class ModelParallelModel(torch.nn.Module):
+            def __init__(self, dev0, dev1):
+                super().__init__()
+                self.dev0 = dev0
+                self.dev1 = dev1
+                self.net0 = torch.nn.Linear(10, 10).to(dev0)
+                self.relu = torch.nn.ReLU()
+                self.net1 = torch.nn.Linear(10, 5).to(dev1)
+
+            def forward(self, x):
+                x = x.to(self.dev0)
+                x = self.relu(self.net0(x))
+                x = x.to(self.dev1)
+                return self.net1(x)
+
+        class LocalModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.net0 = torch.nn.Linear(10, 10)
+                self.relu = torch.nn.ReLU()
+                self.net1 = torch.nn.Linear(10, 5)
+
+            def forward(self, x):
+                return self.net1(self.relu(self.net0(x)))
+
+        dev0 = torch.device(2 * self.rank)
+        dev1 = torch.device(2 * self.rank + 1)
+        mp_model = ModelParallelModel(dev0, dev1)
+        ddp_model = DDP(mp_model)
+        local_model = LocalModel().to(dev0)
+
+        # Ensure the parameters are the same across the two models
+        def copy_param(p):
+            return torch.nn.Parameter(p.detach().clone().to(dev0))
+
+        local_model.net0.weight = copy_param(mp_model.net0.weight)
+        local_model.net0.bias = copy_param(mp_model.net0.bias)
+        local_model.net1.weight = copy_param(mp_model.net1.weight)
+        local_model.net1.bias = copy_param(mp_model.net1.bias)
+
+        # Compare parity between DDP with model parallelism using ZeRO and
+        # a local model using a local optimizer
+        zero_optim = ZeroRedundancyOptimizer(
+            ddp_model.parameters(),
+            optimizer_class=torch.optim.Adam,
+            parameters_as_bucket_view=parameters_as_bucket_view,
+            lr=LR,
+        )
+        local_optim = torch.optim.Adam(local_model.parameters(), lr=LR)
+        inputs = [torch.randn(20, 10).to(dev0) for _ in range(NUM_INPUTS)]
+
+        for _ in range(NUM_EPOCHS):
+            for input in inputs:
+
+                def closure_local():
+                    local_optim.zero_grad()
+                    local_loss = local_model(input).abs().sum()
+                    local_loss.backward()
+                    return local_loss
+
+                def closure_ddp():
+                    zero_optim.zero_grad()
+                    ddp_loss = ddp_model(input).abs().sum()
+                    ddp_loss.backward()
+                    return ddp_loss
+
+                local_loss = cast(torch.Tensor, local_optim.step(closure=closure_local))
+                ddp_loss = cast(torch.Tensor, zero_optim.step(closure=closure_ddp))
+
+                # Increased tolerances are needed to pass when using TF32
+                # See: https://github.com/pytorch/pytorch/issues/67764
+                torch.testing.assert_close(
+                    local_loss.cpu(),
+                    ddp_loss.cpu(),
+                    rtol=1e-03,
+                    atol=1e-08,
+                    msg="Losses differ between local optimizer and ZeRO",
+                )
+
+                for local_p, ddp_p in zip(
+                    local_model.parameters(), ddp_model.parameters()
+                ):
+                    torch.testing.assert_close(
+                        local_p.cpu(),
+                        ddp_p.cpu(),
+                        rtol=1e-03,
+                        atol=1e-04,
+                        msg="Models differ after a step",
+                    )
+
+    @skipIfHpu
+    @skip_if_lt_x_gpu(4)
+    @parametrize(
+        "parameters_as_bucket_view",
+        [False, True],
+    )
+    def test_zero_model_parallel(
+        self,
+        parameters_as_bucket_view: bool,
+    ):
+        """Check that ZeRO works with model parallelism where the model's
+        layers are assigned to different devices."""
+        if self.rank >= 2:
+            return
+        self.create_pg(self.device, world_size=2, backend="nccl-legacy")
+        self._test_zero_model_parallel(parameters_as_bucket_view, self.device)
+
+
 instantiate_parametrized_tests(TestZeroRedundancyOptimizerSingleRank)
 instantiate_parametrized_tests(TestZeroRedundancyOptimizerDistributed)
+instantiate_parametrized_tests(TestZeroRedundancyOptimizerDistributedFreshPG)
 
 if __name__ == "__main__":
     # ! unittest should not be used here, else the tests are not properly registered

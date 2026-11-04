@@ -1,6 +1,6 @@
 /**
  * This file is adapted from PyTorch/XLA
- * https://github.com/pytorch/xla/blob/master/third_party/xla_client/metrics.h
+ * https://github.com/pytorch/xla/blob/e0e5f937a0ba8d904f9608137dc8c51ba439df2d/third_party/xla_client/metrics.h
  */
 
 #pragma once
@@ -15,8 +15,7 @@
 
 #include <c10/macros/Export.h>
 
-namespace torch {
-namespace lazy {
+namespace torch::lazy {
 
 struct TORCH_API Sample {
   Sample() = default;
@@ -34,8 +33,8 @@ using MetricReprFn = std::function<std::string(double)>;
 class TORCH_API MetricData {
  public:
   // Creates a new MetricData object with the internal circular buffer storing
-  // max_samples samples. The repr_fn argument allow to specify a function which
-  // pretty-prints a sample value.
+  // max_samples samples. The repr_fn argument allows specifying a function
+  // which pretty-prints a sample value.
   MetricData(MetricReprFn repr_fn, size_t max_samples);
 
   // Returns the total values of all the samples being posted to this metric.
@@ -233,7 +232,7 @@ TORCH_API std::string CreateMetricReport(
     const std::vector<std::string>& metric_names);
 
 // Returns the currently registered metric names. Note that the list can grow
-// since metrics are usually function intialized (they are static function
+// since metrics are usually function initialized (they are static function
 // variables).
 TORCH_API std::vector<std::string> GetMetricNames();
 
@@ -242,7 +241,7 @@ TORCH_API std::vector<std::string> GetMetricNames();
 TORCH_API MetricData* GetMetric(const std::string& name);
 
 // Returns the currently registered counter names. Note that the list can grow
-// since counters are usually function intialized (they are static function
+// since counters are usually function initialized (they are static function
 // variables).
 TORCH_API std::vector<std::string> GetCounterNames();
 
@@ -259,9 +258,13 @@ class TORCH_API TimedSection {
  public:
   explicit TimedSection(Metric* metric) : metric_(metric), start_(NowNs()) {}
 
+  TimedSection(TimedSection&& other) = delete;
+  TimedSection(const TimedSection&) = delete;
+  TimedSection& operator=(const TimedSection&) = delete;
+  TimedSection& operator=(TimedSection&&) = delete;
   ~TimedSection() {
     int64_t now = NowNs();
-    metric_->AddSample(now, now - start_);
+    metric_->AddSample(now, static_cast<double>(now - start_));
   }
 
   double Elapsed() const {
@@ -282,5 +285,4 @@ class TORCH_API TimedSection {
   TORCH_LAZY_FN_COUNTER(ns);                    \
   TORCH_LAZY_TIMED("LazyTracing")
 
-} // namespace lazy
-} // namespace torch
+} // namespace torch::lazy

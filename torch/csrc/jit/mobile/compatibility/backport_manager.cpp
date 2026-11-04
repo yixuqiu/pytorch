@@ -1,21 +1,17 @@
 #include <ATen/core/ivalue.h>
 #include <c10/util/Exception.h>
-#include <caffe2/serialize/file_adapter.h>
 #include <caffe2/serialize/inline_container.h>
 #include <torch/csrc/jit/mobile/compatibility/backport_manager.h>
 #include <torch/csrc/jit/mobile/compatibility/model_compatibility.h>
 #include <torch/csrc/jit/mobile/import.h>
-#include <torch/csrc/jit/mobile/module.h>
 #include <torch/csrc/jit/serialization/export.h>
 #include <torch/csrc/jit/serialization/import.h>
 #include <torch/csrc/jit/serialization/pickler.h>
 #include <cstddef>
 #include <sstream>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
-using caffe2::serialize::IStreamAdapter;
 using caffe2::serialize::PyTorchStreamReader;
 using caffe2::serialize::PyTorchStreamWriter;
 
@@ -55,7 +51,7 @@ void selective_copy(
     // constants.pkl
     // bytecode.pkl
     // version
-    bool skip = excluded_files.count(record) > 0;
+    bool skip = excluded_files.contains(record);
 
     // Skip dirs, find the last '/' and compare it with record
     for (const auto& excluded_dir : excluded_dirs) {
@@ -117,7 +113,6 @@ void write_archive_current(
   data_pickle.stop();
   // write out tensor data
   size_t i = 0;
-  std::string prefix = archive_name + "/";
 
   TORCH_INTERNAL_ASSERT(tensor_names.size() == data_pickle.tensorData().size());
   const std::unordered_set<std::string>& pre_serialized_files =
@@ -126,9 +121,8 @@ void write_archive_current(
   for (const auto& td : data_pickle.tensorData()) {
     WriteableTensorData writable_td = getWriteableTensorData(td);
     std::string fname = tensor_dir + tensor_names[i++];
-    if (use_storage_context &&
-        pre_serialized_files.find(fname) != pre_serialized_files.end()) {
-      // storage has been serialzed already, skip
+    if (use_storage_context && pre_serialized_files.contains(fname)) {
+      // storage has been serialized already, skip
       continue;
     }
     writer.writeRecord(fname, writable_td.data(), writable_td.sizeInBytes());
@@ -233,7 +227,7 @@ std::stringstream update_bytecode_version(
 
  How to add backport_v{i}_to_v{i-1} ?
  There are two options:
- 1) [Format change only, recommended] Constrcut a reader with the
+ 1) [Format change only, recommended] Construct a reader with the
  input_model_stream, modify the file, and use PyTorchWriter to write it to
  output_model_stream. See backport_v5_to_v4.
 
@@ -257,7 +251,7 @@ namespace {
 
 /*
 The following functions needed for backport model from v5 to v4.
-Backport function bytecode v5 that deduplicate constanst table.
+Backport function bytecode v5 that deduplicate constants table.
 Previously, in v4, constant table will be exported twice, in both archive
 bytecode and archive constants, and majority (almost all) are duplicates.
 Currently, in v5, JIT and mobile will share archive constants, and all
@@ -325,7 +319,7 @@ std::stringstream backport_v5_to_v4(std::stringstream& input_model_stream) {
 
   // The export function to generate bytecode.pkl for version 4. After bytecode
   // version bump, the old export function doesn't exist anymore, so keep a copy
-  // here for backport pupose.
+  // here for backport purpose.
   auto writeArchiveV4 = [](PyTorchStreamWriter& writer,
                            const std::string& archive_name,
                            const c10::IValue& value) {
@@ -348,7 +342,7 @@ std::stringstream backport_v5_to_v4(std::stringstream& input_model_stream) {
 
     for (const auto& td : data_pickle.tensorData()) {
       WriteableTensorData writable_td = getWriteableTensorData(td);
-      std::string fname = prefix + c10::to_string(i++);
+      std::string fname = prefix + std::to_string(i++);
       writer.writeRecord(fname, writable_td.data(), writable_td.sizeInBytes());
     }
     std::string fname = archive_name + ".pkl";
@@ -388,8 +382,8 @@ Thus, the backport is necessary such that the bytecode operator table contains
 number of specified arguments.
 */
 std::stringstream backport_v6_to_v5(std::stringstream& input_model_stream) {
-  std::shared_ptr<IStreamAdapter> rai =
-      std::make_shared<IStreamAdapter>(&input_model_stream);
+  auto rai =
+      std::make_shared<caffe2::serialize::IStreamAdapter>(&input_model_stream);
   auto reader = std::make_shared<PyTorchStreamReader>(rai);
 
   // If there are debug info files in the original model file, it should also
@@ -408,7 +402,7 @@ std::stringstream backport_v6_to_v5(std::stringstream& input_model_stream) {
   }
   // Loading the TS module is required for this backport, because bytecode needs
   // to be re-emitted (refer to the comments below)
-  Module torch_script = torch::jit::load(rai, c10::nullopt, extra_files);
+  Module torch_script = torch::jit::load(rai, std::nullopt, extra_files);
 
   // The RAII guard to change the flag, emitBytecodeDefaultInputs, to true, so
   // that TS stores the default argument values in the constant table, and emits
@@ -453,11 +447,11 @@ push in the stack. Thus, the backport is necessary such that the bytecode
 contains all the arguments as before.
 */
 std::stringstream backport_v7_to_v6(std::stringstream& input_model_stream) {
-  std::shared_ptr<IStreamAdapter> rai =
-      std::make_shared<IStreamAdapter>(&input_model_stream);
+  auto rai =
+      std::make_shared<caffe2::serialize::IStreamAdapter>(&input_model_stream);
   auto reader = std::make_shared<PyTorchStreamReader>(rai);
   auto constants_values =
-      std::move(*readArchive(kArchiveNameConstants, *reader.get()).toTuple())
+      std::move(*readArchive(kArchiveNameConstants, *reader).toTuple())
           .elements();
 
   // If there are debug info files in the original model file, it should also
@@ -476,7 +470,7 @@ std::stringstream backport_v7_to_v6(std::stringstream& input_model_stream) {
   }
   // Loading the TS module is required for this backport, because bytecode needs
   // to be re-emitted (refer to the comments below)
-  Module torch_script = torch::jit::load(rai, c10::nullopt, extra_files);
+  Module torch_script = torch::jit::load(rai, std::nullopt, extra_files);
 
   // The RAII guard to change the flag, emit_default_input_instructions, to
   // false to keep the same behavior in bytecode version 6. Change the flag,
@@ -502,10 +496,10 @@ std::stringstream backport_v7_to_v6(std::stringstream& input_model_stream) {
 std::stringstream backport_v9_to_v8(std::stringstream& input_model_stream) {
   ExtraFilesMap extra_files;
   Module torch_script =
-      torch::jit::load(input_model_stream, c10::nullopt, extra_files);
+      torch::jit::load(input_model_stream, std::nullopt, extra_files);
   std::stringstream intermediate_model_stream;
   // TODO(@pavithran) : Check if debug info is available and use load/save while
-  // backporting hardcode debaug info to be false untill supported.
+  // backporting hardcode debug info to be false until supported.
   bool hasBytecodeDebug = false;
   {
     BytecodeEmitModeGuard argNumGuard(
@@ -526,8 +520,8 @@ std::stringstream backport_v9_to_v8(std::stringstream& input_model_stream) {
 }
 
 std::stringstream backport_v8_to_v7(std::stringstream& input_model_stream) {
-  std::shared_ptr<IStreamAdapter> rai =
-      std::make_shared<IStreamAdapter>(&input_model_stream);
+  auto rai =
+      std::make_shared<caffe2::serialize::IStreamAdapter>(&input_model_stream);
   auto reader = std::make_shared<PyTorchStreamReader>(rai);
   // extra_files are kept
   auto records = reader->getAllRecords();
@@ -540,7 +534,7 @@ std::stringstream backport_v8_to_v7(std::stringstream& input_model_stream) {
       extra_files.emplace(record.substr(found + 1), "");
     }
   }
-  Module torch_script = torch::jit::load(rai, c10::nullopt, extra_files);
+  Module torch_script = torch::jit::load(rai, std::nullopt, extra_files);
   std::stringstream intermediate_model_stream;
   {
     BytecodeEmitModeGuard argNumGuard(
@@ -591,7 +585,7 @@ BackportManager::bytecodeBackportFunctions() const {
 
 bool BackportManager::hasBytecodeBackportFunction(
     const int64_t from_version) const {
-  return bytecodeBackportFunctions().count(from_version);
+  return bytecodeBackportFunctions().contains(from_version);
 }
 
 void BackportManager::registerBytecodeBackportFunction(
@@ -633,7 +627,7 @@ bool BackportManager::backport(
   input_model_stream << oss.rdbuf();
   std::stringstream output_model_stream;
 
-  // 2) backport model, backport_v{i}_to_v{i-1} function's argurment is
+  // 2) backport model, backport_v{i}_to_v{i-1} function's argument is
   // (input_model_stream and output_model_stream)
   while (bytecode_version > to_version) {
     // Swap input and output if it's not the first time and output_model_stream
@@ -696,5 +690,4 @@ bool BackportManager::backport(
   return backport_success;
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

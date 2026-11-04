@@ -1,52 +1,83 @@
+from __future__ import annotations
+
 import math
 import os
+import re
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
-
-from tools.stats.import_test_stats import get_disabled_tests, get_slow_tests
+from tools.stats.import_test_stats import get_disabled_tests
 from tools.testing.test_run import ShardedTest, TestRun
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+try:
+    import torch
+    from torch.testing._internal.common_cuda import SM80OrLater
+    from torch.testing._internal.common_utils import TEST_CUDA
+except ImportError:
+    torch = None
+    TEST_CUDA = False
+    SM80OrLater = False
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 IS_MEM_LEAK_CHECK = os.getenv("PYTORCH_TEST_CUDA_MEM_LEAK_CHECK", "0") == "1"
+BUILD_ENVIRONMENT = os.getenv("BUILD_ENVIRONMENT", "")
 
 # NUM_PROCS_FOR_SHARDING_CALC must remain consistent across all shards of a job
 # to ensure that sharding is consistent, NUM_PROCS is the actual number of procs
 # used to run tests.  If they are not equal, the only consequence should be
 # unequal shards.
-IS_ROCM = os.path.exists("/opt/rocm")
-NUM_PROCS = 1 if IS_MEM_LEAK_CHECK else 2
+# Detect ROCm via torch.version.hip, which is set for both system installs and
+# ROCm wheels (e.g. TheRock preview wheels which have no /opt/rocm). This must
+# reach the rocminfo-based NUM_PROCS clamp below; otherwise NUM_PROCS stays
+# >GPU-count and maybe_set_hip_visible_devies() in run_test.py assigns workers
+# to nonexistent device indices -> torch.cuda.device_count()==0.
+IS_ROCM = torch is not None and torch.version.hip is not None
+NUM_PROCS = 1 if IS_MEM_LEAK_CHECK else 3 if not TEST_CUDA or SM80OrLater else 2
 NUM_PROCS_FOR_SHARDING_CALC = NUM_PROCS if not IS_ROCM or IS_MEM_LEAK_CHECK else 2
 THRESHOLD = 60 * 10  # 10 minutes
 
 # See Note [ROCm parallel CI testing]
 # Special logic for ROCm GHA runners to query number of GPUs available.
-# torch.version.hip was not available to check if this was a ROCm self-hosted runner.
-# Must check for ROCm runner in another way. We look for /opt/rocm directory.
+# hipInfo gcnArchName lines also contain " gfx", so the same count works on Windows.
 if IS_ROCM and not IS_MEM_LEAK_CHECK:
-    try:
-        # This is the same logic used in GHA health check, see .github/templates/common.yml.j2
-        lines = (
-            subprocess.check_output(["rocminfo"], encoding="ascii").strip().split("\n")
-        )
-        count = 0
-        for line in lines:
-            if " gfx" in line:
-                count += 1
-        assert count > 0  # there must be at least 1 GPU
+    gpu_info_cmds = ["hipInfo", "rocminfo"] if os.name == "nt" else ["rocminfo"]
+    gpu_count = 0
+    tool_ran = False
+    for gpu_info_cmd in gpu_info_cmds:
+        try:
+            # errors="replace" tolerates non-ASCII device marketing names on Windows.
+            output = subprocess.check_output(
+                [gpu_info_cmd], encoding="utf-8", errors="replace"
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+        tool_ran = True
+        gpu_count = sum(" gfx" in line for line in output.strip().split("\n"))
+        if gpu_count > 0:
+            break
+    if gpu_count > 0:
         # Limiting to 8 GPUs(PROCS)
-        NUM_PROCS = min(count, 8)
-    except subprocess.CalledProcessError as e:
-        # The safe default for ROCm GHA runners is to run tests serially.
+        NUM_PROCS = min(gpu_count, 8)
+    elif tool_ran:
+        # A GPU runner whose query tools see no devices is unhealthy; fail loudly.
+        raise AssertionError("There must be at least 1 GPU")
+    else:
+        # No GPU query tool available; the safe default is to run tests serially.
         NUM_PROCS = 1
 
 
 class ShardJob:
     def __init__(self) -> None:
-        self.serial: List[ShardedTest] = []
-        self.parallel: List[ShardedTest] = []
+        self.serial: list[ShardedTest] = []
+        self.parallel: list[ShardedTest] = []
 
     def get_total_time(self) -> float:
         """Default is the value for which to substitute if a test has no time"""
@@ -57,21 +88,23 @@ class ShardJob:
         time = max(procs) + sum(test.get_time() for test in self.serial)
         return time
 
-    def convert_to_tuple(self) -> Tuple[float, List[ShardedTest]]:
+    def convert_to_tuple(self) -> tuple[float, list[ShardedTest]]:
         return (self.get_total_time(), self.serial + self.parallel)
 
 
 def get_with_pytest_shard(
     tests: Sequence[TestRun],
-    test_file_times: Dict[str, float],
-    test_class_times: Optional[Dict[str, Dict[str, float]]],
-) -> List[ShardedTest]:
-    sharded_tests: List[ShardedTest] = []
+    test_file_times: dict[str, float],
+    test_class_times: dict[str, dict[str, float]] | None,
+    *,
+    allow_pytest_sharding: bool = True,
+) -> list[ShardedTest]:
+    sharded_tests: list[ShardedTest] = []
 
     for test in tests:
         duration = get_duration(test, test_file_times, test_class_times or {})
 
-        if duration and duration > THRESHOLD:
+        if allow_pytest_sharding and duration and duration > THRESHOLD:
             num_shards = math.ceil(duration / THRESHOLD)
             for i in range(num_shards):
                 sharded_tests.append(
@@ -84,9 +117,9 @@ def get_with_pytest_shard(
 
 def get_duration(
     test: TestRun,
-    test_file_times: Dict[str, float],
-    test_class_times: Dict[str, Dict[str, float]],
-) -> Optional[float]:
+    test_file_times: dict[str, float],
+    test_class_times: dict[str, dict[str, float]],
+) -> float | None:
     """Calculate the time for a TestRun based on the given test_file_times and
     test_class_times.  Returns None if the time is unknown."""
     file_duration = test_file_times.get(test.test_file, None)
@@ -94,8 +127,8 @@ def get_duration(
         return file_duration
 
     def get_duration_for_classes(
-        test_file: str, test_classes: FrozenSet[str]
-    ) -> Optional[float]:
+        test_file: str, test_classes: frozenset[str]
+    ) -> float | None:
         duration: float = 0
 
         for test_class in test_classes:
@@ -116,31 +149,31 @@ def get_duration(
 
     if included:
         return included_classes_duration
-    assert (
-        excluded
-    ), f"TestRun {test} is not full file but doesn't have included or excluded classes"
+    if not excluded:
+        raise AssertionError(
+            f"TestRun {test} is not full file but doesn't have included or excluded classes"
+        )
     if file_duration is None:
         return None
     return file_duration - excluded_classes_duration
 
 
 def shard(
-    sharded_jobs: List[ShardJob],
+    sharded_jobs: list[ShardJob],
     pytest_sharded_tests: Sequence[ShardedTest],
-    estimated_time_limit: Optional[float] = None,
+    estimated_time_limit: float | None = None,
     serial: bool = False,
 ) -> None:
     # Modifies sharded_jobs in place
     if len(sharded_jobs) == 0:
-        assert (
-            len(pytest_sharded_tests) == 0
-        ), "No shards provided but there are tests to shard"
+        if len(pytest_sharded_tests) != 0:
+            raise AssertionError("No shards provided but there are tests to shard")
         return
 
     round_robin_index = 0
 
     def _get_min_sharded_job(
-        sharded_jobs: List[ShardJob], test: ShardedTest
+        sharded_jobs: list[ShardJob], test: ShardedTest
     ) -> ShardJob:
         if test.time is None:
             nonlocal round_robin_index
@@ -150,9 +183,10 @@ def shard(
         return min(sharded_jobs, key=lambda j: j.get_total_time())
 
     def _shard_serial(
-        tests: Sequence[ShardedTest], sharded_jobs: List[ShardJob]
+        tests: Sequence[ShardedTest], sharded_jobs: list[ShardJob]
     ) -> None:
-        assert estimated_time_limit is not None, "Estimated time limit must be provided"
+        if estimated_time_limit is None:
+            raise AssertionError("Estimated time limit must be provided")
         new_sharded_jobs = sharded_jobs
         for test in tests:
             if (
@@ -164,7 +198,7 @@ def shard(
             min_sharded_job.serial.append(test)
 
     def _shard_parallel(
-        tests: Sequence[ShardedTest], sharded_jobs: List[ShardJob]
+        tests: Sequence[ShardedTest], sharded_jobs: list[ShardJob]
     ) -> None:
         for test in tests:
             min_sharded_job = _get_min_sharded_job(sharded_jobs, test)
@@ -181,11 +215,12 @@ def shard(
 def calculate_shards(
     num_shards: int,
     tests: Sequence[TestRun],
-    test_file_times: Dict[str, float],
-    test_class_times: Optional[Dict[str, Dict[str, float]]],
-    must_serial: Optional[Callable[[str], bool]] = None,
+    test_file_times: dict[str, float],
+    test_class_times: dict[str, dict[str, float]] | None,
+    must_serial: Callable[[str], bool] | None = None,
     sort_by_time: bool = True,
-) -> List[Tuple[float, List[ShardedTest]]]:
+    allow_pytest_sharding: bool = True,
+) -> list[tuple[float, list[ShardedTest]]]:
     must_serial = must_serial or (lambda x: True)
     test_class_times = test_class_times or {}
 
@@ -199,13 +234,26 @@ def calculate_shards(
         unknown_tests = [x for x in tests if x not in known_tests]
 
         pytest_sharded_tests = sorted(
-            get_with_pytest_shard(known_tests, test_file_times, test_class_times),
+            get_with_pytest_shard(
+                known_tests,
+                test_file_times,
+                test_class_times,
+                allow_pytest_sharding=allow_pytest_sharding,
+            ),
             key=lambda j: j.get_time(),
             reverse=True,
-        ) + get_with_pytest_shard(unknown_tests, test_file_times, test_class_times)
+        ) + get_with_pytest_shard(
+            unknown_tests,
+            test_file_times,
+            test_class_times,
+            allow_pytest_sharding=allow_pytest_sharding,
+        )
     else:
         pytest_sharded_tests = get_with_pytest_shard(
-            tests, test_file_times, test_class_times
+            tests,
+            test_file_times,
+            test_class_times,
+            allow_pytest_sharding=allow_pytest_sharding,
         )
     del tests
 
@@ -254,5 +302,13 @@ def calculate_shards(
 
 
 def get_test_case_configs(dirpath: str) -> None:
-    get_slow_tests(dirpath=dirpath)
     get_disabled_tests(dirpath=dirpath)
+
+
+# Strip the "test"/"test-osdc" target suffix to recover the build env, the key
+# tools/torchci writes to test-times.json. Must match the write-side extraction.
+JOB_BASE_NAME_RE = re.compile(r" / test(?:-osdc)? \(")
+
+
+def get_job_base_name(job_name: str) -> str:
+    return JOB_BASE_NAME_RE.split(job_name, maxsplit=1)[0]

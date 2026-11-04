@@ -2,8 +2,7 @@
 
 #include <torch/csrc/inductor/aoti_runtime/arrayref_tensor.h>
 
-namespace torch {
-namespace aot_inductor {
+namespace torch::aot_inductor {
 
 template <typename T>
 struct ThreadLocalCachedOutputTensor;
@@ -12,11 +11,11 @@ template <>
 struct ThreadLocalCachedOutputTensor<RAIIAtenTensorHandle> {
   explicit ThreadLocalCachedOutputTensor(const RAIIAtenTensorHandle&) {}
   void copy_data_from(const RAIIAtenTensorHandle& handle) {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 
   AtenTensorHandle tensor() const {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 };
 
@@ -24,11 +23,11 @@ template <>
 struct ThreadLocalCachedOutputTensor<AtenTensorHandle> {
   explicit ThreadLocalCachedOutputTensor(const AtenTensorHandle&) {}
   void copy_data_from(const AtenTensorHandle& handle) {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 
   AtenTensorHandle tensor() const {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 };
 
@@ -36,11 +35,11 @@ template <>
 struct ThreadLocalCachedOutputTensor<ConstantHandle> {
   explicit ThreadLocalCachedOutputTensor(const ConstantHandle&) {}
   void copy_data_from(const ConstantHandle& handle) {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 
   AtenTensorHandle tensor() const {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 };
 
@@ -64,8 +63,9 @@ struct ThreadLocalCachedOutputTensor<ArrayRefTensor<T>> {
  private:
   void realloc(const ArrayRefTensor<T>& t) {
     capacity_ = t.numel();
+    // NOLINTNEXTLINE(*arrays*)
     storage_ = std::make_unique<T[]>(t.numel());
-    AtenTensorHandle handle;
+    AtenTensorHandle handle = nullptr;
     AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_create_tensor_from_blob(
         storage_.get(),
         t.sizes().size(),
@@ -79,6 +79,7 @@ struct ThreadLocalCachedOutputTensor<ArrayRefTensor<T>> {
     tensor_ = handle;
   }
 
+  // NOLINTNEXTLINE(*arrays*)
   std::unique_ptr<T[]> storage_;
   int64_t capacity_ = 0;
   RAIIAtenTensorHandle tensor_;
@@ -91,18 +92,18 @@ struct ThreadLocalCachedOutputArray;
 template <>
 struct ThreadLocalCachedOutputArray<RAIIAtenTensorHandle> {
   explicit ThreadLocalCachedOutputArray(const RAIIAtenTensorHandle&) {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 
   // Not supported yet! We would need to put contiguous() or
   // expect_contiguous() into the ABI.
   void copy_data_from(const RAIIAtenTensorHandle&) {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 
   template <typename U>
   ArrayRefTensor<U> arrayref_tensor() const {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 };
 
@@ -110,18 +111,18 @@ struct ThreadLocalCachedOutputArray<RAIIAtenTensorHandle> {
 template <>
 struct ThreadLocalCachedOutputArray<ConstantHandle> {
   explicit ThreadLocalCachedOutputArray(const ConstantHandle&) {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 
   // Not supported yet! We would need to put contiguous() or
   // expect_contiguous() into the ABI.
   void copy_data_from(const ConstantHandle&) {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 
   template <typename U>
   ArrayRefTensor<U> arrayref_tensor() const {
-    throw std::runtime_error("can't happen");
+    AOTI_RUNTIME_CHECK(false, "can't happen");
   }
 };
 
@@ -141,6 +142,7 @@ struct ThreadLocalCachedOutputArray<ArrayRefTensor<T>> {
   void copy_data_from(const ArrayRefTensor<T>& t) {
     if (t.numel() > capacity_) {
       capacity_ = t.numel();
+      // NOLINTNEXTLINE(*arrays*)
       storage_ = std::make_unique<T[]>(capacity_);
     }
     std::copy(t.data(), t.data() + t.numel(), storage_.get());
@@ -149,10 +151,10 @@ struct ThreadLocalCachedOutputArray<ArrayRefTensor<T>> {
   }
 
  private:
+  // NOLINTNEXTLINE(*arrays*)
   std::unique_ptr<T[]> storage_;
   uint32_t capacity_ = 0;
   ArrayRefTensor<T> tensor_;
 };
 
-} // namespace aot_inductor
-} // namespace torch
+} // namespace torch::aot_inductor

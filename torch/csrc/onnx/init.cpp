@@ -68,7 +68,7 @@ void initONNXBindings(PyObject* module) {
           ::torch::wrap_pybind_function([](std::shared_ptr<Graph>& graph,
                                            int opset_version,
                                            bool fixed_batch_size) {
-            return PeepholeOptimizeONNX(graph, opset_version, fixed_batch_size);
+            PeepholeOptimizeONNX(graph, opset_version, fixed_batch_size);
           }))
       .def(
           "_jit_pass_onnx_preprocess",
@@ -114,8 +114,7 @@ void initONNXBindings(PyObject* module) {
           ::torch::wrap_pybind_function([](std::shared_ptr<Graph>& graph,
                                            bool lowprecision_cast,
                                            int opset_version) {
-            return ScalarTypeAnalysisForONNX(
-                graph, lowprecision_cast, opset_version);
+            ScalarTypeAnalysisForONNX(graph, lowprecision_cast, opset_version);
           }),
           py::arg("graph"),
           py::arg("lowprecision_cast") = true,
@@ -155,9 +154,8 @@ void initONNXBindings(PyObject* module) {
           "_jit_pass_onnx_unpack_quantized_weights",
           ::torch::wrap_pybind_function(
               [](std::shared_ptr<Graph>& graph,
-                 std::map<std::string, IValue>& paramsDict,
-                 bool caffe2) {
-                UnpackQuantizedWeights(graph, paramsDict, caffe2);
+                 std::map<std::string, IValue>& paramsDict) {
+                UnpackQuantizedWeights(graph, paramsDict);
                 return paramsDict;
               }),
           pybind11::return_value_policy::move)
@@ -219,7 +217,7 @@ void initONNXBindings(PyObject* module) {
                   &std::cerr, [](std::ostream*) {});
             } else {
               std::cerr << "ERROR: only `stdout` and `stderr`"
-                        << "are supported as `stream_name`" << std::endl;
+                        << "are supported as `stream_name`" << '\n';
             }
             ::torch::jit::onnx::set_log_output_stream(out);
           },
@@ -232,7 +230,7 @@ void initONNXBindings(PyObject* module) {
               for (auto arg : args) {
                 out << ::c10::str(arg);
               }
-              out << std::endl;
+              out << '\n';
             }
           },
           "Write `args` to the previously specified ONNX log stream.")
@@ -292,11 +290,5 @@ void initONNXBindings(PyObject* module) {
       .value("TRAINING", TrainingMode::TRAINING);
 
   onnx.attr("PRODUCER_VERSION") = py::str(TORCH_VERSION);
-
-#ifdef BUILD_CAFFE2
-  onnx.attr("_CAFFE2_ATEN_FALLBACK") = true;
-#else
-  onnx.attr("_CAFFE2_ATEN_FALLBACK") = false;
-#endif
 }
 } // namespace torch::onnx

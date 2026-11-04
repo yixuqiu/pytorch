@@ -1,29 +1,27 @@
-#include <torch/csrc/autograd/function.h>
-#include <torch/csrc/profiler/kineto_shim.h>
+#include <torch/csrc/profiler/collection.h>
 #include <torch/csrc/profiler/util.h>
 
 #include <c10/util/ArrayRef.h>
 #include <c10/util/irange.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
+
+#include <utility>
 
 #ifdef USE_KINETO
-#include <libkineto.h>
 #endif
 #ifdef USE_DISTRIBUTED
-#ifdef USE_C10D
+#include <c10/util/hash.h>
 #include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
-#endif // USE_C10D
 #endif // USE_DISTRIBUTED
 
-namespace torch {
-namespace profiler {
-namespace impl {
+namespace torch::profiler::impl {
 
 namespace {
-c10::optional<bool> soft_assert_raises_;
+std::optional<bool> soft_assert_raises_;
 } // namespace
 
-void setSoftAssertRaises(c10::optional<bool> value) {
+void setSoftAssertRaises(std::optional<bool> value) {
   soft_assert_raises_ = value;
 }
 
@@ -32,10 +30,15 @@ bool softAssertRaises() {
 }
 
 void logSoftAssert(
+    // @lint-ignore CLANGTIDY
     const char* func,
+    // @lint-ignore CLANGTIDY
     const char* file,
+    // @lint-ignore CLANGTIDY
     uint32_t line,
+    // @lint-ignore CLANGTIDY
     const char* cond,
+    // @lint-ignore CLANGTIDY
     const char* args) {
 #ifdef USE_KINETO
   std::string error;
@@ -52,10 +55,15 @@ void logSoftAssert(
 }
 
 void logSoftAssert(
+    // @lint-ignore CLANGTIDY
     const char* func,
+    // @lint-ignore CLANGTIDY
     const char* file,
+    // @lint-ignore CLANGTIDY
     uint32_t line,
+    // @lint-ignore CLANGTIDY
     const char* cond,
+    // @lint-ignore CLANGTIDY
     const std::string& args) {
 #ifdef USE_KINETO
   std::string error;
@@ -138,13 +146,13 @@ std::vector<std::string> callstackStr(const std::vector<FileLineFunc>& cs) {
   cs_str.reserve(cs.size());
   for (const auto& entry : cs) {
     std::stringstream loc;
-    loc << entry.filename << "(" << entry.line << "): " << entry.funcname;
-    cs_str.push_back(loc.str());
+    loc << entry.filename << '(' << entry.line << "): " << entry.funcname;
+    cs_str.push_back(std::move(loc).str());
   }
   return cs_str;
 }
 
-std::string stacksToStr(
+std::string joinStacks(
     const std::vector<std::string>& stacks,
     const char* delim) {
   std::ostringstream oss;
@@ -159,8 +167,13 @@ std::string stacksToStr(
 #endif
         return s;
       });
-  auto rc = oss.str();
-  return "\"" + rc + "\"";
+  return std::move(oss).str();
+}
+
+std::string stacksToStr(
+    const std::vector<std::string>& stacks,
+    const char* delim) {
+  return "\"" + joinStacks(stacks, delim) + "\"";
 }
 
 static std::vector<std::vector<int64_t>> flattenList(
@@ -252,6 +265,34 @@ std::string variantShapesToStr(const std::vector<shape>& shapes) {
   return str;
 }
 
+// Replicates variantShapesToStr's over-long-TensorList collapse: a TensorList
+// alternative longer than TENSOR_LIST_DISPLAY_LENGTH_LIMIT is replaced by an
+// empty TensorList so the typed serializer emits the byte-identical "[]".
+std::vector<shape> variantShapesTruncated(const std::vector<shape>& shapes) {
+  std::vector<shape> truncated;
+  truncated.reserve(shapes.size());
+  for (const auto& s : shapes) {
+    if (std::holds_alternative<std::vector<std::vector<int64_t>>>(s) &&
+        std::get<std::vector<std::vector<int64_t>>>(s).size() >
+            TENSOR_LIST_DISPLAY_LENGTH_LIMIT) {
+      truncated.emplace_back(std::vector<std::vector<int64_t>>{});
+    } else {
+      truncated.push_back(s);
+    }
+  }
+  return truncated;
+}
+
+std::vector<shape> shapesToInputShapes(
+    const std::vector<std::vector<int64_t>>& shapes) {
+  std::vector<shape> result;
+  result.reserve(shapes.size());
+  for (const auto& s : shapes) {
+    result.emplace_back(s);
+  }
+  return result;
+}
+
 std::string shapeToStr(const std::vector<int64_t>& shape) {
   std::string str("[");
   for (const auto s_idx : c10::irange(shape.size())) {
@@ -291,14 +332,44 @@ std::string strListToStr(const std::vector<std::string>& types) {
         types.end(),
         std::ostream_iterator<std::string>(oss, ", "),
         [](const std::string& s) -> std::string { return "\"" + s + "\""; });
-    auto rc = oss.str();
+    auto rc = std::move(oss).str();
     rc.erase(rc.length() - 2); // remove last ", "
     return "[" + rc + "]";
+  }
+}
+std::string ivalueToStr(const c10::IValue& val, bool isString) {
+  std::stringstream ss;
+  if (val.isNone()) {
+    return "\"None\"";
+  } else {
+    ss.str("");
+    if (isString) {
+      ss << '"';
+    }
+    ss << val;
+    if (isString) {
+      ss << '"';
+    }
+    std::string mystr = std::move(ss).str();
+
+    // For boolean the values that ivalue gives is "True" and "False" but
+    // json only takes "true" and "false" so we convert the string to lower case
+    if (val.isBool()) {
+      for (char& c : mystr) {
+        c = static_cast<char>(std::tolower(c));
+      }
+    }
+
+    // A double quote can cause issues with the chrome tracing so force
+    // all inputs to not contain more than the 2 we add in this function
+    auto count = std::count(mystr.begin(), mystr.end(), '"');
+    return count > 2 ? "\"None\"" : mystr;
   }
 }
 
 std::string ivalueListToStr(const std::vector<c10::IValue>& list) {
   std::vector<std::string> concrete_str_inputs;
+  concrete_str_inputs.reserve(list.size());
   std::stringstream ss;
   for (const auto& val : list) {
     if (val.isNone()) {
@@ -306,10 +377,29 @@ std::string ivalueListToStr(const std::vector<c10::IValue>& list) {
     } else {
       ss.str("");
       ss << val;
-      concrete_str_inputs.emplace_back(ss.str());
+      concrete_str_inputs.emplace_back(std::move(ss).str());
     }
   }
   return strListToStr(concrete_str_inputs);
+}
+
+// Like ivalueListToStr but returns the per-element strings (unquoted, None ->
+// "") instead of a single joined string, for the typed vector<string> field.
+std::vector<std::string> concreteInputsToStrList(
+    const std::vector<c10::IValue>& inputs) {
+  std::vector<std::string> concrete_str_inputs;
+  concrete_str_inputs.reserve(inputs.size());
+  std::stringstream ss;
+  for (const auto& val : inputs) {
+    if (val.isNone()) {
+      concrete_str_inputs.emplace_back("");
+    } else {
+      ss.str("");
+      ss << val;
+      concrete_str_inputs.emplace_back(std::move(ss).str());
+    }
+  }
+  return concrete_str_inputs;
 }
 
 std::vector<std::string> inputTypes(const at::RecordFunction& fn) {
@@ -336,107 +426,234 @@ std::vector<std::string> inputTypes(const at::RecordFunction& fn) {
 // ----------------------------------------------------------------------------
 // -- NCCL Metadata -----------------------------------------------------------
 // ----------------------------------------------------------------------------
-#ifdef USE_DISTRIBUTED
-#ifdef USE_C10D
-static constexpr auto kCommsName = "Collective name";
-static constexpr auto kDtype = "dtype";
-static constexpr auto kInMsgNelems = "In msg nelems";
-static constexpr auto kOutMsgNelems = "Out msg nelems";
-static constexpr auto kInSplit = "In split size";
-static constexpr auto kOutSplit = "Out split size";
-static constexpr auto kGlobalRankStart = "Global rank start";
-static constexpr auto kGlobalRankStride = "Global rank stride";
-static constexpr auto kGroupSize = "Group size";
-static constexpr auto kProcessGroupName = "Process Group Name";
-static constexpr auto kProcessGroupDesc = "Process Group Description";
-static constexpr auto kGroupRanks = "Process Group Ranks";
 
-static constexpr int32_t kTruncatLength = 30;
-#endif // USE_C10D
-#endif // USE_DISTRIBUTED
+static constexpr int32_t kTruncateLength = 30;
 
-std::unordered_map<std::string, std::string> saveNcclMeta(
-    const at::RecordFunction& fn) {
-  std::unordered_map<std::string, std::string> map;
+template <typename ListLikeType>
+static inline std::string format_list(
+    ListLikeType list,
+    bool truncate,
+    bool with_escaped_quotes = true) {
+  if (truncate && list.size() > kTruncateLength) {
+    if (with_escaped_quotes == true) {
+      auto x = fmt::format(
+          "\"[{}, ..., {}]\"",
+          fmt::join(list.begin(), list.begin() + kTruncateLength - 1, ", "),
+          *std::prev(list.end()));
+      return x;
+    } else {
+      auto x = fmt::format(
+          "[{}, ..., {}]",
+          fmt::join(list.begin(), list.begin() + kTruncateLength - 1, ", "),
+          *std::prev(list.end()));
+      return x;
+    }
+  }
+  if (with_escaped_quotes == true) {
+    auto x = fmt::format("\"[{}]\"", fmt::join(list.begin(), list.end(), ", "));
+    return x;
+  } else {
+    auto x = fmt::format("[{}]", fmt::join(list.begin(), list.end(), ", "));
+    return x;
+  }
+}
+
+std::pair<bool, std::variant<int, std::vector<int>>> findStartAddrForTensors(
+    const c10::IValue& val) {
+  if (val.isTensor()) {
+    // Store hints about where the input starts in memory.
+    // Useful for debugging memory access patterns.
+    const auto& tensor = val.toTensor();
+    const int result = getTensorStartHint(tensor);
+    return {false, result};
+  } else if (val.isTuple()) {
+    const auto& val_tuple = val.toTupleRef().elements();
+    size_t tuple_size = val_tuple.size();
+    std::vector<int> responses;
+    responses.reserve(tuple_size);
+    for (const auto j : c10::irange(tuple_size)) {
+      auto [is_list, res] = findStartAddrForTensors(val_tuple[j]);
+      if (is_list) {
+        const auto& vec_res = std::get<std::vector<int>>(res);
+        responses.insert(responses.end(), vec_res.begin(), vec_res.end());
+      } else {
+        responses.push_back(std::get<int>(res));
+      }
+    }
+    return {true, std::move(responses)};
+  } else if (val.isList()) {
+    const auto& val_list = val.toList();
+    size_t list_size = val_list.size();
+    std::vector<int> responses;
+    responses.reserve(list_size);
+    for (const auto j : c10::irange(list_size)) {
+      auto [is_list, res] = findStartAddrForTensors(val_list[j]);
+      if (is_list) {
+        auto const& vec_res = std::get<std::vector<int>>(res);
+        responses.insert(responses.end(), vec_res.begin(), vec_res.end());
+      } else {
+        responses.push_back(std::get<int>(res));
+      }
+    }
+    return {true, std::move(responses)};
+  } else {
+    // push back an invalid value for indices representing non-tensor inputs
+    return {false, -1};
+  }
+}
+
+collective_meta_t saveNcclMetaTyped(
+    // @lint-ignore CLANGTIDY
+    const at::RecordFunction& fn,
+    // @lint-ignore CLANGTIDY
+    const SaveNcclMetaConfig& config) {
+  collective_meta_t metadata;
 #ifdef USE_DISTRIBUTED
-#ifdef USE_C10D
   auto debugInfo = dynamic_cast<ParamCommsDebugInfo*>(
       c10::ThreadLocalDebugInfo::get(c10::DebugInfoKind::PARAM_COMMS_INFO));
-  if (debugInfo == nullptr) {
-    LOG(WARNING) << "ParamCommsDebugInfo not available for function: "
-                 << fn.name();
-    return map;
-  }
 
-  map.emplace(
-      kCommsName, fmt::format("\"{}\"", debugInfo->getCollectiveName()));
-  map.emplace(
-      kDtype, fmt::format("\"{}\"", c10::toString(debugInfo->getDType())));
-  map.emplace(kInMsgNelems, std::to_string(debugInfo->getInMessageNelems()));
-  map.emplace(kOutMsgNelems, std::to_string(debugInfo->getOutMessageNelems()));
-  auto& inSplitSizes = debugInfo->getInputSplitSizes();
-  if (!inSplitSizes.empty() && inSplitSizes.size() <= kTruncatLength) {
-    map.emplace(
-        kInSplit, fmt::format("\"[{}]\"", fmt::join(inSplitSizes, ", ")));
-  } else if (inSplitSizes.size() > kTruncatLength) {
-    map.emplace(
-        kInSplit,
-        fmt::format(
-            "\"[{}, ...]\"",
-            fmt::join(
-                inSplitSizes.begin(),
-                inSplitSizes.begin() + kTruncatLength,
-                ", ")));
+  if (config.introspectMetadata) {
+    if (debugInfo == nullptr) {
+      LOG(WARNING) << "ParamCommsDebugInfo not available for function: "
+                   << fn.name();
+      return metadata;
+    }
+    auto& collective_name = debugInfo->getCollectiveName();
+    metadata.emplace(kCommsName, collective_name);
+    metadata.emplace(kDtype, std::string(c10::toString(debugInfo->getDType())));
+    metadata.emplace(kInMsgNelems, debugInfo->getInMessageNelems());
+    metadata.emplace(kOutMsgNelems, debugInfo->getOutMessageNelems());
+
+    auto& inSplitSizes = debugInfo->getInputSplitSizes();
+    metadata.emplace(
+        kInSplit, format_list(inSplitSizes, config.truncate, false));
+
+    auto& outSplitSizes = debugInfo->getOutputSplitSizes();
+    metadata.emplace(
+        kOutSplit, format_list(outSplitSizes, config.truncate, false));
+
+    auto globalRankStart = debugInfo->getGlobalRankStart();
+    if (globalRankStart >= 0) {
+      metadata.emplace(kGlobalRankStart, globalRankStart);
+    }
+    auto globalRankStride = debugInfo->getGlobalRankStride();
+    if (globalRankStride > 0) {
+      metadata.emplace(kGlobalRankStride, globalRankStride);
+    }
+    metadata.emplace(kGroupSize, debugInfo->getWorldSize());
+    auto& group_name = debugInfo->getProcessGroupName();
+    if (!group_name.empty()) {
+      metadata.emplace(kProcessGroupName, group_name);
+    }
+    auto& group_desc = debugInfo->getProcessGroupDesc();
+    if (!group_desc.empty()) {
+      metadata.emplace(kProcessGroupDesc, group_desc);
+    }
+    auto& groupRanks = debugInfo->getGroupRanks();
+    metadata.emplace(
+        kGroupRanks, format_list(groupRanks, config.truncate, false));
+
+    auto rank = debugInfo->getRank();
+    metadata.emplace(kRank, rank);
+    int nRanks = static_cast<int>(groupRanks.size());
+    if (collective_name == "send") {
+      if (rank >= 0 && rank < nRanks) {
+        metadata.emplace(kP2pDst, groupRanks[rank]);
+      }
+    } else if (collective_name == "recv") {
+      if (rank >= 0 && rank < nRanks) {
+        metadata.emplace(kP2pSrc, groupRanks[rank]);
+      }
+    }
+
+    auto seqNum = debugInfo->getSequenceNumber();
+    if (seqNum >= 0) {
+      metadata.emplace(kSeqNum, seqNum);
+
+      uint64_t comms_id = static_cast<uint64_t>(c10::get_hash(
+          debugInfo->getProcessGroupName(),
+          seqNum,
+          debugInfo->getIsP2P(),
+          globalRankStart,
+          globalRankStride,
+          debugInfo->getWorldSize()));
+      metadata.emplace(kCommsId, comms_id);
+    }
   }
-  auto& outSplitSizes = debugInfo->getOutputSplitSizes();
-  if (!outSplitSizes.empty() && outSplitSizes.size() <= kTruncatLength) {
-    map.emplace(
-        kOutSplit, fmt::format("\"[{}]\"", fmt::join(outSplitSizes, ", ")));
-  } else if (outSplitSizes.size() > kTruncatLength) {
-    map.emplace(
-        kOutSplit,
-        fmt::format(
-            "\"[{}, ...]\"",
-            fmt::join(
-                outSplitSizes.begin(),
-                outSplitSizes.begin() + kTruncatLength,
-                ", ")));
+  metadata.emplace(kIsAsynchronizedOp, debugInfo->isAsynchronizedOp());
+
+  if (get_record_tensor_addrs_enabled()) {
+    std::vector<std::string> addressList;
+    if (config.introspectInputs) {
+      auto num_inputs = fn.num_inputs();
+      const auto inputs = fn.inputs();
+      if (checkFunctionInputsForLogging(fn)) {
+        // need to account for Stack mode where the inputs are at the end.
+        size_t input_start = inputs.size() - num_inputs;
+        for (const auto i : c10::irange(input_start, inputs.size())) {
+          const c10::IValue& val = inputs[i];
+          auto [is_list, result] = findStartAddrForTensors(val);
+          if (is_list) {
+            auto const& list_result = std::get<std::vector<int>>(result);
+            addressList.push_back(
+                format_list(list_result, config.truncate, false));
+          } else {
+            auto scalar_result = std::get<int>(result);
+            addressList.push_back(std::to_string(scalar_result));
+          }
+          // today we record a lot of metadata in record_param_comms that shows
+          // up as inputs. here we only need the addresses of the first inputs,
+          // which are the real tensor inputs to the collective call. So let's
+          // break out of the loop here.
+          break;
+        }
+        metadata.emplace(
+            kInTensorsStart, format_list(addressList, false, false));
+        addressList.clear();
+      }
+    }
+    if (config.introspectOutputs) {
+      const auto& outputs = fn.outputs();
+      auto num_outputs = fn.num_outputs();
+      if (checkFunctionOutputsForLogging(fn)) {
+        // need to account for Stack mode where the outputs are at the end.
+        size_t output_start = outputs.size() - num_outputs;
+        for (const auto i : c10::irange(output_start, outputs.size())) {
+          const c10::IValue& val = outputs[i];
+          auto [is_list, result] = findStartAddrForTensors(val);
+          if (is_list) {
+            auto const& list_result = std::get<std::vector<int>>(result);
+            addressList.push_back(
+                format_list(list_result, config.truncate, false));
+          } else {
+            auto scalar_result = std::get<int>(result);
+            addressList.push_back(std::to_string(scalar_result));
+          }
+        }
+        metadata.emplace(
+            kOutTensorsStart, format_list(addressList, false, false));
+        addressList.clear();
+      }
+    }
   }
-  auto globalRankStart = debugInfo->getGlobalRankStart();
-  if (globalRankStart >= 0) {
-    map.emplace(kGlobalRankStart, std::to_string(globalRankStart));
-  }
-  auto globalRankStride = debugInfo->getGlobalRankStride();
-  if (globalRankStride > 0) {
-    map.emplace(kGlobalRankStride, std::to_string(globalRankStride));
-  }
-  map.emplace(kGroupSize, std::to_string(debugInfo->getWorldSize()));
-  auto& group_name = debugInfo->getProcessGroupName();
-  if (!group_name.empty()) {
-    map.emplace(kProcessGroupName, fmt::format("\"{}\"", group_name));
-  }
-  auto& group_desc = debugInfo->getProcessGroupDesc();
-  if (!group_desc.empty()) {
-    map.emplace(kProcessGroupDesc, fmt::format("\"{}\"", group_desc));
-  }
-  auto& groupRanks = debugInfo->getGroupRanks();
-  if (!groupRanks.empty() && groupRanks.size() <= kTruncatLength) {
-    map.emplace(
-        kGroupRanks, fmt::format("\"[{}]\"", fmt::join(groupRanks, ", ")));
-  } else if (groupRanks.size() > kTruncatLength) {
-    map.emplace(
-        kGroupRanks,
-        fmt::format(
-            "\"[{}, ..., {}]\"",
-            fmt::join(
-                groupRanks.begin(),
-                groupRanks.begin() + kTruncatLength - 1,
-                ", "),
-            groupRanks.back()));
-  }
-#endif // USE_C10D
 #endif // USE_DISTRIBUTED
+  return metadata;
+}
+
+std::unordered_map<std::string, std::string> ncclMetaToStringMap(
+    // @lint-ignore CLANGTIDY
+    const collective_meta_t& metadata) {
+  std::unordered_map<std::string, std::string> map;
+  for (const auto& [key, value] : metadata) {
+    map.emplace(key, ivalueToStr(value, value.isString()));
+  }
   return map;
+}
+
+std::unordered_map<std::string, std::string> saveNcclMeta(
+    const at::RecordFunction& fn,
+    const SaveNcclMetaConfig& config) {
+  return ncclMetaToStringMap(saveNcclMetaTyped(fn, config));
 }
 
 // ----------------------------------------------------------------------------
@@ -476,22 +693,23 @@ static std::vector<c10::IntArrayRef> getInputSizes(
     ss << "Failed to save extra arguments for flops computation of op "
        << op_name << ", min size: " << min_size
        << ", actual size: " << inputs.size();
-    TORCH_WARN(ss.str());
+    TORCH_WARN(std::move(ss).str());
     return {};
   }
   std::vector<c10::IntArrayRef> inputSizes = {};
+  inputSizes.reserve(should_be_tensor.size());
   for (auto index : should_be_tensor) {
     if (!inputs[index].isTensor()) {
       ss << "Failed to save extra arguments for flops computation of op "
          << op_name << ", input[" << index << "] must be a tensor.";
-      TORCH_WARN(ss.str());
+      TORCH_WARN(std::move(ss).str());
       return {};
     }
     at::Tensor t = inputs[index].toTensor();
     if (t.is_nested()) {
       ss << "Failed to save extra arguments for flops computation of op "
          << op_name << " with input[" << index << "] as nested tensor.";
-      TORCH_WARN(ss.str());
+      TORCH_WARN(std::move(ss).str());
       return {};
     }
     inputSizes.emplace_back(t.sizes());
@@ -588,12 +806,9 @@ uint64_t computeFlops(
     const std::string& op_name,
     const std::unordered_map<std::string, c10::IValue>& extra_args) {
   if (op_name == kConv2dOp) {
-    if (extra_args.find(kInputSize) == extra_args.end() ||
-        extra_args.find(kWeightSize) == extra_args.end() ||
-        extra_args.find(kGroups) == extra_args.end() ||
-        extra_args.find(kPadding) == extra_args.end() ||
-        extra_args.find(kStride) == extra_args.end() ||
-        extra_args.find(kDilation) == extra_args.end()) {
+    if (!extra_args.contains(kInputSize) || !extra_args.contains(kWeightSize) ||
+        !extra_args.contains(kGroups) || !extra_args.contains(kPadding) ||
+        !extra_args.contains(kStride) || !extra_args.contains(kDilation)) {
       TORCH_WARN(
           "Calculating flops for aten::conv2d requires groups, padding, stride, dilation, input_size, and weight_size in saved arguments.");
       return 0;
@@ -661,8 +876,7 @@ uint64_t computeFlops(
     return conv2d_multiply_factor * minibatch * output_h * output_w * kernel_h *
         kernel_w * in_channels * out_channels / groups;
   } else if (op_name == kMMOp || op_name == kAddMMOp) {
-    if (extra_args.find(kMat1Size) == extra_args.end() ||
-        extra_args.find(kMat2Size) == extra_args.end()) {
+    if (!extra_args.contains(kMat1Size) || !extra_args.contains(kMat2Size)) {
       TORCH_WARN(
           "Calculating flops for ",
           op_name,
@@ -702,8 +916,7 @@ uint64_t computeFlops(
     flops *= gemm_multiply_factor;
     return flops;
   } else if (op_name == kBMMOp || op_name == kBAddBMMOp) {
-    if (extra_args.find(kMat1Size) == extra_args.end() ||
-        extra_args.find(kMat2Size) == extra_args.end()) {
+    if (!extra_args.contains(kMat1Size) || !extra_args.contains(kMat2Size)) {
       TORCH_WARN(
           "Calculating flops for ",
           op_name,
@@ -749,7 +962,7 @@ uint64_t computeFlops(
     flops *= gemm_multiply_factor;
     return flops;
   } else if (op_name == kMulOp) {
-    if (extra_args.find(kMatSize) == extra_args.end()) {
+    if (!extra_args.contains(kMatSize)) {
       TORCH_WARN(
           "Calculating flops for aten::mul.Tensor requires mat_size in saved arguments.");
       return 0;
@@ -768,7 +981,7 @@ uint64_t computeFlops(
     }
     return flops;
   } else if (op_name == kAddOp) {
-    if (extra_args.find(kMatSize) == extra_args.end()) {
+    if (!extra_args.contains(kMatSize)) {
       TORCH_WARN(
           "Calculating flops for aten::add.Tensor requires mat_size in saved arguments.");
       return 0;
@@ -790,6 +1003,43 @@ uint64_t computeFlops(
   return 0;
 }
 
-} // namespace impl
-} // namespace profiler
-} // namespace torch
+// A function that takes an IValue
+// and returns a conventional string representation of the IValue
+// Currently it returns int representation of the last 20 bits of the address
+// value
+int getTensorStartHint(const at::Tensor& t) {
+  const auto tensor_impl = t.unsafeGetTensorImpl();
+  uintptr_t storage_addr = 0;
+  storage_addr = reinterpret_cast<uintptr_t>(tensor_impl->storage().data());
+  int last_bits = static_cast<int>(storage_addr & 0xFFFFF);
+  return last_bits;
+}
+
+bool checkFunctionOutputsForLogging(const at::RecordFunction& fn) {
+  const auto& outputs = fn.outputs();
+  auto num_outputs = fn.num_outputs();
+  VLOG(2) << "outputs: " << num_outputs << ' ' << outputs.size() << '\n';
+  // We have two cases: for unboxed kernel, we have num_outputs ==
+  // outputs.size() for boxed kernel using stack, there could be more elements
+  // on the stack from previous ops.
+  // TORCH_INTERNAL_ASSERT(num_outputs <= outputs.size());
+  if (num_outputs > outputs.size()) {
+    return false;
+  }
+  return true;
+}
+
+bool checkFunctionInputsForLogging(const at::RecordFunction& fn) {
+  auto num_inputs = fn.num_inputs();
+  const auto inputs = fn.inputs();
+  VLOG(2) << "inputs: " << num_inputs << ' ' << inputs.size() << '\n';
+  // We have two cases: for unboxed kernel, we have num_inputs ==
+  // inputs.size() for boxed kernel using stack, there could be more elements
+  // on the stack from previous ops.
+  // TORCH_INTERNAL_ASSERT(num_inputs <= inputs.size());
+  if (num_inputs > inputs.size()) {
+    return false;
+  }
+  return true;
+}
+} // namespace torch::profiler::impl

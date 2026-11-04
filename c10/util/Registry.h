@@ -14,13 +14,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <c10/macros/Export.h>
 #include <c10/macros/Macros.h>
+#include <c10/util/Exception.h>
 #include <c10/util/Type.h>
 
 namespace c10 {
@@ -57,6 +57,7 @@ class Registry {
   typedef std::function<ObjectPtrType(Args...)> Creator;
 
   Registry(bool warning = true) : registry_(), priority_(), warning_(warning) {}
+  ~Registry() = default;
 
   void Register(
       const SrcType& key,
@@ -68,7 +69,9 @@ class Registry {
     //                                   << " registered twice.";
     // However, TORCH_CHECK_EQ depends on google logging, and since registration
     // is carried out at static initialization time, we do not want to have an
-    // explicit dependency on glog's initialization function.
+    // explicit dependency on glog's initialization function. Plain TORCH_CHECK
+    // below is fine: it expands to torchCheckFail, not to the MessageLogger
+    // that TORCH_CHECK_EQ reaches through TORCH_CHECK_OP.
     if (registry_.count(key) != 0) {
       auto cur_priority = priority_[key];
       if (priority > cur_priority) {
@@ -86,7 +89,7 @@ class Registry {
         if (terminate_) {
           std::exit(1);
         } else {
-          throw std::runtime_error(err_msg);
+          TORCH_CHECK(false, err_msg);
         }
       } else if (warning_) {
         std::string warn_msg =
@@ -152,6 +155,10 @@ class Registry {
     terminate_ = terminate;
   }
 
+  C10_DISABLE_COPY_AND_ASSIGN(Registry);
+  Registry(Registry&&) = delete;
+  Registry& operator=(Registry&&) = delete;
+
  private:
   std::unordered_map<SrcType, Creator> registry_;
   std::unordered_map<SrcType, RegistryPriority> priority_;
@@ -159,8 +166,6 @@ class Registry {
   const bool warning_;
   std::unordered_map<SrcType, std::string> help_message_;
   std::mutex register_mutex_;
-
-  C10_DISABLE_COPY_AND_ASSIGN(Registry);
 };
 
 template <class SrcType, class ObjectPtrType, class... Args>

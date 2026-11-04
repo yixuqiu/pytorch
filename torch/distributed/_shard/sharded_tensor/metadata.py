@@ -1,18 +1,21 @@
+# mypy: allow-untyped-defs
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List
+from typing import cast
 
 import torch
 from torch.distributed._shard.metadata import ShardMetadata
+
 
 class MEM_FORMAT_ENCODING(Enum):
     TORCH_CONTIGUOUS_FORMAT = 0
     TORCH_CHANNELS_LAST = 1
     TORCH_PRESERVE_FORMAT = 2
 
+
 @dataclass
 class TensorProperties:
-    """ Properties used to create :class:`Tensor` """
+    """Properties used to create :class:`Tensor`"""
 
     # Regular tensor fields
     dtype: torch.dtype = field(default=torch.get_default_dtype())
@@ -20,6 +23,8 @@ class TensorProperties:
     requires_grad: bool = False
     memory_format: torch.memory_format = field(default=torch.contiguous_format)
     pin_memory: bool = False
+
+    strides: tuple[int, ...] | None = None
 
     def __getstate__(self):
         # Since torch.memory_format cannot be pickled!
@@ -31,7 +36,7 @@ class TensorProperties:
         elif memory_format == torch.preserve_format:
             mem_format_encoding = MEM_FORMAT_ENCODING.TORCH_PRESERVE_FORMAT
         else:
-            raise RuntimeError(f'Invalid torch.memory_format: {memory_format}')
+            raise RuntimeError(f"Invalid torch.memory_format: {memory_format}")
 
         return (
             self.dtype,
@@ -39,13 +44,31 @@ class TensorProperties:
             self.requires_grad,
             mem_format_encoding,
             self.pin_memory,
+            self.strides,
         )
 
     def __setstate__(
         self,
         state,
     ):
-        (self.dtype, self.layout, self.requires_grad, mem_format_encoding, self.pin_memory) = state
+        if len(state) == 5:
+            (
+                self.dtype,
+                self.layout,
+                self.requires_grad,
+                mem_format_encoding,
+                self.pin_memory,
+            ) = state
+            self.strides = None
+        else:
+            (
+                self.dtype,
+                self.layout,
+                self.requires_grad,
+                mem_format_encoding,
+                self.pin_memory,
+                self.strides,
+            ) = state
 
         if mem_format_encoding == MEM_FORMAT_ENCODING.TORCH_CONTIGUOUS_FORMAT:
             memory_format = torch.contiguous_format
@@ -54,19 +77,25 @@ class TensorProperties:
         elif mem_format_encoding == MEM_FORMAT_ENCODING.TORCH_PRESERVE_FORMAT:
             memory_format = torch.preserve_format
         else:
-            raise RuntimeError(f'Invalid torch.memory_format encoding: {mem_format_encoding}')
+            raise RuntimeError(
+                f"Invalid torch.memory_format encoding: {mem_format_encoding}"
+            )
 
         self.memory_format = memory_format
 
     @staticmethod
     def create_from_tensor(tensor: torch.Tensor) -> "TensorProperties":
+        stride = getattr(tensor, "stride", None)
         return TensorProperties(
             dtype=tensor.dtype,
             layout=tensor.layout,
             requires_grad=tensor.requires_grad,
             memory_format=torch.contiguous_format,
-            pin_memory=tensor.is_pinned()
+            pin_memory=tensor.is_pinned(),
+            strides=cast(tuple[int, ...], stride()) if callable(stride) else None,
         )
+
+
 @dataclass
 class ShardedTensorMetadata:
     """
@@ -74,7 +103,7 @@ class ShardedTensorMetadata:
     """
 
     # Metadata about each shard of the Tensor
-    shards_metadata: List[ShardMetadata] = field(default_factory=list)
+    shards_metadata: list[ShardMetadata] = field(default_factory=list)
 
     # Size of each dim of the overall Tensor.
     size: torch.Size = field(default=torch.Size([]))

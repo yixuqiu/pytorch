@@ -31,11 +31,11 @@ parameters, we only need :meth:`~torch.distributions.Distribution.sample` and
 
 .. math::
 
-    \Delta\theta  = \alpha r \frac{\partial\log p(a|\pi^\theta(s))}{\partial\theta}
+    \Delta\theta  = \alpha r \nabla_\theta \log \pi_\theta(a \mid s)
 
 where :math:`\theta` are the parameters, :math:`\alpha` is the learning rate,
-:math:`r` is the reward and :math:`p(a|\pi^\theta(s))` is the probability of
-taking action :math:`a` in state :math:`s` given policy :math:`\pi^\theta`.
+:math:`r` is the reward and :math:`\pi_\theta(a \mid s)` is the probability of
+taking action :math:`a` in state :math:`s` given policy :math:`\pi_\theta`.
 
 In practice we would sample an action from the output of a network, apply this
 action in an environment, and then use ``log_prob`` to construct an equivalent
@@ -71,6 +71,7 @@ derivative would be as follows::
     loss.backward()
 """
 
+from . import transforms
 from .bernoulli import Bernoulli
 from .beta import Beta
 from .binomial import Binomial
@@ -85,6 +86,7 @@ from .exp_family import ExponentialFamily
 from .exponential import Exponential
 from .fishersnedecor import FisherSnedecor
 from .gamma import Gamma
+from .generalized_pareto import GeneralizedPareto
 from .geometric import Geometric
 from .gumbel import Gumbel
 from .half_cauchy import HalfCauchy
@@ -111,11 +113,11 @@ from .relaxed_categorical import RelaxedOneHotCategorical
 from .studentT import StudentT
 from .transformed_distribution import TransformedDistribution
 from .transforms import *  # noqa: F403
-from . import transforms
 from .uniform import Uniform
 from .von_mises import VonMises
 from .weibull import Weibull
 from .wishart import Wishart
+
 
 _add_kl_info()
 del _add_kl_info
@@ -134,6 +136,7 @@ __all__ = [
     "ExponentialFamily",
     "FisherSnedecor",
     "Gamma",
+    "GeneralizedPareto",
     "Geometric",
     "Gumbel",
     "HalfCauchy",

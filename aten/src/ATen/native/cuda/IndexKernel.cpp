@@ -5,7 +5,6 @@
 #include <ATen/core/List.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/MemoryOverlap.h>
-#include <ATen/NamedTensorUtils.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -22,7 +21,6 @@
 namespace at::native {
 
 static Tensor & masked_select_out_cuda_impl(Tensor & result, const Tensor & self, const Tensor & mask) {
-  NoNamesGuard guard;
 
   TORCH_CHECK(mask.scalar_type() == ScalarType::Bool,
               "masked_select: expected BoolTensor for mask");
@@ -39,22 +37,20 @@ static Tensor & masked_select_out_cuda_impl(Tensor & result, const Tensor & self
   // Cannot reassign to mask_temp and self_temp here! if they are
   // owning and expand_outplace returns a borrow, the returned borrow
   // would dangle.
-  auto mask_self_expanded = expand_outplace(*mask_temp, *self_temp);
+  auto [mask_expanded, self_expanded] = expand_outplace(*mask_temp, *self_temp);
   at::cuda::index_out(
-      result, *std::get<1>(mask_self_expanded),
-      c10::List<c10::optional<at::Tensor>>({*std::move(std::get<0>(mask_self_expanded))}));
+      result, *self_expanded,
+      c10::List<std::optional<at::Tensor>>({*std::move(mask_expanded)}));
 
   return result;
 }
 
 Tensor masked_select_cuda(const Tensor & self, const Tensor & mask) {
-  namedinference::compute_broadcast_outnames(self, mask);
   Tensor result = at::empty({0}, self.options());
   return masked_select_out_cuda_impl(result, self, mask);
 }
 
 Tensor & masked_select_out_cuda(const Tensor & self, const Tensor & mask, Tensor & result) {
-  namedinference::compute_broadcast_outnames(self, mask);
   return masked_select_out_cuda_impl(result, self, mask);
 }
 

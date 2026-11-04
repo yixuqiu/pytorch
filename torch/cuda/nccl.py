@@ -1,6 +1,7 @@
+# mypy: allow-untyped-defs
 import collections
 import warnings
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 
 import torch.cuda
 
@@ -12,7 +13,7 @@ SUM = 0  # ncclRedOp_t
 
 def is_available(tensors):
     if not hasattr(torch._C, "_nccl_all_reduce"):
-        warnings.warn("PyTorch is not compiled with NCCL support")
+        warnings.warn("PyTorch is not compiled with NCCL support", stacklevel=2)
         return False
 
     devices = set()
@@ -32,6 +33,15 @@ def is_available(tensors):
 
 
 def version():
+    """
+    Returns the version of the NCCL.
+
+
+    This function returns a tuple containing the major, minor, and patch version numbers of the NCCL.
+    The suffix is also included in the tuple if a version suffix exists.
+    Returns:
+        tuple: The version information of the NCCL.
+    """
     ver = torch._C._nccl_version()
     major = ver >> 32
     minor = (ver >> 16) & 65535
@@ -51,7 +61,7 @@ def init_rank(num_ranks, uid, rank):
     return torch._C._nccl_init_rank(num_ranks, uid, rank)
 
 
-def _check_sequence_type(inputs: Union[torch.Tensor, Sequence[torch.Tensor]]) -> None:
+def _check_sequence_type(inputs: torch.Tensor | Sequence[torch.Tensor]) -> None:
     if not isinstance(inputs, collections.abc.Container) or isinstance(
         inputs, torch.Tensor
     ):
@@ -70,13 +80,13 @@ def all_reduce(inputs, outputs=None, op=SUM, streams=None, comms=None):
 # arguments for BC reasons.
 def reduce(
     inputs: Sequence[torch.Tensor],
-    output: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]] = None,
+    output: torch.Tensor | Sequence[torch.Tensor] | None = None,
     root: int = 0,
     op: int = SUM,
-    streams: Optional[Sequence[torch.cuda.Stream]] = None,
+    streams: Sequence[torch.cuda.Stream] | None = None,
     comms=None,
     *,
-    outputs: Optional[Sequence[torch.Tensor]] = None,
+    outputs: Sequence[torch.Tensor] | None = None,
 ) -> None:
     _check_sequence_type(inputs)
     _output: torch.Tensor
@@ -89,8 +99,10 @@ def reduce(
             )
         else:
             warnings.warn(
-                "nccl.reduce with an output tensor list is deprecated. "
-                "Please specify a single output tensor with argument 'output' instead instead."
+                "`nccl.reduce` with an output tensor list is deprecated. "
+                "Please specify a single output tensor with argument 'output' instead.",
+                FutureWarning,
+                stacklevel=2,
             )
             _output = outputs[root]
     elif not isinstance(output, torch.Tensor) and isinstance(
@@ -99,7 +111,9 @@ def reduce(
         # User called old API with positional arguments of list of output tensors.
         warnings.warn(
             "nccl.reduce with an output tensor list is deprecated. "
-            "Please specify a single output tensor."
+            "Please specify a single output tensor.",
+            FutureWarning,
+            stacklevel=2,
         )
         _output = output[root]
     else:

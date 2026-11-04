@@ -1,13 +1,15 @@
+# mypy: allow-untyped-defs
 """JIT-related state.
 
 This module stores various pieces of Python-global state relating to the JIT.
 
-This is not intended to be imported directly; please the exposed
+This is not intended to be imported directly; please use the exposed
 functionalities in `torch.jit`.
 """
+
 import os
 import weakref
-from typing import Any, Dict, Type
+from typing import Any
 
 import torch
 
@@ -18,7 +20,7 @@ class EnabledProxy:
     This is just a wrapper for a bool, so that we get reference semantics
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.enabled = self.parse_env(
             "PYTORCH_JIT", True, "> Using PyTorch JIT", "> PyTorch JIT DISABLED"
         )
@@ -39,18 +41,18 @@ class EnabledProxy:
             return False
         raise ValueError(f"Unknown setting of {name}. Try using 0 or 1.")
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return self.enabled
 
 
 _enabled = EnabledProxy()
 
 
-def disable():
+def disable() -> None:
     _enabled.enabled = False
 
 
-def enable():
+def enable() -> None:
     _enabled.enabled = True
 
 
@@ -61,11 +63,11 @@ _python_cu = torch._C.CompilationUnit()
 
 
 # python class => ScriptClass mapping
-_script_classes: Dict[Type[Any], Type[Any]] = {}
-_name_to_pyclass: Dict[str, Type[Any]] = {}
+_script_classes: dict[type[Any], type[Any]] = {}
+_name_to_pyclass: dict[str, type[Any]] = {}
 
 
-def _add_script_class(python_class, script_class):
+def _add_script_class(python_class, script_class) -> None:
     _script_classes[python_class] = script_class
     _name_to_pyclass[script_class.qualified_name()] = python_class
 
@@ -74,14 +76,14 @@ def _get_script_class(python_class):
     override = getattr(python_class, "_jit_override_qualname", None)
     if override is not None:
         python_class = _get_python_class(override)
-    return _script_classes.get(python_class, None)
+    return _script_classes.get(python_class)
 
 
 def _get_python_class(qualified_name):
-    return _name_to_pyclass.get(qualified_name, None)
+    return _name_to_pyclass.get(qualified_name)
 
 
-def _clear_class_state():
+def _clear_class_state() -> None:
     _script_classes.clear()
     _name_to_pyclass.clear()
 
@@ -106,7 +108,7 @@ def _try_get_jit_cached_overloads(key):
         return None
 
 
-def _set_jit_overload_cache(key, compiled_fns):
+def _set_jit_overload_cache(key, compiled_fns) -> None:
     _jit_function_overload_caching[key] = [fn.qualified_name for fn in compiled_fns]
 
 
@@ -120,7 +122,8 @@ def _try_get_jit_cached_function(key):
         return None
 
 
-def _set_jit_function_cache(key, value):
+def _set_jit_function_cache(key, value) -> None:
     # only free functions currently supported
-    assert isinstance(value, torch.jit.ScriptFunction)
+    if not isinstance(value, torch.jit.ScriptFunction):
+        raise AssertionError(f"Expected ScriptFunction, got {type(value)}")
     _jit_caching_layer[key] = value.qualified_name

@@ -1,13 +1,17 @@
-from typing import Dict, List, Optional, Tuple
+# mypy: allow-untyped-defs
 
 import torch
 import torch.optim._functional as F
-
 from torch import Tensor
+from torch.distributed.optim._deprecation_warning import (
+    _scripted_functional_optimizer_deprecation_warning,
+)
 
-__all__: List[str] = []
 
-# Define a TorchScript compatible Functional AdamW Optimizer
+__all__: list[str] = []
+
+
+# Define a Functional AdamW Optimizer
 # where we use these optimizer in a functional way.
 # Instead of using the `param.grad` when updating parameters,
 # we explicitly allow the distributed optimizer pass gradients to
@@ -16,13 +20,12 @@ __all__: List[str] = []
 # parameters without data traces on accumulating to the same .grad.
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
-@torch.jit.script
 class _FunctionalAdamW:
     def __init__(
         self,
-        params: List[Tensor],
+        params: list[Tensor],
         lr: float = 1e-3,
-        betas: Tuple[float, float] = (0.9, 0.999),
+        betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
         amsgrad: bool = False,
@@ -31,6 +34,7 @@ class _FunctionalAdamW:
         fused: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
@@ -53,7 +57,7 @@ class _FunctionalAdamW:
         self.maximize = maximize
         self.foreach = foreach
         self.fused = fused
-        self.state = torch.jit.annotate(Dict[torch.Tensor, Dict[str, torch.Tensor]], {})
+        self.state = torch.jit.annotate(dict[torch.Tensor, dict[str, torch.Tensor]], {})
 
         if len(params) == 0 and not _allow_empty_param_list:
             raise ValueError("optimizer got an empty parameter list")
@@ -62,13 +66,13 @@ class _FunctionalAdamW:
         # param group as it's not a common use case.
         self.param_group = {"params": params}
 
-    def step_param(self, param: Tensor, grad: Optional[Tensor]):
+    def step_param(self, param: Tensor, grad: Tensor | None):
         params_with_grad = []
         grads = []
         exp_avgs = []
         exp_avg_sqs = []
         max_exp_avg_sqs = []
-        state_steps: List[Tensor] = []
+        state_steps: list[Tensor] = []
         has_complex = torch.is_complex(param)
         if grad is not None:
             params_with_grad.append(param)
@@ -123,14 +127,14 @@ class _FunctionalAdamW:
                 has_complex=has_complex,
             )
 
-    def step(self, gradients: List[Optional[Tensor]]):
+    def step(self, gradients: list[Tensor | None]):
         params = self.param_group["params"]
         params_with_grad = []
         grads = []
         exp_avgs = []
         exp_avg_sqs = []
         max_exp_avg_sqs = []
-        state_steps: List[Tensor] = []
+        state_steps: list[Tensor] = []
 
         if len(params) != len(gradients):
             raise ValueError(

@@ -2,13 +2,17 @@
 
 import onnx_test_common
 import pytorch_test_common
+
 import torch
 import torch.utils.cpp_extension
 from torch.onnx import symbolic_helper
 from torch.testing._internal import common_utils
+from torch.testing._internal.common_utils import HardwareClassification
 
 
 class TestCustomAutogradFunction(pytorch_test_common.ExportTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     opset_version = 9
     keep_initializers_as_inputs = False
     onnx_shape_inference = True
@@ -25,7 +29,7 @@ class TestCustomAutogradFunction(pytorch_test_common.ExportTestCase):
                 return g.op("Clip", input, min_f=scalar)
 
         class MyModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.clip = MyClip.apply
 
@@ -51,7 +55,7 @@ class TestCustomAutogradFunction(pytorch_test_common.ExportTestCase):
                 return input.clamp(min=0)
 
         class MyModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.clip = MyClip.apply
                 self.relu = MyRelu.apply
@@ -61,13 +65,12 @@ class TestCustomAutogradFunction(pytorch_test_common.ExportTestCase):
                 h = self.relu(h)
                 return h
 
-        def symbolic_pythonop(ctx: torch.onnx.SymbolicContext, g, *args, **kwargs):
-            n = ctx.cur_node
+        def symbolic_pythonop(g, *args, **kwargs):
             name = kwargs["name"]
             if name == "MyClip":
-                return g.op("Clip", args[0], min_f=args[1], outputs=n.outputsSize())
+                return g.op("Clip", args[0], min_f=args[1])
             elif name == "MyRelu":
-                return g.op("Relu", args[0], outputs=n.outputsSize())
+                return g.op("Relu", args[0])
             else:
                 return symbolic_helper._unimplemented(
                     "prim::PythonOp", "unknown node kind: " + name
@@ -83,20 +86,22 @@ class TestCustomAutogradFunction(pytorch_test_common.ExportTestCase):
 
 
 class TestExportAsContribOps(pytorch_test_common.ExportTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     opset_version = 14
     keep_initializers_as_inputs = False
     onnx_shape_inference = True
 
     def test_contrib_op_with_loop(self):
         class M(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.gelu = torch.nn.GELU(approximate="none")
 
             def forward(self, x):
                 res = []
                 res2 = []
-                for i in range(x.size(0)):
+                for _ in range(x.size(0)):
                     if len(res) > 0:
                         res2.append(res[0])
                     else:

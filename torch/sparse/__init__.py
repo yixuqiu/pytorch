@@ -1,55 +1,68 @@
+# mypy: allow-untyped-defs
 # The Tensor classes are added to this module by python_tensor.cpp
-from typing import Optional, Tuple, List, Union, Any
+# A workaround to support both TorchScript and MyPy:
+from typing import Any, TYPE_CHECKING
 
 import torch
-from torch._C import _add_docstr, _sparse  # type: ignore[attr-defined]
 from torch import Tensor
+from torch._C import _add_docstr, _sparse  # type: ignore[attr-defined]
 
 # Semi structured sparsity support
 from .semi_structured import (
     SparseSemiStructuredTensor,
     SparseSemiStructuredTensorCUSPARSELT,
     SparseSemiStructuredTensorCUTLASS,
-    to_sparse_semi_structured
+    to_sparse_semi_structured,
 )
 
-# A workaround to support both TorchScript and MyPy:
-from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from torch.types import _dtype as DType
-    DimOrDims = Optional[Union[int, Tuple[int, ...], List[int]]]
+
+    DimOrDims = int | tuple[int, ...] | list[int] | None
 else:
     # The JIT doesn't understand Union, nor torch.dtype here
     DType = int
-    DimOrDims = Optional[Tuple[int]]
+    DimOrDims = tuple[int] | None
 
 
 __all__ = [
-    'addmm',
-    'check_sparse_tensor_invariants',
-    'mm',
-    'sum',
-    'softmax',
-    'log_softmax',
-    'SparseSemiStructuredTensor',
-    'SparseSemiStructuredTensorCUTLASS',
-    'SparseSemiStructuredTensorCUSPARSELT',
-    'to_sparse_semi_structured',
-    'as_sparse_gradcheck',
+    "addmm",
+    "check_sparse_tensor_invariants",
+    "mm",
+    "sum",
+    "softmax",
+    # pyrefly: ignore [bad-dunder-all]
+    "solve",
+    "log_softmax",
+    "SparseSemiStructuredTensor",
+    "SparseSemiStructuredTensorCUTLASS",
+    "SparseSemiStructuredTensorCUSPARSELT",
+    "to_sparse_semi_structured",
+    "as_sparse_gradcheck",
 ]
 
-addmm = _add_docstr(_sparse._sparse_addmm, r"""
+addmm = _add_docstr(
+    _sparse._sparse_addmm,
+    r"""
 sparse.addmm(mat, mat1, mat2, *, beta=1., alpha=1.) -> Tensor
 
 This function does exact same thing as :func:`torch.addmm` in the forward,
-except that it supports backward for sparse COO matrix :attr:`mat1`.
+except that it supports backward for sparse COO and CSR matrix :attr:`mat1`.
 When :attr:`mat1` is a COO tensor it must have `sparse_dim = 2`.
-When inputs are COO tensors, this function also supports backward for both inputs.
 
 Supports both CSR and COO storage formats.
 
 .. note::
-    This function doesn't support computing derivaties with respect to CSR matrices.
+    **Gradient support:**
+
+    - **COO @ Dense**: Backward is supported for both inputs. The gradient for the
+      sparse input is returned as a sparse COO tensor.
+    - **CSR @ Dense**: Backward is supported for both inputs. The gradient for the
+      sparse input is returned as a sparse CSR tensor.
+    - **CSC/BSR/BSC @ Dense**: Not supported.
+    - **Sparse @ Sparse** (COO @ COO, CSR @ CSR): Forward works, but backward is
+      not supported.
 
 Args:
     mat (Tensor): a dense matrix to be added
@@ -57,21 +70,32 @@ Args:
     mat2 (Tensor): a dense matrix to be multiplied
     beta (Number, optional): multiplier for :attr:`mat` (:math:`\beta`)
     alpha (Number, optional): multiplier for :math:`mat1 @ mat2` (:math:`\alpha`)
-""")
+""",
+)
 
 
-mm = _add_docstr(_sparse._sparse_mm, r"""
+mm = _add_docstr(
+    _sparse._sparse_mm,
+    r"""
     Performs a matrix multiplication of the sparse matrix :attr:`mat1`
     and the (sparse or strided) matrix :attr:`mat2`. Similar to :func:`torch.mm`, if :attr:`mat1` is a
     :math:`(n \times m)` tensor, :attr:`mat2` is a :math:`(m \times p)` tensor, out will be a
     :math:`(n \times p)` tensor.
     When :attr:`mat1` is a COO tensor it must have `sparse_dim = 2`.
-    When inputs are COO tensors, this function also supports backward for both inputs.
 
     Supports both CSR and COO storage formats.
 
 .. note::
-    This function doesn't support computing derivaties with respect to CSR matrices.
+    **Gradient support:**
+
+    - **COO @ Dense**: Backward is supported for both inputs. The gradient for the
+      sparse input is returned as a sparse COO tensor.
+    - **CSR @ Dense**: Backward is supported for both inputs. The gradient for the
+      sparse input is returned as a sparse CSR tensor.
+    - **CSC/BSR/BSC @ Dense**: Not supported.
+    - **Sparse @ Sparse** (COO @ COO, CSR @ CSR): Forward works, but backward is
+      not supported.
+    - **Mixed formats** (COO @ CSR, CSR @ COO): Not supported.
 
     This function also additionally accepts an optional :attr:`reduce` argument that allows
     specification of an optional reduction operation, mathematically performs the following operation:
@@ -131,10 +155,13 @@ Example::
     >>> y2
     tensor([[0., 1.],
             [6., 0.]], grad_fn=<SparseMmReduceImplBackward0>)
-""")
+""",
+)
 
 
-sampled_addmm = _add_docstr(_sparse.sparse_sampled_addmm, r"""
+sampled_addmm = _add_docstr(
+    _sparse.sparse_sampled_addmm,
+    r"""
 sparse.sampled_addmm(input, mat1, mat2, *, beta=1., alpha=1., out=None) -> Tensor
 
 Performs a matrix multiplication of the dense matrices :attr:`mat1` and :attr:`mat2` at the locations
@@ -183,10 +210,11 @@ Examples::
         col_indices=tensor([0, 1, 2]),
         values=tensor([ 0.1423, -0.3903, -0.0950]), device='cuda:0',
         size=(3, 3), nnz=3, layout=torch.sparse_csr)
-""")
+""",
+)
 
-def sum(input: Tensor, dim: DimOrDims = None,
-        dtype: Optional[DType] = None) -> Tensor:
+
+def sum(input: Tensor, dim: DimOrDims = None, dtype: DType | None = None) -> Tensor:
     r"""Return the sum of each row of the given sparse tensor.
 
     Returns the sum of each row of the sparse tensor :attr:`input` in the given
@@ -216,7 +244,8 @@ def sum(input: Tensor, dim: DimOrDims = None,
         >>> V = torch.randn(nnz, dims[2], dims[3])
         >>> size = torch.Size(dims)
         >>> # xdoctest: +IGNORE_WANT("non-deterministic")
-        >>> S = torch.sparse_coo_tensor(I, V, size)
+        >>> with torch.sparse.check_sparse_tensor_invariants():
+        ...     S = torch.sparse_coo_tensor(I, V, size)
         >>> S
         tensor(indices=tensor([[2, 0, 3],
                                [2, 4, 1]]),
@@ -255,7 +284,9 @@ def sum(input: Tensor, dim: DimOrDims = None,
             return torch._sparse_sum(input, dtype=dtype)
 
 
-softmax = _add_docstr(_sparse._sparse_softmax, r"""
+softmax = _add_docstr(
+    _sparse._sparse_softmax,
+    r"""
 sparse.softmax(input, dim, *, dtype=None) -> Tensor
 
 Applies a softmax function.
@@ -280,10 +311,33 @@ Args:
         casted to :attr:`dtype` before the operation is
         performed. This is useful for preventing data type
         overflows. Default: None
-""")
+""",
+)
 
 
-log_softmax = _add_docstr(_sparse._sparse_log_softmax, r"""
+spsolve = _add_docstr(
+    _sparse._spsolve,
+    r"""
+sparse.spsolve(input, other, *, left=True) -> Tensor
+
+Computes the solution of a square system of linear equations with
+a unique solution. Its purpose is similar to :func:`torch.linalg.solve`,
+except that the system is defined by a sparse CSR matrix with layout
+`sparse_csr`.
+
+Args:
+    input (Tensor): a sparse CSR matrix of shape `(n, n)` representing the
+        coefficients of the linear system.
+    other (Tensor): a dense matrix of shape `(n, )` representing the right-hand
+        side of the linear system.
+    left (bool, optional): whether to solve the system for `input @ out = other`
+        (default) or `out @ input = other`. Only `left=True` is supported.
+""",
+)
+
+log_softmax = _add_docstr(
+    _sparse._sparse_log_softmax,
+    r"""
 sparse.log_softmax(input, dim, *, dtype=None) -> Tensor
 
 Applies a softmax function followed by logarithm.
@@ -298,7 +352,8 @@ Args:
         casted to :attr:`dtype` before the operation is
         performed. This is useful for preventing data type
         overflows. Default: None
-""")
+""",
+)
 
 
 spdiags = _add_docstr(
@@ -392,13 +447,14 @@ Specifying a positive offset::
             [0, 0, 3, 0, 0],
             [0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0]])
-""")
+""",
+)
 
 
 class check_sparse_tensor_invariants:
     """A tool to control checking sparse tensor invariants.
 
-    The following options exists to manage sparsr tensor invariants
+    The following options exists to manage sparse tensor invariants
     checking in sparse tensor construction:
 
     1. Using a context manager:
@@ -482,23 +538,25 @@ class check_sparse_tensor_invariants:
     # context manager support
     def __init__(self, enable=True):
         self.state = enable
-        self.saved_state : Optional[bool] = None
+        self.saved_state: bool | None = None
 
     def __enter__(self):
         if self.saved_state is not None:
-            raise RuntimeError('This context manager instance is already activated.'
-                               ' Use a different context manager instance for context nesting.')
+            raise RuntimeError(
+                "This context manager instance is already activated."
+                " Use a different context manager instance for context nesting."
+            )
         self.saved_state = self.is_enabled()
         torch._C._set_check_sparse_tensor_invariants(self.state)
 
     def __exit__(self, type, value, traceback):
-        assert self.saved_state is not None
+        if self.saved_state is None:
+            raise AssertionError("saved_state should not be None on exit")
         torch._C._set_check_sparse_tensor_invariants(self.saved_state)
         self.saved_state = None
 
     # decorator support
     def __call__(self, mth):
-
         def test_mth(*args, **kwargs):
             with type(self)(self.state):
                 return mth(*args, **kwargs)
@@ -518,8 +576,15 @@ def as_sparse_gradcheck(gradcheck):
 
     For example:
 
+    >>> warnings.filterwarnings(
+    ...     "ignore", message=".*Sparse CSR tensor support is in beta state"
+    ... )  # docs: hide
     >>> gradcheck = torch.sparse.as_sparse_gradcheck(torch.autograd.gradcheck)
-    >>> x = torch.tensor([[0, 1], [2, 3]], dtype=torch.float64).to_sparse_coo().requires_grad_(True)
+    >>> x = (
+    ...     torch.tensor([[0, 1], [2, 3]], dtype=torch.float64)
+    ...     .to_sparse_coo()
+    ...     .requires_grad_(True)
+    ... )
     >>> gradcheck(lambda x: x.to_sparse_csr(), x)
     True
     """
@@ -530,56 +595,115 @@ def as_sparse_gradcheck(gradcheck):
 
         Same as :func:`torch.autograd.gradcheck` but with sparse tensors inputs and outputs support.
         """
-        masked = kwargs.pop('masked', False)
-        sparse_layouts = {torch.sparse_coo, torch.sparse_csr, torch.sparse_csc, torch.sparse_bsr, torch.sparse_bsc}
-        sparse_compressed_layouts = {torch.sparse_csr, torch.sparse_csc, torch.sparse_bsr, torch.sparse_bsc}
+        masked = kwargs.pop("masked", False)
+        sparse_layouts = {
+            torch.sparse_coo,
+            torch.sparse_csr,
+            torch.sparse_csc,
+            torch.sparse_bsr,
+            torch.sparse_bsc,
+        }
+        sparse_compressed_layouts = {
+            torch.sparse_csr,
+            torch.sparse_csc,
+            torch.sparse_bsr,
+            torch.sparse_bsc,
+        }
         sparse_block_layouts = {torch.sparse_bsr, torch.sparse_bsc}
-        STRIDED_REPRESENTATION = '__STRIDED_REPRESENTATION__'
+        STRIDED_REPRESENTATION = "__STRIDED_REPRESENTATION__"
 
         def convert_to_strided_representation(args):
             """Convert differentiable non-strided tensors to a representation containing differentiable strided tensors."""
             if not isinstance(args, (list, tuple)):
-                args = args,
-            new_args: List[Any] = []
+                args = (args,)
+            new_args: list[Any] = []
             for obj in args:
-                if isinstance(obj, torch.Tensor) and obj.requires_grad and obj.layout in sparse_layouts:
-                    d = dict(layout=obj.layout, shape=obj.shape)
+                if (
+                    isinstance(obj, torch.Tensor)
+                    and obj.requires_grad
+                    and obj.layout in sparse_layouts
+                ):
+                    d = {
+                        "layout": obj.layout,
+                        "shape": obj.shape,
+                    }
                     if not masked:
                         # Materialize unspecified elements with zero values
                         batch_dim = obj.ndim - obj.dense_dim() - obj.sparse_dim()
-                        blocksize = obj.values().shape[batch_dim + 1:batch_dim + 3] if obj.layout in sparse_block_layouts else None
-                        full_mask = torch.ones(obj.shape, device=obj.device, dtype=torch.bool).to_sparse(
-                            layout=obj.layout, blocksize=blocksize, dense_dim=obj.dense_dim())
+                        blocksize = (
+                            obj.values().shape[batch_dim + 1 : batch_dim + 3]
+                            if obj.layout in sparse_block_layouts
+                            else None
+                        )
+                        full_mask = torch.ones(
+                            obj.shape, device=obj.device, dtype=torch.bool
+                        ).to_sparse(
+                            layout=obj.layout,
+                            blocksize=blocksize,
+                            dense_dim=obj.dense_dim(),
+                        )
                         obj = obj.to_dense().sparse_mask(full_mask)
                     if obj.layout is torch.sparse_coo:
-                        d.update(indices=obj._indices(), is_coalesced=obj.is_coalesced())
+                        # pyrefly: ignore [no-matching-overload]
+                        d.update(
+                            # pyrefly: ignore [bad-argument-type]
+                            indices=obj._indices(),
+                            # pyrefly: ignore [bad-argument-type]
+                            is_coalesced=obj.is_coalesced(),
+                        )
                         values = obj._values()
                     elif obj.layout in {torch.sparse_csr, torch.sparse_bsr}:
-                        d.update(compressed_indices=obj.crow_indices(), plain_indices=obj.col_indices())
+                        # pyrefly: ignore [no-matching-overload]
+                        d.update(
+                            # pyrefly: ignore [bad-argument-type]
+                            compressed_indices=obj.crow_indices(),
+                            # pyrefly: ignore [bad-argument-type]
+                            plain_indices=obj.col_indices(),
+                        )
                         values = obj.values()
                     else:
-                        d.update(compressed_indices=obj.ccol_indices(), plain_indices=obj.row_indices())
+                        # pyrefly: ignore [no-matching-overload]
+                        d.update(
+                            # pyrefly: ignore [bad-argument-type]
+                            compressed_indices=obj.ccol_indices(),
+                            # pyrefly: ignore [bad-argument-type]
+                            plain_indices=obj.row_indices(),
+                        )
                         values = obj.values()
-                    new_args.extend((STRIDED_REPRESENTATION, d, values.requires_grad_(True)))
+                    new_args.extend(
+                        (STRIDED_REPRESENTATION, d, values.requires_grad_(True))
+                    )
                 else:
                     new_args.append(obj)
             return tuple(new_args)
 
         def restore_from_strided_representation(args):
-            """Restore non-strided differentiable tensosr from their strided representations."""
+            """Restore non-strided differentiable tensors from their strided representations."""
             new_args = []
             args = list(args)
             while args:
                 a = args.pop(0)
                 if a == STRIDED_REPRESENTATION:
                     d, values = args.pop(0), args.pop(0)
-                    if d['layout'] is torch.sparse_coo:
-                        a = torch.sparse_coo_tensor(d['indices'], values, size=d['shape'], is_coalesced=d['is_coalesced'])
-                    elif d['layout'] in sparse_compressed_layouts:
-                        a = torch.sparse_compressed_tensor(d['compressed_indices'], d['plain_indices'], values,
-                                                           size=d['shape'], layout=d['layout'])
+                    if d["layout"] is torch.sparse_coo:
+                        a = torch.sparse_coo_tensor(
+                            d["indices"],
+                            values,
+                            size=d["shape"],
+                            is_coalesced=d["is_coalesced"],
+                        )
+                    elif d["layout"] in sparse_compressed_layouts:
+                        a = torch.sparse_compressed_tensor(
+                            d["compressed_indices"],
+                            d["plain_indices"],
+                            values,
+                            size=d["shape"],
+                            layout=d["layout"],
+                        )
                     else:
-                        raise NotImplementedError(f'conversion of {d["layout"]} strided representation to tensor')
+                        raise NotImplementedError(
+                            f"conversion of {d['layout']} strided representation to tensor"
+                        )
                 new_args.append(a)
             return tuple(new_args)
 
@@ -590,12 +714,25 @@ def as_sparse_gradcheck(gradcheck):
             # tensors:
             outputs = func(*restored_args, **kwargs)
 
-            strided_outputs = tuple(outputs) if isinstance(outputs, (list, tuple)) else (outputs,)
-            strided_outputs = tuple((o.to_dense(masked_grad=masked)
-                                     if isinstance(o, torch.Tensor) and o.requires_grad and o.layout in sparse_layouts else o)
-                                    for o in strided_outputs)
+            strided_outputs = (
+                tuple(outputs) if isinstance(outputs, (list, tuple)) else (outputs,)
+            )
+            strided_outputs = tuple(
+                (
+                    o.to_dense(masked_grad=masked)
+                    if isinstance(o, torch.Tensor)
+                    and o.requires_grad
+                    and o.layout in sparse_layouts
+                    else o
+                )
+                for o in strided_outputs
+            )
 
-            return strided_outputs if isinstance(outputs, (list, tuple)) else strided_outputs[0]
+            return (
+                strided_outputs
+                if isinstance(outputs, (list, tuple))
+                else strided_outputs[0]
+            )
 
         args = (func_wrapper, convert_to_strided_representation(inputs))
 

@@ -4,9 +4,7 @@
 #include <torch/csrc/jit/passes/constant_propagation.h>
 #include <torch/csrc/jit/passes/subgraph_rewrite.h>
 
-namespace torch {
-namespace jit {
-namespace graph_rewrite_helper {
+namespace torch::jit::graph_rewrite_helper {
 
 std::string getFuncName(Value* func_value) {
   auto func = func_value->type()->expectRef<FunctionType>().function();
@@ -27,7 +25,7 @@ Value* getValue(
   return match_vmap.at(vmap.at(name));
 }
 
-c10::optional<IValue> getIValue(
+std::optional<IValue> getIValue(
     const std::string& name,
     const std::unordered_map<const Value*, Value*>& match_vmap,
     const std::unordered_map<std::string, Value*>& vmap) {
@@ -280,14 +278,14 @@ bool isClampFusable(
   // If hardtanh's min/max Value's are not actually constants, we will end up
   // rerouting those values to prepack op. And if they are not constants
   // we will not be able to remove prepacking ops.
-  if (vmap.find("output_min") != vmap.end()) {
+  if (vmap.contains("output_min")) {
     // aten::relu pattern does not have output_min/output_max.
     // aten::hardtanh/_ does.
     TORCH_CHECK(
         vmap.find("output_max") != vmap.end(),
         "Expected to find output_max as well given "
         "output_min exist in pattern graph.");
-    // If output_min/max are not constant, we get c10::nullopt.
+    // If output_min/max are not constant, we get std::nullopt.
     auto output_min =
         graph_rewrite_helper::getIValue("output_min", match_vmap, vmap);
     auto output_max =
@@ -299,6 +297,4 @@ bool isClampFusable(
   return is_fusable;
 }
 
-} // namespace graph_rewrite_helper
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::graph_rewrite_helper

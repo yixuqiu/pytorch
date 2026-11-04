@@ -31,7 +31,7 @@ using namespace torch::autograd::utils;
 
 namespace torch::autograd {
 
-static PyObject* THPNNVariableFunctionsModule = NULL;
+static PyObject* THPNNVariableFunctionsModule = nullptr;
 
 static PyObject * THPVariable__parse_to(PyObject* module, PyObject* args, PyObject* kwargs)
 {
@@ -52,7 +52,7 @@ static PyObject * THPVariable__parse_to(PyObject* module, PyObject* args, PyObje
   auto non_blocking = std::get<2>(parsed);
   auto opt_memory_format = std::get<4>(parsed);
   auto tuple = THPObjectPtr{PyTuple_New(4)};
-  if (!tuple) throw python_error();
+  TORCH_CHECK_PYTHON(tuple);
   if (device) {
     PyTuple_SET_ITEM(tuple.get(), 0, THPDevice_New(*device));
   } else {
@@ -84,26 +84,22 @@ static PyMethodDef nn_functions[] = {
   {"_parse_to", castPyCFunctionWithKeywords(THPVariable__parse_to),
     METH_VARARGS | METH_KEYWORDS, nullptr},
   ${py_method_defs}
-  {NULL}
+  {nullptr}
 };
 
 void initNNFunctions(PyObject* module) {
   static struct PyModuleDef def = {
      PyModuleDef_HEAD_INIT,
      "torch._C._nn",
-     NULL,
+     nullptr,
      -1,
      nn_functions
   };
   PyObject* nn = PyModule_Create(&def);
   THPNNVariableFunctionsModule = nn;
-  if (!nn) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(nn);
   // steals a reference to nn
-  if (PyModule_AddObject(module, "_nn", nn) != 0) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(PyModule_AddObject(module, "_nn", nn) == 0);
 }
 
 // generated methods start here

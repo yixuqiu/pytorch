@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import json
@@ -8,14 +10,18 @@ import sys
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Any, List, NamedTuple, Optional
+from typing import NamedTuple
 
 
 IS_WINDOWS: bool = os.name == "nt"
 
 
-def eprint(*args: Any, **kwargs: Any) -> None:
-    print(*args, file=sys.stderr, flush=True, **kwargs)
+def _default_num_workers() -> int | None:
+    # clang-format must respect MAX_JOBS to cap parallelism.
+    max_jobs = os.environ.get("MAX_JOBS")
+    if max_jobs and max_jobs.isdigit() and int(max_jobs) > 0:
+        return int(max_jobs)
+    return os.cpu_count()
 
 
 class LintSeverity(str, Enum):
@@ -26,15 +32,15 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
-    path: Optional[str]
-    line: Optional[int]
-    char: Optional[int]
+    path: str | None
+    line: int | None
+    char: int | None
     code: str
     severity: LintSeverity
     name: str
-    original: Optional[str]
-    replacement: Optional[str]
-    description: Optional[str]
+    original: str | None
+    replacement: str | None
+    description: str | None
 
 
 def as_posix(name: str) -> str:
@@ -42,10 +48,10 @@ def as_posix(name: str) -> str:
 
 
 def _run_command(
-    args: List[str],
+    args: list[str],
     *,
     timeout: int,
-) -> "subprocess.CompletedProcess[bytes]":
+) -> subprocess.CompletedProcess[bytes]:
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -62,11 +68,11 @@ def _run_command(
 
 
 def run_command(
-    args: List[str],
+    args: list[str],
     *,
     retries: int,
     timeout: int,
-) -> "subprocess.CompletedProcess[bytes]":
+) -> subprocess.CompletedProcess[bytes]:
     remaining_retries = retries
     while True:
         try:
@@ -89,7 +95,7 @@ def check_file(
     binary: str,
     retries: int,
     timeout: int,
-) -> List[LintMessage]:
+) -> list[LintMessage]:
     try:
         with open(filename, "rb") as f:
             original = f.read()
@@ -192,11 +198,23 @@ def main() -> None:
         help="verbose logging",
     )
     parser.add_argument(
+        "-j",
+        "--num-workers",
+        type=int,
+        default=None,
+        help=(
+            "number of clang-format processes to run in parallel. Defaults to "
+            "the MAX_JOBS environment variable if set, otherwise the CPU count."
+        ),
+    )
+    parser.add_argument(
         "filenames",
         nargs="+",
         help="paths to lint",
     )
     args = parser.parse_args()
+
+    num_workers = args.num_workers or _default_num_workers()
 
     logging.basicConfig(
         format="<%(threadName)s:%(levelname)s> %(message)s",
@@ -228,7 +246,7 @@ def main() -> None:
         sys.exit(0)
 
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=os.cpu_count(),
+        max_workers=num_workers,
         thread_name_prefix="Thread",
     ) as executor:
         futures = {

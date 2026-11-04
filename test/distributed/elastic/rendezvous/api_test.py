@@ -6,25 +6,32 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, cast, Dict, SupportsInt, Tuple
-from unittest import TestCase
+from typing import Any, cast, SupportsInt
 
-from torch.distributed import Store
 from torch.distributed.elastic.rendezvous import (
     RendezvousHandler,
     RendezvousHandlerRegistry,
+    RendezvousInfo,
     RendezvousParameters,
+)
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
 )
 
 
 class RendezvousParametersTest(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self) -> None:
+        super().setUp()
         self._backend = "dummy_backend"
         self._endpoint = "dummy_endpoint"
         self._run_id = "dummy_run_id"
         self._min_nodes = 3
         self._max_nodes = 6
-        self._kwargs: Dict[str, Any] = {}
+        self._kwargs: dict[str, Any] = {}
 
     def _create_params(self) -> RendezvousParameters:
         return RendezvousParameters(
@@ -140,7 +147,17 @@ class RendezvousParametersTest(TestCase):
                 self.assertFalse(params.get_as_bool("dummy_param"))
 
     def test_get_as_bool_raises_error_if_value_is_invalid(self) -> None:
-        for value in ["01", "Flse", "Ture", "g", "4", "_", "truefalse", 2, -1]:
+        for value in [
+            "01",
+            "Flse",  # codespell:ignore
+            "Ture",  # codespell:ignore
+            "g",
+            "4",
+            "_",
+            "truefalse",
+            2,
+            -1,
+        ]:
             with self.subTest(value=value):
                 self._kwargs["dummy_param"] = value
 
@@ -196,7 +213,7 @@ class _DummyRendezvousHandler(RendezvousHandler):
     def get_backend(self) -> str:
         return "dummy_backend"
 
-    def next_rendezvous(self) -> Tuple[Store, int, int]:
+    def next_rendezvous(self) -> RendezvousInfo:
         raise NotImplementedError
 
     def is_closed(self) -> bool:
@@ -216,7 +233,10 @@ class _DummyRendezvousHandler(RendezvousHandler):
 
 
 class RendezvousHandlerRegistryTest(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self) -> None:
+        super().setUp()
         self._params = RendezvousParameters(
             backend="dummy_backend",
             endpoint="dummy_endpoint",
@@ -277,3 +297,7 @@ class RendezvousHandlerRegistryTest(TestCase):
             self._params.backend = "dummy_backend_2"
 
             self._registry.create_handler(self._params)
+
+
+if __name__ == "__main__":
+    run_tests()

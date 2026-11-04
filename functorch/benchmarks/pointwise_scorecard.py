@@ -4,8 +4,8 @@ import sys
 import time
 
 import torch
-
 from functorch import pointwise_operator
+
 
 torch.set_num_threads(1)
 torch._C._debug_set_fusion_group_inlining(False)
@@ -233,7 +233,7 @@ for shape, operator in itertools.product(shapes, operators):
     args = shape()[:nargs]
 
     try:
-        if shape == medium_transpose:
+        if shape is medium_transpose:
             raise RuntimeError("pointwise_operator hangs on medium_transpose")
         pw_op = pointwise_operator(operator)
         torch.testing.assert_close(operator(*args), pw_op(*args))
@@ -264,7 +264,7 @@ for shape, operator in itertools.product(shapes, operators):
         )
     )
     try:
-        if shape == medium_transpose:
+        if shape is medium_transpose:
             raise RuntimeError("pointwise_operator hangs on medium_transpose")
         if (operator, shape) in nope:
             raise RuntimeError("pointwise_operator fails on medium_transpose")

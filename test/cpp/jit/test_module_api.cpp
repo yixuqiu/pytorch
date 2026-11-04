@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <filesystem>
+
 #include <test/cpp/jit/test_utils.h>
 
 #include <ATen/core/qualified_name.h>
@@ -13,7 +15,7 @@
 namespace torch {
 namespace jit {
 
-static constexpr c10::string_view moduleInterfaceSrc = R"JIT(
+static constexpr std::string_view moduleInterfaceSrc = R"JIT(
 class OneInterface(ModuleInterface):
     def one(self, x: Tensor, y: Tensor) -> Tensor:
         pass
@@ -53,10 +55,9 @@ TEST(ModuleAPITest, MethodRunAsync) {
   //     r2 = torch.jit.fork(torch.mm, torch.rand(100,100),torch.rand(100,100))
   //     return r1.wait() + r2.wait()
   // )");
-  std::string filePath(__FILE__);
-  auto testModelFile = filePath.substr(0, filePath.find_last_of("/\\") + 1);
   // borrow model file from TEST(GraphExecutorTest, runAsync_executor)
-  testModelFile.append("test_interpreter_async.pt");
+  auto testModelFile =
+      resolveTestDataFile(__FILE__, "test_interpreter_async.pt");
   auto m = load(testModelFile);
 
   auto counter = 0;
@@ -242,6 +243,17 @@ TEST(ModuleAPITest, DeepCopy) {
   ASSERT_TRUE(!t1.equal(t2));
   // check that t3 is the same as t1 since it is a shallow copy
   ASSERT_TRUE(t1.equal(t3));
+}
+
+TEST(ModuleAPITest, DeepCopyWithSameDevice) {
+  Module module("module");
+  module.register_attribute("tensor", TensorType::get(), at::randn(5));
+
+  Module copied = module.deepcopy(at::kCPU);
+
+  ASSERT_FALSE(IValue(copied._ivalue()).overlaps(IValue(module._ivalue())));
+  ASSERT_TRUE(
+      copied.attr("tensor").toTensor().equal(module.attr("tensor").toTensor()));
 }
 
 TEST(ModuleAPITest, DeepCopyString) {

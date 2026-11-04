@@ -1,18 +1,13 @@
 #include <torch/optim/adam.h>
 
-#include <torch/csrc/autograd/variable.h>
-#include <torch/nn/module.h>
-#include <torch/serialize/archive.h>
 #include <torch/utils.h>
 
-#include <ATen/ATen.h>
 #include <c10/util/irange.h>
 
 #include <cmath>
 #include <functional>
 
-namespace torch {
-namespace optim {
+namespace torch::optim {
 
 AdamOptions::AdamOptions(double lr) : lr_(lr) {}
 
@@ -181,5 +176,4 @@ void Adam::load(serialize::InputArchive& archive) {
     }
   }
 }
-} // namespace optim
-} // namespace torch
+} // namespace torch::optim

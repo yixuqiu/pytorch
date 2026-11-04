@@ -2,10 +2,23 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/div_rtn.h>
+#include <c10/util/safe_numerics.h>
 
 namespace at::native {
 
-static inline void col2im_shape_check(
+// Number of sliding-window positions along one spatial dimension (floor division, int64_t).
+inline int64_t sliding_window_count(
+    int64_t input_size,
+    int64_t pad,
+    int64_t dilation,
+    int64_t kernel,
+    int64_t stride) {
+  return div_rtn<int64_t>(
+             input_size + 2 * pad - (dilation * (kernel - 1) + 1), stride) +
+      1;
+}
+
+inline void col2im_shape_check(
     const Tensor& input,
     const Tensor& grad_output,
     int64_t output_height,
@@ -54,9 +67,17 @@ static inline void col2im_shape_check(
 
   int64_t batch_dim = (ndim == 3) ? 0 : -1;
   int64_t n_input_plane = input.size(batch_dim + 1);
+  uint64_t prod_kernel_size = 1;
+
+  TORCH_CHECK(!c10::mul_overflows(static_cast<uint64_t>(kernel_width), static_cast<uint64_t>(kernel_height), &prod_kernel_size),
+            "Given kernel_width = ",
+            kernel_width,
+            " and kernel_height = ",
+            kernel_height,
+            " the product of kernel_width and kernel_height overflowed.");
 
   if (n_input_plane % (kernel_width * kernel_height) != 0) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Expected size of input's dimension 1 to be divisible by the "
         "product of kernel_size, but got input.size(1)=",
         n_input_plane,
@@ -68,20 +89,13 @@ static inline void col2im_shape_check(
   }
 
   int64_t input_length = input.size(batch_dim + 2);
-  int64_t n_blocks_height =
-      div_rtn<int64_t>(
-          output_height + 2 * pad_height -
-              dilation_height * (kernel_height - 1) - 1,
-          stride_height) +
-      1;
-  int64_t n_blocks_width = div_rtn<int64_t>(
-                                   output_width + 2 * pad_width -
-                                       dilation_width * (kernel_width - 1) - 1,
-                                   stride_width) +
-      1;
+  int64_t n_blocks_height = sliding_window_count(
+      output_height, pad_height, dilation_height, kernel_height, stride_height);
+  int64_t n_blocks_width = sliding_window_count(
+      output_width, pad_width, dilation_width, kernel_width, stride_width);
 
   if (input_length != (n_blocks_height * n_blocks_width)) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Given output_size=(",
         output_height,
         ", ",
@@ -126,7 +140,7 @@ static inline void col2im_shape_check(
     "which is too small (non-positive)");
 
   if (output_width < 1 || output_height < 1) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Expected output spatial size to be positive, but got: output_size=(",
         output_height,
         ", ",
@@ -135,7 +149,7 @@ static inline void col2im_shape_check(
   }
 }
 
-static inline void im2col_shape_check(
+inline void im2col_shape_check(
     const Tensor& input,
     const Tensor& grad_output,
     int64_t kernel_height,
@@ -192,23 +206,17 @@ static inline void im2col_shape_check(
 
   int64_t input_height = input.size(dim_batch + 2);
   int64_t input_width = input.size(dim_batch + 3);
-  int64_t output_height = div_rtn<int64_t>(
-                              input_height + 2 * pad_height -
-                                  (dilation_height * (kernel_height - 1) + 1),
-                              stride_height) +
-      1;
-  int64_t output_width = div_rtn<int64_t>(
-                             input_width + 2 * pad_width -
-                                 (dilation_width * (kernel_width - 1) + 1),
-                             stride_width) +
-      1;
+  int64_t output_height = sliding_window_count(
+      input_height, pad_height, dilation_height, kernel_height, stride_height);
+  int64_t output_width = sliding_window_count(
+      input_width, pad_width, dilation_width, kernel_width, stride_width);
 
   if (output_height < 1 || output_width < 1) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Given input with spatial size (",
         input_height,
         ", ",
-        input_height,
+        input_width,
         "), kernel_size=(",
         kernel_height,
         ", ",

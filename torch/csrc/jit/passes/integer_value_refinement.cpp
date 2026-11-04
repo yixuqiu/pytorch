@@ -1,4 +1,3 @@
-#include <ATen/core/jit_type.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/integer_value_refinement.h>
@@ -6,8 +5,7 @@
 
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 using IntegerRefinement = std::unordered_map<Value*, int64_t>;
 
@@ -62,7 +60,7 @@ struct IntegerValueRefiner {
     // same value, which opens up further optimization opportunities. The pass
     // will already handle if both outputs are refined to the same constant.
     // Here, we look for cases where one block output has been refined in the
-    // other block to be equal to the same constant value as the other other
+    // other block to be equal to the same constant value as the other
     // block output:
     //  graph(%y.1 : int):
     //   %one_constant : int = prim::Constant[value=1]()
@@ -93,7 +91,7 @@ struct IntegerValueRefiner {
         auto other_output = other_if_block->outputs().at(i);
         auto other_const_value = other_output->type()->cast<IntType>()
             ? constant_as<int64_t>(other_output)
-            : c10::nullopt;
+            : std::nullopt;
         if (!other_const_value ||
             block_output->node()->kind() == prim::Constant) {
           continue;
@@ -104,7 +102,7 @@ struct IntegerValueRefiner {
         // to the constant value of %one_constant
         const auto& other_block_refinements =
             block_index == 0 ? false_block_refinements : true_block_refinements;
-        if (!other_block_refinements.count(block_output)) {
+        if (!other_block_refinements.contains(block_output)) {
           continue;
         }
         if (other_block_refinements.at(block_output) == *other_const_value) {
@@ -152,7 +150,7 @@ struct IntegerValueRefiner {
 
       if (n->kind() == prim::If) {
         IfView if_n(n);
-        bool has_cond_ref = info_.count(if_n.cond()) != 0;
+        bool has_cond_ref = info_.contains(if_n.cond());
         IntegerRefinement empty;
         auto true_block_refinements = RefineIntegerValues(
             if_n.thenBlock(),
@@ -202,16 +200,16 @@ struct IntegerValueRefiner {
 
     active_refinements_.pop_back();
     return block_refinements;
-  };
+  }
 
-  c10::optional<int64_t> tryFindRefinement(Value* v) {
+  std::optional<int64_t> tryFindRefinement(Value* v) {
     for (const auto& ref : active_refinements_) {
       auto maybe_refinement = ref->find(v);
       if (maybe_refinement != ref->end()) {
         return maybe_refinement->second;
       }
     }
-    return c10::nullopt;
+    return std::nullopt;
   }
 
   std::shared_ptr<Graph> graph_;
@@ -227,5 +225,4 @@ bool RefineIntegerValues(const std::shared_ptr<Graph>& graph) {
   return IntegerValueRefiner(graph).run();
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

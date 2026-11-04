@@ -27,6 +27,11 @@ class C10_API SignalHandler {
 
   // Constructor. Specify what action to take when a signal is received.
   SignalHandler(Action SIGINT_action, Action SIGHUP_action);
+
+  SignalHandler(const SignalHandler&) = delete;
+  SignalHandler(SignalHandler&&) = delete;
+  SignalHandler& operator=(const SignalHandler&) = delete;
+  SignalHandler& operator=(SignalHandler&&) = delete;
   ~SignalHandler();
 
   Action CheckForSignals();
@@ -49,7 +54,11 @@ class C10_API FatalSignalHandler {
   C10_API void setPrintStackTracesOnFatalSignal(bool print);
   C10_API bool printStackTracesOnFatalSignal();
   static FatalSignalHandler& getInstance();
-  virtual ~FatalSignalHandler();
+  FatalSignalHandler(const FatalSignalHandler&) = delete;
+  FatalSignalHandler(FatalSignalHandler&&) = delete;
+  FatalSignalHandler& operator=(const FatalSignalHandler&) = delete;
+  FatalSignalHandler& operator=(FatalSignalHandler&&) = delete;
+  virtual ~FatalSignalHandler() = default;
 
  protected:
   explicit FatalSignalHandler();
@@ -57,8 +66,8 @@ class C10_API FatalSignalHandler {
  private:
   void installFatalSignalHandlers();
   void uninstallFatalSignalHandlers();
-  static void fatalSignalHandlerStatic(int signum);
-  void fatalSignalHandler(int signum);
+  static void fatalSignalHandlerStatic(int signum, siginfo_t* info, void* ctx);
+  void fatalSignalHandler(int signum, siginfo_t* info);
   virtual void fatalSignalHandlerPostProcess();
   struct sigaction* getPreviousSigaction(int signum);
   const char* getSignalName(int signum);
@@ -79,7 +88,7 @@ class C10_API FatalSignalHandler {
   bool fatalSignalHandlersInstalled;
   // We need to hold a reference to call the previous SIGUSR2 handler in case
   // we didn't signal it
-  struct sigaction previousSigusr2 {};
+  struct sigaction previousSigusr2{};
   // Flag dictating whether the SIGUSR2 handler falls back to previous handlers
   // or is intercepted in order to print a stack trace.
   std::atomic<bool> fatalSignalReceived;

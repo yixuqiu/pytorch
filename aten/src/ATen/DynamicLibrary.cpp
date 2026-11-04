@@ -1,19 +1,17 @@
 #include <c10/util/Exception.h>
-#include <c10/util/Unicode.h>
 #include <ATen/DynamicLibrary.h>
-#include <ATen/Utils.h>
 
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <libgen.h>
 #else
 #include <c10/util/win32-headers.h>
+#include <c10/util/Unicode.h>
 #endif
 
 namespace at {
 
 
-#ifndef C10_MOBILE
 #ifndef _WIN32
 
 // Unix
@@ -102,7 +100,6 @@ DynamicLibrary::~DynamicLibrary() {
   FreeLibrary((HMODULE)handle);
 }
 
-#endif
 #endif
 
 } // namespace at

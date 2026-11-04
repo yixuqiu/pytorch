@@ -11,9 +11,7 @@
 #include <stack>
 #include <unordered_map>
 
-namespace torch {
-namespace jit {
-namespace detail {
+namespace torch::jit::detail {
 namespace {
 
 /*
@@ -70,7 +68,7 @@ backendPreprocessFunctions() {
 } // namespace
 
 bool hasBackendPreprocessFunction(const std::string& name) {
-  return backendPreprocessFunctions().count(name);
+  return backendPreprocessFunctions().contains(name);
 }
 
 void registerBackendPreprocessFunction(
@@ -199,7 +197,7 @@ Module codegen_backend_module(
   // Whereas this information is not serialized as part of the lowered
   // module, we still need to provide a valid instance of the
   // BackendDebugInfo class when the lowered module is deserialized.
-  // Since the deserialized modules does not need this information,
+  // Since the deserialized modules do not need this information,
   // we create a "dummy" instance with no extra code dependencies (to avoid
   // overhead) when the backend is created in __setstate__.
   c10::intrusive_ptr<torch::CustomClassHolder> backend_debug_info_class;
@@ -307,19 +305,19 @@ Module codegen_backend_module(
         TORCH_INTERNAL_ASSERT(default_value.has_value());
         std::stringstream def_ss, fwd_ss;
         // Annotate type of the arg
-        def_ss << name << ": " << arg.type()->annotation_str(nullptr) << "=";
-        fwd_ss << name << "=" << name;
+        def_ss << name << ": " << arg.type()->annotation_str(nullptr) << '=';
+        fwd_ss << name << '=' << name;
         default_value->repr(
             def_ss, [](std::ostream&, const IValue&) -> bool { return false; });
         def_inputs.emplace_back(def_ss.str());
-        fwd_inputs.emplace_back(fwd_ss.str());
+        fwd_inputs.emplace_back(std::move(fwd_ss).str());
       } else {
         // If this is not a kwarg, it should be emitted as is in the
         // signature and the call to backend_execute.
         std::stringstream def_ss;
         // Annotate type of the arg
         def_ss << name << ": " << arg.type()->annotation_str(nullptr);
-        def_inputs.emplace_back(def_ss.str());
+        def_inputs.emplace_back(std::move(def_ss).str());
         fwd_inputs.emplace_back(name);
       }
     }
@@ -339,19 +337,19 @@ Module codegen_backend_module(
 
     if (out_tuple_ty) {
       auto tuple_elements = out_tuple_ty->elements();
-      type_check_ss << tuple_elements[0]->annotation_str() << ")";
+      type_check_ss << tuple_elements[0]->annotation_str() << ')';
       type_checks.emplace_back(type_check_ss.str());
       for (unsigned i = 1, e = tuple_elements.size(); i < e; ++i) {
         type_check_ss.str(std::string());
         type_check_ss.clear();
         out_ss << ", _" << i;
         type_check_ss << "assert isinstance(_" << i << ", "
-                      << tuple_elements[i]->annotation_str() << ")";
+                      << tuple_elements[i]->annotation_str() << ')';
         type_checks.emplace_back(type_check_ss.str());
       }
     } else {
-      type_check_ss << out_ty->annotation_str() << ")";
-      type_checks.emplace_back(type_check_ss.str());
+      type_check_ss << out_ty->annotation_str() << ')';
+      type_checks.emplace_back(std::move(type_check_ss).str());
     }
 
     method_te.v("def_inputs", def_inputs);
@@ -361,15 +359,15 @@ Module codegen_backend_module(
 
     wrapper_method_te.v("def_inputs", def_inputs);
     wrapper_method_te.v("fwd_inputs", fwd_inputs);
-    wrapper_methods.push_back(wrapper_method_ct.format(wrapper_method_te));
+    wrapper_methods.emplace_back(wrapper_method_ct.format(wrapper_method_te));
 
     // If the output type is a single element tuple then add an extra comma
     // to ensure the final output maintains this type.
     if (out_tuple_ty && out_tuple_ty->elements().size() == 1) {
-      out_ss << ",";
+      out_ss << ',';
     }
 
-    method_te.s("ret", out_ss.str());
+    method_te.s("ret", std::move(out_ss).str());
 
     loweredModule.define(method_ct.format(method_te), loweredModuleResolver());
   }
@@ -408,6 +406,4 @@ Module codegen_backend_module(
 
   return wrapper;
 }
-} // namespace detail
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::detail

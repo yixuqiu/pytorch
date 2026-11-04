@@ -56,7 +56,7 @@ bool allContiguous(at::TensorList tensors) {
 
 void getLaunchConfig(dim3* block, dim3* grid, int64_t numel) {
   c10::DeviceIndex curDevice = -1;
-  c10::cuda::GetDevice(&curDevice);
+  AT_CUDA_CHECK(c10::cuda::GetDevice(&curDevice));
   *block = cuda::getApplyBlock();
   TORCH_INTERNAL_ASSERT(cuda::getApplyGrid(numel, *grid, curDevice),
                         "Could not get grid size for pointwise apply.");
@@ -94,9 +94,7 @@ T sigmoid(T in)  {
 namespace kernel {
 
 template <typename scalar_t, typename accscalar_t, typename index_type, int indexing_kind>
-#if __CUDA_ARCH__ >= 350 || defined(USE_ROCM)
 C10_LAUNCH_BOUNDS_2(512, 4)
-#endif
 __global__ void lstm_cell_forward(
             TensorInfo<scalar_t, index_type> input,
             TensorInfo<scalar_t, index_type> hidden,
@@ -181,9 +179,7 @@ __global__ void lstm_cell_forward(
 }
 
 template <typename scalar_t, typename accscalar_t, typename index_type, int indexing_kind>
-#if __CUDA_ARCH__ >= 350 || defined(USE_ROCM)
 C10_LAUNCH_BOUNDS_2(512, 4)
-#endif
 __global__ void lstm_cell_backward(
               TensorInfo<scalar_t, index_type> storage,
               TensorInfo<scalar_t, index_type> gradInGates,
@@ -246,9 +242,7 @@ __global__ void lstm_cell_backward(
 }
 
 template <typename scalar_t, typename accscalar_t, typename index_type, int indexing_kind>
-#if __CUDA_ARCH__ >= 350 || defined(USE_ROCM)
 C10_LAUNCH_BOUNDS_2(512, 4)
-#endif
 __global__ void gru_cell_forward(
             TensorInfo<scalar_t, index_type> Input,
             TensorInfo<scalar_t, index_type> Hidden,
@@ -316,9 +310,7 @@ __global__ void gru_cell_forward(
 }
 
 template <typename scalar_t, typename accscalar_t, typename index_type, int indexing_kind>
-#if __CUDA_ARCH__ >= 350 || defined(USE_ROCM)
 C10_LAUNCH_BOUNDS_2(512, 4)
-#endif
 __global__ void gru_cell_backward(
              TensorInfo<scalar_t, index_type> gradInInput,
              TensorInfo<scalar_t, index_type> gradInHidden,
@@ -516,11 +508,11 @@ void gru_backward_impl(const Tensor& grad_hy, const Tensor& workspace,
 
 std::tuple<Tensor, Tensor, Tensor> _thnn_fused_lstm_cell_cuda(
       const Tensor& input_gates, const Tensor& hidden_gates,
-      const Tensor& cx, const c10::optional<Tensor>& input_bias_opt, const c10::optional<Tensor>& hidden_bias_opt) {
+      const Tensor& cx, const std::optional<Tensor>& input_bias_opt, const std::optional<Tensor>& hidden_bias_opt) {
   // See [Note: hacky wrapper removal for optional tensor]
   c10::MaybeOwned<Tensor> input_bias_maybe_owned = at::borrow_from_optional_tensor(input_bias_opt);
   const Tensor& input_bias = *input_bias_maybe_owned;
-  const Tensor& hidden_bias = c10::value_or_else(hidden_bias_opt, [] {return Tensor();});
+  const Tensor& hidden_bias = hidden_bias_opt.value_or(Tensor());
 
   checkSizes("_thnn_fused_lstm_cell_cuda",
              {input_gates, "input_gates", 1}, {hidden_gates, "hidden_gates", 2},
@@ -564,13 +556,13 @@ void checkLSTMBackwardSizes(const TensorArg& grad_hy, const TensorArg& grad_cy,
   checkNumel(c, workspace, exp_size[0] * exp_size[1] * 4);
 }
 
-std::tuple<Tensor, Tensor, Tensor> _thnn_fused_lstm_cell_backward_impl_cuda( const c10::optional<Tensor>& grad_hy_opt, const c10::optional<Tensor>& grad_cy_opt,
+std::tuple<Tensor, Tensor, Tensor> _thnn_fused_lstm_cell_backward_impl_cuda( const std::optional<Tensor>& grad_hy_opt, const std::optional<Tensor>& grad_cy_opt,
       const Tensor& cx, const Tensor& cy,
       const Tensor& workspace, bool has_bias) {
   // See [Note: hacky wrapper removal for optional tensor]
   c10::MaybeOwned<Tensor> grad_hy_maybe_owned = at::borrow_from_optional_tensor(grad_hy_opt);
   const Tensor& grad_hy = *grad_hy_maybe_owned;
-  const Tensor& grad_cy = c10::value_or_else(grad_cy_opt, [] {return Tensor();});
+  const Tensor& grad_cy = grad_cy_opt.value_or(Tensor());
 
   if (!grad_hy.defined() && !grad_cy.defined()) {
     return std::tuple<Tensor, Tensor, Tensor>();
@@ -602,11 +594,11 @@ static constexpr int64_t GRU_WORKSPACE_MULTIPLIER = 5;
 
 std::tuple<Tensor, Tensor> _thnn_fused_gru_cell_cuda(
       const Tensor& input_gates, const Tensor& hidden_gates,
-      const Tensor& hx, const c10::optional<Tensor>& input_bias_opt, const c10::optional<Tensor>& hidden_bias_opt) {
+      const Tensor& hx, const std::optional<Tensor>& input_bias_opt, const std::optional<Tensor>& hidden_bias_opt) {
   // See [Note: hacky wrapper removal for optional tensor]
   c10::MaybeOwned<Tensor> input_bias_maybe_owned = at::borrow_from_optional_tensor(input_bias_opt);
   const Tensor& input_bias = *input_bias_maybe_owned;
-  const Tensor& hidden_bias = c10::value_or_else(hidden_bias_opt, [] {return Tensor();});
+  const Tensor& hidden_bias = hidden_bias_opt.value_or(Tensor());
 
   checkSizes("_thnn_fused_gru_cell_cuda",
              {input_gates, "input_gates", 1}, {hidden_gates, "hidden_gates", 2},

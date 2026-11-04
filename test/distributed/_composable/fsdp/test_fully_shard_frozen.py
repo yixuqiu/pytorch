@@ -4,33 +4,40 @@ import copy
 import functools
 import itertools
 
-from typing import List, Union
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed._composable import checkpoint, replicate
-from torch.distributed._composable.fsdp import fully_shard
-from torch.distributed._composable.fsdp._fsdp_param_group import (
+from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
     RegisterPostBackwardFunction,
 )
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
     check_sharded_parity,
     FSDPTest,
+    get_devtype,
     MLP,
     patch_reduce_scatter,
     patch_register_post_backward_hook_backward,
     reduce_scatter_with_assert,
 )
-from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
 
 
+device_type = torch.device(get_devtype())
+
+
+@instantiate_parametrized_tests
 class TestFullyShardFrozen(FSDPTest):
     @property
     def world_size(self) -> int:
-        return min(4, torch.cuda.device_count())
+        return min(4, torch.get_device_module(device_type).device_count())
 
     @skip_if_lt_x_gpu(2)
     def test_train_mixed_requires_grad_per_group(self):
@@ -43,8 +50,25 @@ class TestFullyShardFrozen(FSDPTest):
         """
         self.run_subtests(
             {
-                "reshard_after_forward": [False, True, 2],
+                "reshard_after_forward": [False, True],
                 "use_activation_checkpointing": [False, True],
+                "freeze_after_init": [False, True],
+            },
+            self._test_train_mixed_requires_grad_per_group,
+        )
+
+    # reshard_after_forward=2 makes every fully_shard call build a new post-forward
+    # mesh, and its NCCL communicators hold /dev/shm until the processes exit, so
+    # run each use_activation_checkpointing value in fresh processes.
+    @skip_if_lt_x_gpu(2)
+    @parametrize("use_activation_checkpointing", [False, True])
+    def test_train_mixed_requires_grad_per_group_reshard_to_2(
+        self, use_activation_checkpointing: bool
+    ):
+        self.run_subtests(
+            {
+                "reshard_after_forward": [2],
+                "use_activation_checkpointing": [use_activation_checkpointing],
                 "freeze_after_init": [False, True],
             },
             self._test_train_mixed_requires_grad_per_group,
@@ -52,7 +76,7 @@ class TestFullyShardFrozen(FSDPTest):
 
     def _test_train_mixed_requires_grad_per_group(
         self,
-        reshard_after_forward: Union[bool, int],
+        reshard_after_forward: bool | int,
         use_activation_checkpointing: bool,
         freeze_after_init: bool,
     ):
@@ -67,7 +91,7 @@ class TestFullyShardFrozen(FSDPTest):
                 if "bias" not in param_name:
                     param.requires_grad_(False)
         ref_model = replicate(
-            copy.deepcopy(model).cuda(),
+            copy.deepcopy(model).to(device_type),
             device_ids=[self.rank],
             find_unused_parameters=freeze_after_init,
         )
@@ -78,7 +102,7 @@ class TestFullyShardFrozen(FSDPTest):
             fully_shard(mlp, reshard_after_forward=reshard_after_forward)
         fully_shard(model, reshard_after_forward=reshard_after_forward)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
-        orig_reduce_scatter = dist.reduce_scatter_tensor
+        orig_reduce_scatter = dist.reduce_scatter_single
         if freeze_after_init:
             for param_name, param in itertools.chain(
                 model.named_parameters(), ref_model.named_parameters()
@@ -86,10 +110,11 @@ class TestFullyShardFrozen(FSDPTest):
                 if "bias" not in param_name:
                     param.requires_grad_(False)
         for mlp in model:
-            assert isinstance(mlp, MLP), (
-                "The reduce-scatter numel check assumes the model consists of "
-                f"only the same MLP class but got {type(mlp)}"
-            )
+            if not isinstance(mlp, MLP):
+                raise AssertionError(
+                    "The reduce-scatter numel check assumes the model consists of "
+                    f"only the same MLP class but got {type(mlp)}"
+                )
         expected_numel = sum(
             p._local_tensor.numel()
             for n, p in model[0].named_parameters()
@@ -111,13 +136,14 @@ class TestFullyShardFrozen(FSDPTest):
             return orig_backward(*args, **kwargs)
 
         torch.manual_seed(42 + self.rank + 1)
-        device = torch.device("cuda")
-        with patch_reduce_scatter(
-            reduce_scatter
-        ), patch_register_post_backward_hook_backward(backward_with_count):
+        device = device_type
+        with (
+            patch_reduce_scatter(reduce_scatter),
+            patch_register_post_backward_hook_backward(backward_with_count),
+        ):
             for iter_idx in range(10):
                 inp = torch.randn((8, lin_dim), device=device)
-                losses: List[torch.Tensor] = []
+                losses: list[torch.Tensor] = []
                 for _model, _optim in ((ref_model, ref_optim), (model, optim)):
                     _optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
                     losses.append(_model(inp).sum())
@@ -147,17 +173,17 @@ class TestFullyShardFrozen(FSDPTest):
 
     def _test_train_mixed_requires_grad_across_groups(
         self,
-        reshard_after_forward: Union[bool, int],
+        reshard_after_forward: bool | int,
         unfreeze_params: bool,
     ):
         torch.manual_seed(42)
         num_linears, lin_dim = (6, 32)
-        modules: List[nn.Module] = []
+        modules: list[nn.Module] = []
         for _ in range(num_linears):
             modules += [nn.Linear(lin_dim, lin_dim), nn.ReLU()]
         model = nn.Sequential(*modules)
         ref_model = replicate(
-            copy.deepcopy(model).cuda(),
+            copy.deepcopy(model).to(device_type),
             device_ids=[self.rank],
             find_unused_parameters=True,
         )
@@ -185,10 +211,10 @@ class TestFullyShardFrozen(FSDPTest):
         _set_requires_grad(ref_model, False)
         num_iters, no_grad_iter_idx = (3, 1)
         torch.manual_seed(42 + self.rank)
-        inp = torch.randn((8, lin_dim), device="cuda")
+        inp = torch.randn((8, lin_dim), device=device_type)
         with patch_register_post_backward_hook_backward(backward_with_count):
             for iter_idx in range(num_iters):
-                losses: List[torch.Tensor] = []
+                losses: list[torch.Tensor] = []
                 for _model, _optim in ((ref_model, ref_optim), (model, optim)):
                     # Unfreeze the parameters on the last step to emulate some
                     # kinds of fine-tuning
@@ -221,7 +247,7 @@ class TestFullyShardFrozen(FSDPTest):
 
     def _test_multi_forward_mixed_requires_grad(
         self,
-        reshard_after_forward: Union[bool, int],
+        reshard_after_forward: bool | int,
     ):
         class MultiForwardModule(nn.Module):
             def __init__(self, device: torch.device):
@@ -243,7 +269,9 @@ class TestFullyShardFrozen(FSDPTest):
 
         torch.manual_seed(42)
         model = MultiForwardModule(torch.device("cpu"))
-        ref_model = replicate(copy.deepcopy(model).cuda(), device_ids=[self.rank])
+        ref_model = replicate(
+            copy.deepcopy(model).to(device_type), device_ids=[self.rank]
+        )
         ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-2)
         for module in model.modules():
             if isinstance(module, nn.Linear):
@@ -251,8 +279,8 @@ class TestFullyShardFrozen(FSDPTest):
         fully_shard(model, reshard_after_forward=reshard_after_forward)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
         for iter_idx in range(10):
-            inp = torch.randn((8, 5), device="cuda")
-            losses: List[torch.Tensor] = []
+            inp = torch.randn((8, 5), device=device_type)
+            losses: list[torch.Tensor] = []
             for _model, _optim in ((ref_model, ref_optim), (model, optim)):
                 _optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
                 losses.append(_model(inp).sum())

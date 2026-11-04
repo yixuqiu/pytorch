@@ -1,19 +1,14 @@
 # Owner(s): ["module: onnx"]
 
 import copy
-import functools
 import io
 import re
 import warnings
-from typing import Callable
 
 import onnx
+
 import parameterized
 import pytorch_test_common
-
-import torch
-import torch.onnx
-import torch.utils.cpp_extension
 import torchvision
 from autograd_helper import CustomFunction as CustomFunction2
 from pytorch_test_common import (
@@ -21,12 +16,15 @@ from pytorch_test_common import (
     skipIfUnsupportedMaxOpsetVersion,
     skipIfUnsupportedMinOpsetVersion,
 )
+
+import torch
+import torch.onnx
+import torch.utils.cpp_extension
 from torch.onnx import _constants, OperatorExportTypes, TrainingMode, utils
-from torch.onnx._globals import GLOBALS
+from torch.onnx._internal.torchscript_exporter._globals import GLOBALS
 from torch.onnx.symbolic_helper import _unpack_list, parse_args
 from torch.testing._internal import common_utils
-from torch.testing._internal.common_utils import skipIfNoCaffe2, skipIfNoLapack
-from verify import verify
+from torch.testing._internal.common_utils import skipIfNoLapack
 
 
 def _remove_test_environment_prefix_from_scope_name(scope_name: str) -> str:
@@ -86,86 +84,6 @@ class _BaseTestCase(pytorch_test_common.ExportTestCase):
         return graph, params_dict, torch_out
 
 
-@common_utils.instantiate_parametrized_tests
-class TestUnconvertibleOps(pytorch_test_common.ExportTestCase):
-    """Unit tests for the `unconvertible_ops` function."""
-
-    def setUp(self):
-        class EinsumModule(torch.nn.Module):
-            def forward(self, x):
-                return torch.einsum("ii", x)
-
-        self.einsum_module = EinsumModule()
-
-    def test_it_returns_graph_and_unconvertible_ops_at_lower_opset_version(self):
-        x = torch.randn(4, 4)
-
-        # Einsum is supported since opset 12. It should be unconvertible at opset 9.
-        graph, unconvertible_ops = utils.unconvertible_ops(
-            self.einsum_module, (x,), opset_version=9
-        )
-        nodes = graph.nodes()
-        self.assertEqual(next(nodes).kind(), "prim::Constant")
-        self.assertEqual(next(nodes).kind(), "prim::ListConstruct")
-        self.assertEqual(next(nodes).kind(), "prim::Constant")
-        self.assertEqual(next(nodes).kind(), "aten::einsum")
-        self.assertEqual(unconvertible_ops, ["aten::einsum"])
-
-    @common_utils.parametrize(
-        "jit_function",
-        [
-            common_utils.subtest(
-                functools.partial(torch.jit.trace, example_inputs=torch.randn(4, 4)),
-                name="traced",
-            ),
-            common_utils.subtest(torch.jit.script, name="scripted"),
-        ],
-    )
-    def test_it_returns_unconvertible_ops_at_lower_opset_version_for_jit_module(
-        self, jit_function: Callable
-    ):
-        module = jit_function(self.einsum_module)
-        x = torch.randn(4, 4)
-
-        # Einsum is supported since opset 12. It should be unconvertible at opset 9.
-        _, unconvertible_ops = utils.unconvertible_ops(module, (x,), opset_version=9)
-        self.assertEqual(unconvertible_ops, ["aten::einsum"])
-
-    @common_utils.parametrize(
-        "jit_function",
-        [
-            common_utils.subtest(lambda x: x, name="nn_module"),
-            common_utils.subtest(
-                functools.partial(torch.jit.trace, example_inputs=torch.randn(4, 4)),
-                name="traced",
-            ),
-            common_utils.subtest(torch.jit.script, name="scripted"),
-        ],
-    )
-    def test_it_returns_empty_list_when_all_ops_convertible(
-        self, jit_function: Callable
-    ):
-        module = jit_function(self.einsum_module)
-        x = torch.randn(4, 4)
-
-        # Einsum is supported since opset 12
-        _, unconvertible_ops = utils.unconvertible_ops(module, (x,), opset_version=12)
-        self.assertEqual(unconvertible_ops, [])
-
-    def test_it_returns_empty_list_when_model_contains_supported_inplace_ops(self):
-        class SkipConnectionModule(torch.nn.Module):
-            def forward(self, x):
-                out = x
-                out += x
-                out = torch.nn.functional.relu(out, inplace=True)
-                return out
-
-        module = SkipConnectionModule()
-        x = torch.randn(4, 4)
-        _, unconvertible_ops = utils.unconvertible_ops(module, (x,), opset_version=13)
-        self.assertEqual(unconvertible_ops, [])
-
-
 @parameterized.parameterized_class(
     [
         {"opset_version": opset}
@@ -174,7 +92,9 @@ class TestUnconvertibleOps(pytorch_test_common.ExportTestCase):
             _constants.ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET + 1,
         )
     ],
-    class_name_func=lambda cls, num, params_dict: f"{cls.__name__}_opset_{params_dict['opset_version']}",
+    class_name_func=lambda cls,
+    num,
+    params_dict: f"{cls.__name__}_opset_{params_dict['opset_version']}",
 )
 class TestUtilityFuns(_BaseTestCase):
     opset_version = None
@@ -191,7 +111,9 @@ class TestUtilityFuns(_BaseTestCase):
         x = torch.randn(3, 4)
         f = io.BytesIO()
         try:
-            torch.onnx.export(MyModule(), x, f, opset_version=self.opset_version)
+            torch.onnx.export(
+                MyModule(), x, f, opset_version=self.opset_version, dynamo=False
+            )
         except ValueError:
             self.assertFalse(torch.onnx.is_in_onnx_export())
 
@@ -367,8 +289,6 @@ class TestUtilityFuns(_BaseTestCase):
         GLOBALS.export_onnx_opset_version = self.opset_version
         GLOBALS.operator_export_type = OperatorExportTypes.ONNX
         x = torch.ones(1, 3)
-        model = GatherModule()
-        model(x)
         graph, _, __ = self._model_to_graph(
             GatherModule(), (x,), input_names=["x"], dynamic_axes={"x": [0, 1]}
         )
@@ -397,7 +317,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_constant_fold_unsqueeze_multi_axies(self):
         class PReluModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.prelu = torch.nn.PReLU()
 
@@ -490,7 +410,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_constant_fold_lstm(self):
         class GruNet(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.mygru = torch.nn.GRU(7, 3, 1, bidirectional=False)
 
@@ -521,7 +441,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_constant_fold_transpose_matmul(self):
         class MatMulNet(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.B = torch.nn.Parameter(torch.ones(5, 3))
 
@@ -545,7 +465,7 @@ class TestUtilityFuns(_BaseTestCase):
                 self,
             ):
                 super().__init__()
-                self.register_buffer("weight", torch.ones(5))
+                self.weight = torch.nn.Buffer(torch.ones(5))
 
             def forward(self, x):
                 b = self.weight.reshape(1, -1, 1, 1)
@@ -568,7 +488,7 @@ class TestUtilityFuns(_BaseTestCase):
                 self,
             ):
                 super().__init__()
-                self.register_buffer("weight", torch.ones(5))
+                self.weight = torch.nn.Buffer(torch.ones(5))
 
             def forward(self, x):
                 div = self.weight.div(torch.tensor([1, 2, 3, 4, 5]))
@@ -591,7 +511,7 @@ class TestUtilityFuns(_BaseTestCase):
                 self,
             ):
                 super().__init__()
-                self.register_buffer("weight", torch.ones(5))
+                self.weight = torch.nn.Buffer(torch.ones(5))
 
             def forward(self, x):
                 mul = self.weight.mul(torch.tensor([1, 2, 3, 4, 5]))
@@ -614,7 +534,7 @@ class TestUtilityFuns(_BaseTestCase):
                 self,
             ):
                 super().__init__()
-                self.register_buffer("weight", torch.ones(5))
+                self.weight = torch.nn.Buffer(torch.ones(5))
 
             def forward(self, x):
                 add = self.weight + torch.tensor([1, 2, 3, 4, 5])
@@ -645,7 +565,7 @@ class TestUtilityFuns(_BaseTestCase):
                 self,
             ):
                 super().__init__()
-                self.register_buffer("weight", torch.ones(5))
+                self.weight = torch.nn.Buffer(torch.ones(5))
 
             def forward(self, x):
                 sub = self.weight - torch.tensor([1, 2, 3, 4, 5])
@@ -676,7 +596,7 @@ class TestUtilityFuns(_BaseTestCase):
                 self,
             ):
                 super().__init__()
-                self.register_buffer("weight", torch.ones(5))
+                self.weight = torch.nn.Buffer(torch.ones(5))
 
             def forward(self, x):
                 sqrt = torch.sqrt(self.weight)
@@ -694,9 +614,9 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_constant_fold_shape(self):
         class ShapeModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
-                self.register_buffer("weight", torch.ones(5))
+                self.weight = torch.nn.Buffer(torch.ones(5))
 
             def forward(self, x):
                 shape = self.weight.shape[0]
@@ -718,7 +638,7 @@ class TestUtilityFuns(_BaseTestCase):
         model = torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         x = torch.randn(1, 32, 224, 224)
         f = io.BytesIO()
-        torch.onnx.export(model, x, f)
+        torch.onnx.export(model, x, f, dynamo=False)
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
         self.assertEqual(len(onnx_model.graph.initializer), 0)
 
@@ -731,10 +651,17 @@ class TestUtilityFuns(_BaseTestCase):
 
         def is_model_stripped(f, verbose=None):
             if verbose is None:
-                torch.onnx.export(MyModule(), x, f, opset_version=self.opset_version)
+                torch.onnx.export(
+                    MyModule(), x, f, opset_version=self.opset_version, dynamo=False
+                )
             else:
                 torch.onnx.export(
-                    MyModule(), x, f, verbose=verbose, opset_version=self.opset_version
+                    MyModule(),
+                    x,
+                    f,
+                    verbose=verbose,
+                    opset_version=self.opset_version,
+                    dynamo=False,
                 )
             model = onnx.load(io.BytesIO(f.getvalue()))
             model_strip = copy.copy(model)
@@ -757,7 +684,9 @@ class TestUtilityFuns(_BaseTestCase):
             "exporter, please use 'attribute' module to "
             "unwrap model from torch.nn.DataParallel. Try ",
         ):
-            torch.onnx.export(model, x, f, opset_version=self.opset_version)
+            torch.onnx.export(
+                model, x, f, opset_version=self.opset_version, dynamo=False
+            )
 
     @skipIfUnsupportedMinOpsetVersion(11)
     def test_sequence_dim(self):
@@ -781,6 +710,7 @@ class TestUtilityFuns(_BaseTestCase):
             opset_version=self.opset_version,
             input_names=["x", "y"],
             dynamic_axes={"y": [1]},
+            dynamo=False,
         )
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
         loop_output_value_info_proto = onnx_model.graph.output[0]
@@ -792,7 +722,9 @@ class TestUtilityFuns(_BaseTestCase):
         # Case 2: no dynamic axes.
         f = io.BytesIO()
         y = torch.randn(2, 3)
-        torch.onnx.export(script_model, (x, y), f, opset_version=self.opset_version)
+        torch.onnx.export(
+            script_model, (x, y), f, opset_version=self.opset_version, dynamo=False
+        )
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
         loop_output_value_info_proto = onnx_model.graph.output[0]
         ref_value_info_proto = onnx.helper.make_tensor_sequence_value_info(
@@ -819,6 +751,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             training=torch.onnx.TrainingMode.TRAINING,
+            dynamo=False,
         )
         # verify that the model state is preserved
         self.assertEqual(model.training, old_state)
@@ -832,6 +765,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             training=torch.onnx.TrainingMode.EVAL,
+            dynamo=False,
         )
         # verify that the model state is preserved
         self.assertEqual(model.training, old_state)
@@ -845,7 +779,7 @@ class TestUtilityFuns(_BaseTestCase):
                     return x * x
 
         class Outer(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.inner = torch.jit.script(Inner())
 
@@ -859,7 +793,9 @@ class TestUtilityFuns(_BaseTestCase):
         # jit.freeze removes the training attribute in the module
         module = torch.jit.freeze(module)
 
-        torch.onnx.export(module, (x,), io.BytesIO(), opset_version=self.opset_version)
+        torch.onnx.export(
+            module, (x,), io.BytesIO(), opset_version=self.opset_version, dynamo=False
+        )
 
     @skipIfUnsupportedMinOpsetVersion(15)
     def test_local_function(self):
@@ -908,6 +844,7 @@ class TestUtilityFuns(_BaseTestCase):
                 torch.nn.Dropout,
                 torch.nn.LayerNorm,
             },
+            dynamo=False,
         )
 
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
@@ -942,6 +879,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             export_modules_as_functions={torch.nn.CELU},
+            dynamo=False,
         )
 
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
@@ -957,6 +895,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             export_modules_as_functions=set(),
+            dynamo=False,
         )
 
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
@@ -971,6 +910,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             export_modules_as_functions=True,
+            dynamo=False,
         )
 
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
@@ -1007,6 +947,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             export_modules_as_functions={NWithOverloads},
+            dynamo=False,
         )
 
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
@@ -1036,6 +977,7 @@ class TestUtilityFuns(_BaseTestCase):
             export_modules_as_functions=True,
             opset_version=self.opset_version,
             do_constant_folding=False,
+            dynamo=False,
         )
 
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
@@ -1068,6 +1010,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             export_modules_as_functions=True,
             opset_version=self.opset_version,
+            dynamo=False,
         )
 
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
@@ -1133,11 +1076,12 @@ class TestUtilityFuns(_BaseTestCase):
             export_modules_as_functions=True,
             opset_version=self.opset_version,
             verbose=True,  # Allows the test case to print `Skipping module attribute 'freeze'`
+            dynamo=False,
         )
 
     def test_node_scope(self):
         class N(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.relu = torch.nn.ReLU()
 
@@ -1359,6 +1303,8 @@ class TestUtilityFuns(_BaseTestCase):
         iter = graph.nodes()
         self.assertEqual(next(iter).kind(), "custom_namespace::custom_op")
 
+    # gelu is exported as onnx::Gelu for opset >= 20
+    @skipIfUnsupportedMaxOpsetVersion(19)
     def test_custom_opsets_gelu(self):
         self.addCleanup(torch.onnx.unregister_custom_op_symbolic, "::gelu", 9)
 
@@ -1375,6 +1321,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             custom_opsets={"com.microsoft": 1},
+            dynamo=False,
         )
 
         graph = onnx.load(io.BytesIO(f.getvalue()))
@@ -1383,6 +1330,8 @@ class TestUtilityFuns(_BaseTestCase):
         self.assertEqual(graph.opset_import[1].domain, "com.microsoft")
         self.assertEqual(graph.opset_import[1].version, 1)
 
+    # gelu is exported as onnx::Gelu for opset >= 20
+    @skipIfUnsupportedMaxOpsetVersion(19)
     def test_register_aten_custom_op_symbolic(self):
         self.addCleanup(torch.onnx.unregister_custom_op_symbolic, "aten::gelu", 9)
 
@@ -1393,7 +1342,9 @@ class TestUtilityFuns(_BaseTestCase):
         model = torch.nn.GELU(approximate="none")
         x = torch.randn(3, 3)
         f = io.BytesIO()
-        torch.onnx.export(model, (x,), f, opset_version=self.opset_version)
+        torch.onnx.export(
+            model, (x,), f, opset_version=self.opset_version, dynamo=False
+        )
         graph = onnx.load(io.BytesIO(f.getvalue()))
 
         self.assertEqual(graph.graph.node[0].op_type, "Gelu")
@@ -1420,6 +1371,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             custom_opsets={"com.microsoft": 1},
+            dynamo=False,
         )
 
         graph = onnx.load(io.BytesIO(f.getvalue()))
@@ -1562,7 +1514,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_unused_initializers(self):
         class Model(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv2 = torch.nn.ConvTranspose2d(
                     16, 33, (3, 5), stride=(2, 1), padding=(4, 2), dilation=(1, 1)
@@ -1589,7 +1541,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_scripting_param(self):
         class MyModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv = torch.nn.Conv2d(
                     3, 16, kernel_size=1, stride=2, padding=3, bias=True
@@ -1623,28 +1575,9 @@ class TestUtilityFuns(_BaseTestCase):
                 "Graph parameter names does not match model parameters.",
             )
 
-    @skipIfNoCaffe2
-    def test_modifying_params(self):
-        class MyModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.param = torch.nn.Parameter(torch.tensor([2.0]))
-
-            def forward(self, x):
-                y = x * x
-                self.param.data.add_(1.0)
-                return y
-
-        x = torch.tensor([1, 2])
-        # Move import to local as caffe2 backend requires additional build flag,
-        # and is only used in this test case.
-        import caffe2.python.onnx.backend as backend
-
-        verify(MyModel(), x, backend, do_constant_folding=False)
-
     def test_fuse_conv_bn(self):
         class Fuse(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv = torch.nn.Conv2d(
                     3, 2, kernel_size=1, stride=2, padding=3, bias=True
@@ -1716,7 +1649,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_onnx_value_name(self):
         class MyModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.in_weight = torch.nn.Parameter(torch.Tensor(3, 3))
                 self.in_bias = torch.nn.Parameter(torch.Tensor(3))
@@ -1742,6 +1675,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             opset_version=self.opset_version,
             keep_initializers_as_inputs=True,
+            dynamo=False,
         )
         graph = onnx.load(io.BytesIO(f.getvalue()))
         self.assertEqual(graph.graph.input[1].name, "in_weight")
@@ -1749,7 +1683,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def test_onnx_node_naming(self):
         class MainModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self._module_1 = torch.nn.Linear(10, 10)
                 self._module_2 = torch.nn.Linear(10, 10)
@@ -1774,13 +1708,19 @@ class TestUtilityFuns(_BaseTestCase):
         ]
         f = io.BytesIO()
 
-        torch.onnx.export(module, torch.ones(1, 10), f, output_names=["y"])
+        torch.onnx.export(
+            module, torch.ones(1, 10), f, output_names=["y"], dynamo=False
+        )
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
         for n in onnx_model.graph.node:
             self.assertIn(n.name, ref_node_names)
 
         torch.onnx.export(
-            torch.jit.script(module), torch.ones(1, 10), f, output_names=["y"]
+            torch.jit.script(module),
+            torch.ones(1, 10),
+            f,
+            output_names=["y"],
+            dynamo=False,
         )
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
         for n in onnx_model.graph.node:
@@ -1788,7 +1728,7 @@ class TestUtilityFuns(_BaseTestCase):
 
     def _test_deduplicate_initializers(self, torchscript=False):
         class MyModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.layer1 = torch.nn.Linear(3, 3)
                 self.layer2 = torch.nn.Linear(3, 3)
@@ -1823,6 +1763,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             training=TrainingMode.TRAINING,
             opset_version=self.opset_version,
+            dynamo=False,
         )
         graph = onnx.load(io.BytesIO(f.getvalue()))
         self.assertSetEqual({i.name for i in graph.graph.initializer}, param_name_set)
@@ -1835,6 +1776,7 @@ class TestUtilityFuns(_BaseTestCase):
             f,
             training=TrainingMode.PRESERVE,
             opset_version=self.opset_version,
+            dynamo=False,
         )
         graph = onnx.load(io.BytesIO(f.getvalue()))
         self.assertSetEqual({i.name for i in graph.graph.initializer}, param_name_set)
@@ -1842,7 +1784,9 @@ class TestUtilityFuns(_BaseTestCase):
         # Test eval mode.
         model.eval()
         f = io.BytesIO()
-        torch.onnx.export(model, (x,), f, opset_version=self.opset_version)
+        torch.onnx.export(
+            model, (x,), f, opset_version=self.opset_version, dynamo=False
+        )
         graph = onnx.load(io.BytesIO(f.getvalue()))
         param_name_set.remove("param2")
         self.assertSetEqual({i.name for i in graph.graph.initializer}, param_name_set)
@@ -1856,7 +1800,7 @@ class TestUtilityFuns(_BaseTestCase):
     @skipIfNoCuda
     def test_deduplicate_initializers_diff_devices(self):
         class Model(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.w_cpu = torch.nn.Parameter(
                     torch.ones(3, device=torch.device("cpu"))
@@ -1871,7 +1815,9 @@ class TestUtilityFuns(_BaseTestCase):
         x = torch.randn(3, 3, device=torch.device("cpu"))
         y = torch.randn(3, 3, device=torch.device("cuda"))
         f = io.BytesIO()
-        torch.onnx.export(Model(), (x, y), f, opset_version=self.opset_version)
+        torch.onnx.export(
+            Model(), (x, y), f, opset_version=self.opset_version, dynamo=False
+        )
         graph = onnx.load(io.BytesIO(f.getvalue()))
         self.assertSetEqual({i.name for i in graph.graph.initializer}, {"w_cpu"})
 
@@ -1886,7 +1832,7 @@ class TestUtilityFuns(_BaseTestCase):
                 out2 = self.fc1(input1)
                 return out1, out1, out2, out1, out2
 
-        N, D_in, H, D_out = 64, 784, 500, 10
+        N, D_in, D_out = 64, 784, 10
         pt_model = DuplicatedOutputNet(D_in, D_out)
 
         f = io.BytesIO()
@@ -1912,6 +1858,7 @@ class TestUtilityFuns(_BaseTestCase):
             dynamic_axes=dynamic_axes,
             verbose=True,
             keep_initializers_as_inputs=True,
+            dynamo=False,
         )
 
         graph = onnx.load(io.BytesIO(f.getvalue()))
@@ -1929,7 +1876,7 @@ class TestUtilityFuns(_BaseTestCase):
         # upsample scale is a constant, not a model parameter,
         # therefore should be ignored by shared weight deduplication.
         class Model(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.upsample_1 = torch.nn.Upsample(scale_factor=2)
                 self.upsample_2 = torch.nn.Upsample(scale_factor=2)
@@ -1939,7 +1886,7 @@ class TestUtilityFuns(_BaseTestCase):
 
         f = io.BytesIO()
         x = torch.randn(1, 32, 224, 224)
-        torch.onnx.export(Model(), x, f)
+        torch.onnx.export(Model(), x, f, dynamo=False)
         onnx_model = onnx.load(io.BytesIO(f.getvalue()))
         # aten::upsample converts to onnx::resize
         resize_nodes = [n for n in onnx_model.graph.node if n.op_type == "Resize"]
@@ -1971,7 +1918,7 @@ class TestUtilityFuns(_BaseTestCase):
         self.assertExpectedRaisesInline(
             AssertionError,
             lambda: torch.onnx.export(
-                model, (x,), f, opset_version=_onnx_opset_version
+                model, (x,), f, opset_version=_onnx_opset_version, dynamo=False
             ),
             (
                 "A mismatch between the number of arguments (2) and their descriptors (1) was found at symbolic function "

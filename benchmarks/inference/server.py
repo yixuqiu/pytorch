@@ -1,5 +1,4 @@
 import argparse
-
 import asyncio
 import os.path
 import subprocess
@@ -46,7 +45,7 @@ class FrontendWorker(mp.Process):
         """
         This function will poll the response queue until it has received all
         responses. It records the startup latency, the average, max, min latency
-        as well as througput of requests.
+        as well as throughput of requests.
         """
         warmup_response_time = None
         response_times = []
@@ -182,13 +181,14 @@ class BackendWorker:
         self.h2d_stream = torch.cuda.Stream()
         self.d2h_stream = torch.cuda.Stream()
         # maps thread_id to the cuda.Stream associated with that worker thread
-        self.stream_map = dict()
+        self.stream_map = {}
 
     def _setup(self):
         import time
 
-        import torch
         from torchvision.models.resnet import BasicBlock, ResNet
+
+        import torch
 
         # Create ResNet18 on meta device
         with torch.device("meta"):

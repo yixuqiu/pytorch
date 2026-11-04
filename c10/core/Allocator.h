@@ -1,20 +1,42 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include <c10/core/Device.h>
 #include <c10/core/DeviceType.h>
+#include <c10/core/Stream.h>
+#include <c10/core/alignment.h>
 #include <c10/macros/Export.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
 #include <c10/util/ThreadLocalDebugInfo.h>
 #include <c10/util/UniqueVoidPtr.h>
+#include <c10/util/irange.h>
 
 namespace c10 {
+
+using CaptureId_t = unsigned long long;
+
+struct AllocationStreamInfo {
+  Stream stream;
+  CaptureId_t capture_id;
+  bool private_pool;
+};
+// first is set if the instance is created by CUDAGraph::capture_begin.
+// second is set if the instance is created by at::cuda::graph_pool_handle.
+using MempoolId_t = std::pair<CaptureId_t, CaptureId_t>;
+
+struct MempoolIdHash {
+  std::size_t operator()(const MempoolId_t& mempool_id) const noexcept {
+    return mempool_id.first != 0 ? mempool_id.first : mempool_id.second;
+  }
+};
 
 // A DataPtr is a unique pointer (with an attached deleter and some
 // context for the deleter) to some memory, which also records what
@@ -31,12 +53,16 @@ class C10_API DataPtr {
  public:
   // Choice of CPU here is arbitrary; if there's an "undefined" device
   // we could use that too
-  DataPtr() : ptr_(), device_(DeviceType::CPU) {}
+  DataPtr() : device_(DeviceType::CPU) {}
   DataPtr(void* data, Device device) : ptr_(data), device_(device) {}
   DataPtr(void* data, void* ctx, DeleterFnPtr ctx_deleter, Device device)
       : ptr_(data, ctx, ctx_deleter), device_(device) {}
   void* operator->() const {
     return ptr_.get();
+  }
+  C10_ALWAYS_INLINE bool /* success */ unsafe_reset_data_and_ctx(
+      void* new_data_and_ctx) {
+    return ptr_.unsafe_reset_data_and_ctx(new_data_and_ctx);
   }
   void clear() {
     ptr_.clear();
@@ -103,7 +129,7 @@ class C10_API DataPtr {
    * be; be sure to read the source code of the Allocator
    * in question to confirm this.
    */
-  C10_NODISCARD bool compare_exchange_deleter(
+  [[nodiscard]] bool compare_exchange_deleter(
       DeleterFnPtr expected_deleter,
       DeleterFnPtr new_deleter) {
     return ptr_.compare_exchange_deleter(expected_deleter, new_deleter);
@@ -113,8 +139,9 @@ class C10_API DataPtr {
   }
   // Unsafely mutates the device on a DataPtr.  Under normal use,
   // you should never actually need to call this function.
-  // We need this for the implementation of the hack detailed
-  // in Note [Masquerading as CUDA]
+  // We used to need this for the implementation of the hack detailed
+  // in Note [Masquerading as CUDA], but that hack has been removed.
+  // Other uses of this function now exist so it cannot be deprecated.
   void unsafe_set_device(Device device) {
     device_ = device;
   }
@@ -157,6 +184,7 @@ inline bool operator!=(std::nullptr_t, const DataPtr& dp) noexcept {
 // possible, or the raw interface will incorrectly reported as unsupported,
 // when it is actually possible.
 
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 struct C10_API Allocator {
   virtual ~Allocator() = default;
 
@@ -202,8 +230,17 @@ struct C10_API Allocator {
   //
   // Requires: src and dest were allocated by this allocator
   // Requires: src and dest both have length >= count
+  // CUDA implementations enqueue the copy on the current stream, including
+  // during capture. The caller is responsible for both allocations' lifetimes.
   virtual void copy_data(void* dest, const void* src, std::size_t count)
       const = 0;
+
+  // The allocation's reuse stream and capture of origin (zero for eager).
+  // Unknown backends cannot safely defer CUDA copies using stream ordering.
+  virtual std::optional<AllocationStreamInfo> allocation_stream_info(
+      const void* /*ptr*/) const {
+    return std::nullopt;
+  }
 
  protected:
   // Uses `std::memcpy` to copy data.
@@ -223,10 +260,24 @@ struct C10_API Allocator {
 // allocation InefficientStdFunctionContext, on top of the dynamic
 // allocation which is implied by std::function itself.
 struct C10_API InefficientStdFunctionContext {
-  void* ptr_;
+  void* ptr_{nullptr};
   std::function<void(void*)> deleter_;
   InefficientStdFunctionContext(void* ptr, std::function<void(void*)> deleter)
       : ptr_(ptr), deleter_(std::move(deleter)) {}
+  InefficientStdFunctionContext(const InefficientStdFunctionContext&) = delete;
+  InefficientStdFunctionContext(InefficientStdFunctionContext&& rhs) noexcept
+      : ptr_(std::exchange(rhs.ptr_, nullptr)),
+        deleter_(std::move(rhs.deleter_)) {}
+  InefficientStdFunctionContext& operator=(
+      const InefficientStdFunctionContext&) = delete;
+  // NOLINTNEXTLINE(*-noexcept-move-*)
+  InefficientStdFunctionContext& operator=(
+      InefficientStdFunctionContext&& rhs) {
+    this->~InefficientStdFunctionContext();
+    ptr_ = std::exchange(rhs.ptr_, nullptr);
+    deleter_ = std::move(rhs.deleter_);
+    return *this;
+  }
   ~InefficientStdFunctionContext() {
     if (deleter_) {
       deleter_(ptr_);
@@ -271,7 +322,7 @@ struct AllocatorRegisterer {
 // per device
 struct C10_API MemoryReportingInfoBase : public c10::DebugInfoBase {
   MemoryReportingInfoBase();
-  ~MemoryReportingInfoBase() override = default;
+  ~MemoryReportingInfoBase() override;
 
   /**
    * alloc_size corresponds to the size of the ptr.
@@ -312,8 +363,109 @@ C10_API void reportOutOfMemoryToProfiler(
     Device device);
 
 // used to hold traceback information in allocators
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 struct GatheredContext {
   virtual ~GatheredContext() = default;
 };
 
+namespace CachingAllocator {
+struct Stat {
+  void increase(size_t amount) {
+    current += static_cast<int64_t>(amount);
+    peak = std::max(current, peak);
+    allocated += static_cast<int64_t>(amount);
+  }
+
+  void decrease(size_t amount) {
+    current -= static_cast<int64_t>(amount);
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+        current >= 0,
+        "Negative tracked stat in device allocator (likely logic error).");
+    freed += static_cast<int64_t>(amount);
+  }
+
+  void reset_accumulated() {
+    allocated = 0;
+    freed = 0;
+  }
+
+  void reset_peak() {
+    peak = current;
+  }
+
+  int64_t current = 0;
+  int64_t peak = 0;
+  int64_t allocated = 0;
+  int64_t freed = 0;
+};
+
+enum struct StatType : uint64_t {
+  AGGREGATE = 0,
+  SMALL_POOL = 1,
+  LARGE_POOL = 2,
+  NUM_TYPES = 3 // remember to update this whenever a new stat type is added
+};
+
+using StatArray = std::array<Stat, static_cast<size_t>(StatType::NUM_TYPES)>;
+using StatTypes = std::array<bool, static_cast<size_t>(StatType::NUM_TYPES)>;
+
+template <typename Func>
+void for_each_selected_stat_type(const StatTypes& stat_types, Func f) {
+  for (const auto stat_type : c10::irange(stat_types.size())) {
+    if (stat_types[stat_type]) {
+      f(stat_type);
+    }
+  }
+}
+
+// Structure for keeping timing information
+struct DurationStat {
+  void increase(int64_t amount) {
+    total += amount;
+    count += 1;
+    max = std::max(amount, max);
+    if (min == 0) {
+      min = amount;
+    } else {
+      min = std::min(amount, min);
+    }
+  }
+
+  void reset_accumulated() {
+    total = 0;
+    count = 0;
+  }
+
+  void reset_peak() {
+    min = 0;
+    max = 0;
+  }
+
+  int64_t total = 0;
+  int64_t max = 0;
+  int64_t min = 0;
+  int64_t count = 0;
+};
+
+// Size pretty-printer
+inline std::string format_size(uint64_t size) {
+  std::ostringstream os;
+  os.precision(2);
+  os << std::fixed;
+  if (size <= 1024) {
+    os << size << " bytes";
+  } else if (size <= 1048576) {
+    os << (static_cast<double>(size) / 1024.0);
+    os << " KiB";
+  } else if (size <= 1073741824ULL) {
+    os << static_cast<double>(size) / 1048576.0;
+    os << " MiB";
+  } else {
+    os << static_cast<double>(size) / 1073741824.0;
+    os << " GiB";
+  }
+  return std::move(os).str();
+}
+
+} // namespace CachingAllocator
 } // namespace c10

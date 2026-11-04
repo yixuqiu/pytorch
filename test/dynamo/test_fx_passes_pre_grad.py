@@ -2,13 +2,15 @@
 from unittest import mock
 
 import torch
-
 import torch._dynamo
 import torch._dynamo.test_case
 from torch._inductor.utils import pass_execution_and_save
+from torch.testing._internal.common_utils import HardwareClassification
 
 
 class FxPassesPreGradTests(torch._dynamo.test_case.TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @mock.patch("torch._inductor.utils.ShapeProp.propagate")
     def test_pass_execution_and_save(self, mock_shape_prop):
         class TestModule(torch.nn.Module):
@@ -25,7 +27,7 @@ class FxPassesPreGradTests(torch._dynamo.test_case.TestCase):
         sample_input = torch.randn(4, 4)
         m = TestModule()
         m(sample_input)
-        exported_program = torch.export.export(m, (sample_input,))
+        exported_program = torch.export.export(m, (sample_input,), strict=True)
         gm = exported_program.graph_module
 
         pass_execution_and_save(fx_pass, gm, sample_input, "Apply testing pass")

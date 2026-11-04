@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import inspect
 
 from torch._custom_op.impl import (
@@ -8,6 +9,7 @@ from torch._custom_op.impl import (
     validate_namespace,
 )
 from torch.library import get_ctx
+
 
 __all__ = [
     "custom_op",
@@ -50,6 +52,7 @@ def custom_op(qualname, func_or_schema=None):
             schema string.
 
     Example::
+
         >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
         >>> import torch
         >>> import numpy as np
@@ -103,7 +106,7 @@ def custom_op(qualname, func_or_schema=None):
                 f"is passed to `custom_op`"
             )
 
-        schema = infer_schema(func)
+        schema = infer_schema(func, mutates_args=())
         _custom_op_with_schema(qualname, schema)
         return func
 
@@ -132,6 +135,7 @@ def impl(qualname, *, device_types=("cpu", "cuda"), func=None):
         device_types (str or Iterable[str]): the device type(s) to register the function for.
 
     Example::
+
         >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
         >>> import torch
         >>> import numpy as np
@@ -250,7 +254,7 @@ def impl_abstract(qualname, *, func=None):
     """
     import torch.library
 
-    return torch.library.impl_abstract(qualname, func, _stacklevel=2)
+    return torch.library.register_fake(qualname, func, _stacklevel=2)
 
 
 def impl_save_for_backward(qualname, *, func=None):

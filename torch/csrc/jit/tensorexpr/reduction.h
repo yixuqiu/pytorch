@@ -10,9 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace torch {
-namespace jit {
-namespace tensorexpr {
+namespace torch::jit::tensorexpr {
 
 using ParameterList = const std::vector<VarHandle>;
 using ReduceInteraction = std::function<ExprHandle(ExprHandle, ExprHandle)>;
@@ -36,21 +34,21 @@ class TORCH_API Reducer {
   }
 
   ExprHandle operator()(
-      BufHandle result_buf,
+      const BufHandle& result_buf,
       ExprHandle body,
       const std::vector<ExprHandle>& output,
       const std::vector<VarHandle>& inner) const;
 
   ReduceOpPtr operator()(
-      BufPtr result_buf,
+      const BufPtr& result_buf,
       ExprPtr body,
       const std::vector<ExprPtr>& output,
       const std::vector<VarPtr>& inner) const;
 
   ExprHandle operator()(
-      BufHandle result_buf,
+      const BufHandle& result_buf,
       BufHandle acc_buf,
-      ExprHandle body,
+      const ExprHandle& body,
       const std::vector<ExprHandle>& output,
       const std::vector<VarHandle>& inner) const;
 
@@ -64,9 +62,9 @@ class TORCH_API Reducer {
   static ExprHandle getReduceBody(
       const std::function<ExprHandle(const VarHandle&)>& func,
       const std::vector<VarHandle>& vars) {
-    if (vars.size() != 1) {
-      throw malformed_input("mismatch between reduce body and arg size (1)");
-    }
+    TORCH_CHECK(
+        vars.size() == 1,
+        "MALFORMED INPUT: mismatch between reduce body and arg size (1)");
 
     return func(vars[0]);
   }
@@ -74,9 +72,9 @@ class TORCH_API Reducer {
   static ExprHandle getReduceBody(
       const std::function<ExprHandle(const VarHandle&, const VarHandle&)>& func,
       const std::vector<VarHandle>& vars) {
-    if (vars.size() != 2) {
-      throw malformed_input("mismatch between reduce body and arg size (2)");
-    }
+    TORCH_CHECK(
+        vars.size() == 2,
+        "MALFORMED INPUT: mismatch between reduce body and arg size (2)");
     return func(vars[0], vars[1]);
   }
 
@@ -85,9 +83,9 @@ class TORCH_API Reducer {
           ExprHandle(const VarHandle&, const VarHandle&, const VarHandle&)>&
           func,
       const std::vector<VarHandle>& vars) {
-    if (vars.size() != 3) {
-      throw malformed_input("mismatch between reduce body and arg size (3)");
-    }
+    TORCH_CHECK(
+        vars.size() == 3,
+        "MALFORMED INPUT: mismatch between reduce body and arg size (3)");
     return func(vars[0], vars[1], vars[2]);
   }
 
@@ -98,17 +96,17 @@ class TORCH_API Reducer {
           const VarHandle&,
           const VarHandle&)>& func,
       const std::vector<VarHandle>& vars) {
-    if (vars.size() != 4) {
-      throw malformed_input("mismatch between reduce body and arg size (4)");
-    }
+    TORCH_CHECK(
+        vars.size() == 4,
+        "MALFORMED INPUT: mismatch between reduce body and arg size (4)");
     return func(vars[0], vars[1], vars[2], vars[3]);
   }
 
   // Completes the reduction operator by applying the interaction function to
   // the accumulation and the body expression.
   static ExprPtr complete(
-      BufPtr accumulator,
-      ReduceInteraction interaction,
+      const BufPtr& accumulator,
+      const ReduceInteraction& interaction,
       ExprHandle body,
       const std::vector<ExprPtr>& output_args,
       const std::vector<VarPtr>& reduce_args) {
@@ -118,8 +116,8 @@ class TORCH_API Reducer {
     return e.node();
   }
   static ExprHandle complete(
-      BufHandle accumulator,
-      ReduceInteraction interaction,
+      const BufHandle& accumulator,
+      const ReduceInteraction& interaction,
       ExprHandle body,
       const std::vector<ExprHandle>& output_args,
       const std::vector<VarHandle>& reduce_args) {
@@ -134,49 +132,48 @@ class TORCH_API Reducer {
 };
 
 // An expression representing a Reduction operation (e.g. Sum, Max) broken into
-// it's component parts: initialization, accumulation var, acquisition of value
+// its component parts: initialization, accumulation var, acquisition of value
 // to be reduced and interaction.
 //
 // This is intended to be expanded in the loopnest and not make it to codegen.
 class TORCH_API ReduceOp : public ExprNode<ReduceOp> {
  public:
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   ReduceOp(
-      ExprPtr body,
+      const ExprPtr& body,
       std::vector<VarPtr> reduce_args,
-      const Reducer& reducer)
+      Reducer reducer)
       : ExprNodeBase(body->dtype()),
         body_(body),
         reduce_args_(std::move(reduce_args)),
-        reducer_(reducer) {
+        reducer_(std::move(reducer)) {
     result_buf_ = nullptr;
     acc_buf_ = nullptr;
     ri_operand_ = nullptr;
   }
 
   ReduceOp(
-      ExprPtr body,
+      const ExprPtr& body,
       std::vector<VarPtr> reduce_args,
       BufPtr result_buf,
       BufPtr acc_buf,
       ExprPtr ri_operand,
-      const Reducer& reducer)
+      Reducer reducer)
       : ExprNodeBase(body->dtype()),
         body_(body),
         reduce_args_(std::move(reduce_args)),
         result_buf_(std::move(result_buf)),
         acc_buf_(std::move(acc_buf)),
         ri_operand_(std::move(ri_operand)),
-        reducer_(reducer) {}
+        reducer_(std::move(reducer)) {}
 
   static ExprHandle make(
       ExprHandle body,
-      std::vector<VarHandle> reduce_args,
+      const std::vector<VarHandle>& reduce_args,
       const Reducer& reducer);
 
   static ExprHandle make(
       ExprHandle body,
-      std::vector<VarHandle> reduce_args,
+      const std::vector<VarHandle>& reduce_args,
       BufHandle result_buf,
       BufHandle acc_buf,
       ExprHandle ri_operand,
@@ -233,7 +230,7 @@ class TORCH_API ReduceOp : public ExprNode<ReduceOp> {
 class Sum : public Reducer {
  public:
   Sum()
-      : Reducer(ExprHandle(0), [](ExprHandle a, ExprHandle b) {
+      : Reducer(ExprHandle(0), [](const ExprHandle& a, const ExprHandle& b) {
           return a + b;
         }) {}
 };
@@ -246,7 +243,7 @@ inline ExprHandle maximumVal(ScalarType type) {
     AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, MAX_BY_TYPE_CASE)
 #undef MAX_BY_TYPE_CASE
     default:
-      throw unsupported_dtype();
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE");
   }
   return ExprHandle();
 }
@@ -259,7 +256,7 @@ inline ExprHandle minimumVal(ScalarType type) {
     AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, MAX_BY_TYPE_CASE)
 #undef MAX_BY_TYPE_CASE
     default:
-      throw unsupported_dtype();
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE");
   }
 }
 
@@ -270,11 +267,15 @@ class Maximum : public Reducer {
   Maximum(Dtype dtype)
       : Reducer(
             minimumVal(dtype.scalar_type()),
-            [](ExprHandle a, ExprHandle b) { return Max::make(a, b, true); }) {}
+            [](const ExprHandle& a, const ExprHandle& b) {
+              return Max::make(a, b, true);
+            }) {}
   Maximum(ExprHandle initializer)
-      : Reducer(initializer, [](ExprHandle a, ExprHandle b) {
-          return Max::make(a, b, true);
-        }) {}
+      : Reducer(
+            std::move(initializer),
+            [](const ExprHandle& a, const ExprHandle& b) {
+              return Max::make(a, b, true);
+            }) {}
 };
 
 class Minimum : public Reducer {
@@ -282,24 +283,24 @@ class Minimum : public Reducer {
   Minimum(Dtype dtype)
       : Reducer(
             maximumVal(dtype.scalar_type()),
-            [](ExprHandle a, ExprHandle b) { return Min::make(a, b, true); }) {}
-  Minimum(ExprHandle initializer)
-      : Reducer(initializer, [](ExprHandle a, ExprHandle b) {
+            [](const ExprHandle& a, const ExprHandle& b) {
+              return Min::make(a, b, true);
+            }) {}
+  Minimum(const ExprHandle& initializer)
+      : Reducer(initializer, [](const ExprHandle& a, const ExprHandle& b) {
           return Min::make(a, b, true);
         }) {}
 };
 
 class ReductionExpander : public IRMutator {
  public:
-  StmtPtr expand(StmtPtr s) {
+  StmtPtr expand(const StmtPtr& s) {
     return s->accept_mutator(this);
   }
 
-  ExprPtr mutate(ReduceOpPtr v) override {
+  ExprPtr mutate(const ReduceOpPtr& v) override {
     return v->body();
   }
 };
 
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr

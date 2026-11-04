@@ -1,4 +1,9 @@
-#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "libcst",
+# ]
+# ///
 """
 This lint verifies that every Python test file (file that matches test_*.py or
 *_test.py in the test folder) has a main block which raises an exception or
@@ -6,14 +11,18 @@ calls run_tests to ensure that the test will be run in OSS CI.
 
 Takes ~2 minuters to run without the multiprocessing, probably overkill.
 """
+
+from __future__ import annotations
+
 import argparse
 import json
 import multiprocessing as mp
 from enum import Enum
-from typing import List, NamedTuple, Optional
+from typing import NamedTuple
 
 import libcst as cst
 import libcst.matchers as m
+
 
 LINTER_CODE = "TEST_HAS_MAIN"
 
@@ -29,6 +38,11 @@ class HasMainVisiter(cst.CSTVisitor):
         run_test_call = m.Call(
             func=m.Name("run_tests") | m.Attribute(attr=m.Name("run_tests"))
         )
+        # Distributed tests (i.e. MultiProcContinuousTest) calls `run_rank`
+        # instead of `run_tests` in main
+        run_rank_call = m.Call(
+            func=m.Name("run_rank") | m.Attribute(attr=m.Name("run_rank"))
+        )
         raise_block = m.Raise()
 
         # name == main or main == name
@@ -42,7 +56,7 @@ class HasMainVisiter(cst.CSTVisitor):
         )
         for child in node.children:
             if m.matches(child, m.If(test=if_main1 | if_main2)):
-                if m.findall(child, raise_block | run_test_call):
+                if m.findall(child, raise_block | run_test_call | run_rank_call):
                     self.found = True
                     break
 
@@ -57,18 +71,18 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
-    path: Optional[str]
-    line: Optional[int]
-    char: Optional[int]
+    path: str | None
+    line: int | None
+    char: int | None
     code: str
     severity: LintSeverity
     name: str
-    original: Optional[str]
-    replacement: Optional[str]
-    description: Optional[str]
+    original: str | None
+    replacement: str | None
+    description: str | None
 
 
-def check_file(filename: str) -> List[LintMessage]:
+def check_file(filename: str) -> list[LintMessage]:
     lint_messages = []
 
     with open(filename) as f:

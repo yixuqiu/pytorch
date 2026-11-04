@@ -7,24 +7,26 @@
 
 #include <ATen/ATen.h>
 
-#include <memory>
 #include <utility>
 
-namespace torch {
-namespace autograd {
+namespace torch::autograd {
 
-auto Error::apply(variable_list&& inputs) -> variable_list {
-  throw std::runtime_error(msg);
+variable_list Error::apply(variable_list&& inputs) {
+  return static_cast<const Error*>(this)->apply(std::move(inputs));
 }
 
-void Error::compiled_args(CompiledNodeArgs& args) {
-  // throw the error durring collect, the graph won't get compiled
+variable_list Error::apply(variable_list&& /*inputs*/) const {
+  TORCH_CHECK(false, msg);
+}
+
+void Error::compiled_args(CompiledNodeArgs& /*args*/) const {
+  // throw the error during collect, the graph won't get compiled
   apply(variable_list());
 }
 
 variable_list Error::apply_with_saved(
-    const variable_list& inputs,
-    SwapSavedVariables& saved) {
+    const variable_list& /*inputs*/,
+    SwapSavedVariables& /*saved*/) {
   TORCH_INTERNAL_ASSERT(false, "unreachable");
 }
 
@@ -36,7 +38,7 @@ auto DelayedError::apply(variable_list&& inputs) -> variable_list {
     outputs.emplace_back(var.defined() ? var.tensor_data() : at::Tensor());
   }
   return wrap_outputs(inputs, std::move(outputs), [&](edge_list&& next_edges) {
-    return std::make_shared<Error>(msg, std::move(next_edges));
+    return c10::make_intrusive<Error>(msg, std::move(next_edges));
   });
 }
 
@@ -48,30 +50,24 @@ auto UndefinedGrad::apply(variable_list&& inputs) -> variable_list {
         var.defined() ? var.clone().tensor_data() : at::Tensor());
   }
   return wrap_outputs(inputs, std::move(outputs), [&](edge_list&& next_edges) {
-    return std::make_shared<UndefinedGradBackward>(std::move(next_edges));
+    return c10::make_intrusive<UndefinedGradBackward>(std::move(next_edges));
   });
 }
 
 auto UndefinedGradBackward::apply(variable_list&& output_grads)
     -> variable_list {
-  tensor_list input_grads;
-  output_grads.reserve(input_grads.size());
-  for (auto& grad : output_grads) {
-    (void)grad; // Suppress unused variable warning
-    input_grads.emplace_back();
-  }
-  return input_grads;
+  return tensor_list(output_grads.size());
 }
 
 auto Identity::apply(variable_list&& grads) -> variable_list {
   return std::move(grads);
 }
 
-void GraphRoot::compiled_args(CompiledNodeArgs& args) {
+void GraphRoot::compiled_args(CompiledNodeArgs& args) const {
   args.collect(outputs);
 }
 variable_list GraphRoot::apply_with_saved(
-    const variable_list& inputs,
+    const variable_list& /*inputs*/,
     SwapSavedVariables& saved) {
   saved.before(outputs);
   variable_list result(outputs);
@@ -79,5 +75,4 @@ variable_list GraphRoot::apply_with_saved(
   return result;
 }
 
-} // namespace autograd
-} // namespace torch
+} // namespace torch::autograd

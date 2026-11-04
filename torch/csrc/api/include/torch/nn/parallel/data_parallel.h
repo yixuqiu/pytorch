@@ -15,14 +15,12 @@
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 
-#include <cstddef>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <vector>
 
-namespace torch {
-namespace nn {
+namespace torch::nn {
 
 namespace {
 
@@ -61,9 +59,10 @@ namespace {
 // in data parallel, and should not be exposed as a user API.
 struct ReduceAdd : public autograd::Node {
   explicit ReduceAdd(const at::Device& destination_device)
-      : destination_device_(destination_device){};
-  ~ReduceAdd() override {}
+      : destination_device_(destination_device) {};
+  ~ReduceAdd() override = default;
 
+  // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
   autograd::variable_list apply(autograd::variable_list&& inputs) override {
     TORCH_CHECK(
         !torch::autograd::compute_requires_grad(inputs),
@@ -90,7 +89,7 @@ struct ReduceAdd : public autograd::Node {
       output.add_(input.to(destination_device_));
     }
 
-    return {output};
+    return {std::move(output)};
   }
 
  private:
@@ -108,22 +107,24 @@ void replicate_grad_edges(
     const std::vector<std::shared_ptr<ModuleType>>& replicas,
     const std::vector<Device>& devices) {
   for (auto& parameter : module->named_parameters(/*recurse=*/false)) {
-    auto grad_fn = std::make_shared<ReduceAdd>((*parameter).device());
+    auto grad_fn = c10::make_intrusive<ReduceAdd>((*parameter).device());
     grad_fn->set_next_edges(autograd::collect_next_edges(*parameter));
 
     for (const auto i : c10::irange(devices.size())) {
       autograd::set_history(replicas[i]->parameters_[parameter.key()], grad_fn);
     }
+    autograd::fire_node_creation_hooks(grad_fn);
   }
 
   for (auto& buffer : module->named_buffers(/*recurse=*/false)) {
     if (buffer.value().requires_grad()) {
-      auto grad_fn = std::make_shared<ReduceAdd>((*buffer).device());
+      auto grad_fn = c10::make_intrusive<ReduceAdd>((*buffer).device());
       grad_fn->set_next_edges(autograd::collect_next_edges(*buffer));
 
       for (const auto i : c10::irange(devices.size())) {
         autograd::set_history(replicas[i]->buffers_[buffer.key()], grad_fn);
       }
+      autograd::fire_node_creation_hooks(grad_fn);
     }
   }
 
@@ -155,7 +156,7 @@ std::vector<std::shared_ptr<ModuleType>> replicate(
     replicas.push_back(
         std::dynamic_pointer_cast<ModuleType>(module->clone(device)));
   }
-  // Configure gradient edges to point from replcia parameters to original
+  // Configure gradient edges to point from replica parameters to original
   // module parameters. See [Replicating Modules]
   replicate_grad_edges(module, replicas, devices);
   return replicas;
@@ -190,7 +191,7 @@ template <typename ModuleType>
 std::vector<Tensor> parallel_apply(
     std::vector<ModuleType>& modules,
     const std::vector<Tensor>& inputs,
-    const optional<std::vector<Device>>& devices = nullopt) {
+    const std::optional<std::vector<Device>>& devices = std::nullopt) {
   TORCH_CHECK(
       modules.size() == inputs.size(), "Must have as many inputs as modules");
   if (devices) {
@@ -253,8 +254,8 @@ template <typename ModuleType>
 Tensor data_parallel(
     ModuleType module,
     Tensor input,
-    optional<std::vector<Device>> devices = nullopt,
-    optional<Device> output_device = nullopt,
+    std::optional<std::vector<Device>> devices = std::nullopt,
+    std::optional<Device> output_device = std::nullopt,
     int64_t dim = 0) {
   if (!devices) {
     const auto device_count = torch::cuda::device_count();
@@ -276,7 +277,7 @@ Tensor data_parallel(
     return module->forward(std::move(input)).to(*output_device);
   }
 
-  autograd::Scatter scatter(*devices, /*chunk_sizes=*/nullopt, dim);
+  autograd::Scatter scatter(*devices, /*chunk_sizes=*/std::nullopt, dim);
   auto scattered_inputs = fmap<Tensor>(scatter.apply({std::move(input)}));
   // Input tensor might not be big enough to scale across all available devices
   if (scattered_inputs.size() < devices->size()) {
@@ -293,5 +294,4 @@ Tensor data_parallel(
 }
 
 } // namespace parallel
-} // namespace nn
-} // namespace torch
+} // namespace torch::nn

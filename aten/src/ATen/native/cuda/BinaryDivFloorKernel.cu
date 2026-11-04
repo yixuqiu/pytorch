@@ -9,7 +9,6 @@
 #include <c10/cuda/CUDAMathCompat.h>
 #include <c10/util/TypeSafeSignMath.h>
 #include <c10/util/generic_math.h>
-#include <ATen/native/cuda/BinaryInternal.h>
 #include <ATen/native/cuda/JitLoops.cuh>
 #include <ATen/native/cuda/Loops.cuh>
 
@@ -78,6 +77,6 @@ void div_floor_kernel_cuda(TensorIteratorBase& iter) {
 }
 } // namespace binary_internal
 
-REGISTER_DISPATCH(div_floor_stub, &binary_internal::div_floor_kernel_cuda);
+REGISTER_DISPATCH(div_floor_stub, &binary_internal::div_floor_kernel_cuda)
 
 } // namespace at::native

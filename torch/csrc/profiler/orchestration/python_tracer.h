@@ -11,9 +11,7 @@
 #include <torch/csrc/profiler/kineto_shim.h>
 #include <torch/csrc/profiler/util.h>
 
-namespace torch {
-namespace profiler {
-namespace impl {
+namespace torch::profiler::impl {
 
 class RecordQueue;
 struct Result;
@@ -33,6 +31,11 @@ struct CompressedEvent {
   c10::time_t enter_t_{};
 };
 
+// Bounds Python events by their nearest same-thread Python ancestor.
+// `sorted_events` must be ordered by start time.
+TORCH_API void clampOverrunningPythonEvents(
+    const std::vector<std::shared_ptr<Result>>& sorted_events);
+
 /*
 Libtorch does not depend on Python (e.g. cannot #include <Python.h>); however
 when we call the profiler from libtorch_python we need the profiler to be able
@@ -49,6 +52,8 @@ struct TORCH_API PythonTracerBase {
   virtual ~PythonTracerBase() = default;
 
   virtual void stop() = 0;
+  virtual void restart() = 0;
+  virtual void register_gc_callback() = 0;
   virtual std::vector<std::shared_ptr<Result>> getEvents(
       std::function<c10::time_t(c10::approx_time_t)> time_converter,
       std::vector<CompressedEvent>& enters,
@@ -57,7 +62,21 @@ struct TORCH_API PythonTracerBase {
 
 using MakeFn = std::unique_ptr<PythonTracerBase> (*)(RecordQueue*);
 TORCH_API void registerTracer(MakeFn make_tracer);
+
+/**
+ * Memory Tracer Implementation
+ */
+struct TORCH_API PythonMemoryTracerBase {
+  static std::unique_ptr<PythonMemoryTracerBase> make();
+  virtual ~PythonMemoryTracerBase() = default;
+
+  virtual void start() = 0;
+  virtual void stop() = 0;
+  virtual void export_memory_history(const std::string& path) = 0;
+};
+
+using MakeMemoryFn = std::unique_ptr<PythonMemoryTracerBase> (*)();
+TORCH_API void registerMemoryTracer(MakeMemoryFn make_memory_tracer);
+
 } // namespace python_tracer
-} // namespace impl
-} // namespace profiler
-} // namespace torch
+} // namespace torch::profiler::impl

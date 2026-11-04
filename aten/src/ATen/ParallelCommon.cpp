@@ -3,6 +3,7 @@
 #include <ATen/Config.h>
 #include <ATen/PTThreadPool.h>
 #include <ATen/Version.h>
+#include <c10/util/env.h>
 
 #include <sstream>
 #include <thread>
@@ -15,7 +16,7 @@
 #include <omp.h>
 #endif
 
-#if defined(__APPLE__) && defined(__aarch64__) && !defined(C10_MOBILE)
+#if defined(__APPLE__) && defined(__aarch64__)
 #include <sys/sysctl.h>
 #endif
 
@@ -23,23 +24,23 @@ namespace at {
 
 namespace {
 
-const char* get_env_var(
+std::string get_env_var(
     const char* var_name, const char* def_value = nullptr) {
-  const char* value = std::getenv(var_name);
-  return value ? value : def_value;
+  auto env = c10::utils::get_env(var_name);
+  return env.has_value() ? env.value() : def_value;
 }
 
 size_t get_env_num_threads(const char* var_name, size_t def_value = 0) {
   try {
-    if (auto* value = std::getenv(var_name)) {
-      int nthreads = std::stoi(value);
+    if (auto value = c10::utils::get_env(var_name)) {
+      int nthreads = std::stoi(value.value());
       TORCH_CHECK(nthreads > 0);
       return nthreads;
     }
   } catch (const std::exception& e) {
     std::ostringstream oss;
     oss << "Invalid " << var_name << " variable value, " << e.what();
-    TORCH_WARN(oss.str());
+    TORCH_WARN(std::move(oss).str());
   }
   return def_value;
 }
@@ -59,7 +60,9 @@ std::string get_parallel_info() {
   ss << "\tomp_get_max_threads() : " << omp_get_max_threads() << '\n';
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
   ss << at::get_mkl_version() << '\n';
+#endif
 #if AT_MKL_ENABLED()
   ss << "\tmkl_get_max_threads() : " << mkl_get_max_threads() << '\n';
 #endif
@@ -72,19 +75,16 @@ std::string get_parallel_info() {
   ss << "Environment variables:" << '\n';
   ss << "\tOMP_NUM_THREADS : "
      << get_env_var("OMP_NUM_THREADS", "[not set]") << '\n';
+#if defined(__x86_64__) || defined(_M_X64)
   ss << "\tMKL_NUM_THREADS : "
      << get_env_var("MKL_NUM_THREADS", "[not set]") << '\n';
+#endif
 
   ss << "ATen parallel backend: ";
   #if AT_PARALLEL_OPENMP
   ss << "OpenMP";
   #elif AT_PARALLEL_NATIVE
   ss << "native thread pool";
-  #elif AT_PARALLEL_NATIVE_TBB
-  ss << "native thread pool and TBB";
-  #endif
-  #ifdef C10_MOBILE
-  ss << " [mobile]";
   #endif
   ss << '\n';
 
@@ -92,16 +92,10 @@ std::string get_parallel_info() {
   ss << "Experimental: single thread pool" << std::endl;
   #endif
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
 int intraop_default_num_threads() {
-#ifdef C10_MOBILE
-  // Intraop thread pool size should be determined by mobile cpuinfo.
-  // We should hook up with the logic in caffe2/utils/threadpool if we ever need
-  // call this API for mobile.
-  TORCH_CHECK(false, "Undefined intraop_default_num_threads on mobile.");
-#else
   size_t nthreads = get_env_num_threads("OMP_NUM_THREADS", 0);
   nthreads = get_env_num_threads("MKL_NUM_THREADS", nthreads);
   if (nthreads == 0) {
@@ -124,7 +118,6 @@ int intraop_default_num_threads() {
 #endif
   }
   return static_cast<int>(nthreads);
-#endif /* !defined(C10_MOBILE) */
 }
 
 } // namespace at

@@ -5,6 +5,7 @@ import torch.ao.nn.intrinsic as nni
 import torch.ao.nn.qat as nnqat
 import torch.ao.nn.quantized.reference as nnqr
 from torch.testing._internal.common_quantization import QuantizationTestCase
+from torch.testing._internal.common_utils import HardwareClassification
 
 from torch.ao.quantization.backend_config import (
     BackendConfig,
@@ -18,6 +19,7 @@ from torch.ao.quantization.fx.quantize_handler import _default_root_node_getter
 
 
 class TestBackendConfig(QuantizationTestCase):
+    hw_classification = HardwareClassification.GENERIC
 
     # =============
     #  DTypeConfig
@@ -294,8 +296,6 @@ class TestBackendConfig(QuantizationTestCase):
         })
 
     def test_backend_config_from_dict(self):
-        op1 = self._get_backend_op_config1()
-        op2 = self._get_backend_op_config2()
         op_dict1 = self._get_backend_pattern_config_dict1()
         op_dict2 = self._get_backend_pattern_config_dict2()
         conf_dict = {

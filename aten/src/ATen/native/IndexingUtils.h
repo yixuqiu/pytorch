@@ -5,6 +5,13 @@
 #include <ATen/core/IListRef.h>
 #include <c10/util/irange.h>
 
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#else
+#include <ATen/ops/empty.h>
+#include <ATen/ops/nonzero.h>
+#endif
+
 namespace at::native {
 
 [[noreturn]]
@@ -13,9 +20,12 @@ static void invalid_mask(const Tensor & self, int64_t idx, const Tensor & mask, 
   " does not match the shape of the indexed tensor ", self.sizes(), " at index ", idx);
 }
 
-
-static C10_UNUSED std::vector<Tensor> expandTensors(const Tensor & self, IOptTensorListRef indices) {
-  // If indices come in as ByteTensor or BoolTensor (masks), expand them into the equivalent indexing by LongTensors
+[[maybe_unused]] static std::vector<Tensor> expandTensors(
+    const Tensor& self,
+    IOptTensorListRef indices,
+    bool ensure_same_device = false) {
+  // If indices come in as ByteTensor or BoolTensor (masks), expand them into
+  // the equivalent indexing by LongTensors
   std::vector<Tensor> result;
   for (const auto& index_opt : indices) {
     if (!index_opt.has_value()) {
@@ -36,10 +46,19 @@ static C10_UNUSED std::vector<Tensor> expandTensors(const Tensor & self, IOptTen
           }
         }
         // Replace with nonzeros
-        auto nonzero = index.nonzero();
+        at::Tensor nonzero;
+        if (ensure_same_device && index.device() != self.device()) {
+          bool non_blocking = index.is_cpu() && self.device().is_cuda();
+          auto out = at::empty({0}, index.options().dtype(kLong).pinned_memory(non_blocking));
+          nonzero = at::nonzero_out(out, index).to(self.device(), non_blocking);
+        } else {
+          nonzero = index.nonzero();
+        }
         for (const auto j : c10::irange(index.dim())) {
           result.emplace_back(nonzero.select(1, j));
         }
+      } else if (ensure_same_device && index.device() != self.device()) {
+        result.emplace_back(index.to(self.device()));
       } else {
         result.emplace_back(index);
       }
@@ -48,7 +67,9 @@ static C10_UNUSED std::vector<Tensor> expandTensors(const Tensor & self, IOptTen
   return result;
 }
 
-static C10_UNUSED void checkIndexTensorTypes(IOptTensorListRef indices, bool allow_int=false) {
+[[maybe_unused]] static void checkIndexTensorTypes(
+    IOptTensorListRef indices,
+    bool allow_int = false) {
   for (const auto& tensor : indices) {
     if (tensor.has_value() && tensor->defined()) {
       auto scalarType = tensor->scalar_type();
@@ -65,8 +86,8 @@ static C10_UNUSED void checkIndexTensorTypes(IOptTensorListRef indices, bool all
   }
 }
 
-inline torch::List<c10::optional<Tensor>> toListOfOptionalTensors(ArrayRef<Tensor> list) {
-  torch::List<c10::optional<Tensor>> result;
+inline torch::List<std::optional<Tensor>> toListOfOptionalTensors(ArrayRef<Tensor> list) {
+  torch::List<std::optional<Tensor>> result;
   result.reserve(list.size());
   for (const Tensor& a : list) {
     result.push_back(a);
@@ -74,25 +95,27 @@ inline torch::List<c10::optional<Tensor>> toListOfOptionalTensors(ArrayRef<Tenso
   return result;
 }
 
-inline torch::List<c10::optional<Tensor>> toListOfOptionalTensors(ArrayRef<IValue> list) {
-  torch::List<c10::optional<Tensor>> result;
+inline torch::List<std::optional<Tensor>> toListOfOptionalTensors(ArrayRef<IValue> list) {
+  torch::List<std::optional<Tensor>> result;
   result.reserve(list.size());
   for (const IValue& a : list) {
-    result.push_back(a.isTensor() ? c10::optional<Tensor>(a.toTensor()) : c10::optional<Tensor>());
+    result.push_back(a.isTensor() ? std::optional<Tensor>(a.toTensor()) : std::optional<Tensor>());
   }
   return result;
 }
 
-static C10_UNUSED bool hasContiguousSubspace(TensorList tl) {
+[[maybe_unused]] static bool hasContiguousSubspace(TensorList tl) {
   // true if all the non-null tensors are adjacent
   auto isDefined = [](const Tensor & tensor){ return tensor.defined(); };
   auto isNull = [](const Tensor & tensor){ return !tensor.defined(); };
   auto start = std::find_if(tl.begin(), tl.end(), isDefined);
+  if (start == tl.end()) {
+    return true;
+  }
   auto stop = std::find_if(tl.rbegin(), tl.rend(), isDefined);
   auto it = std::find_if(start, stop.base(), isNull);
   return it == stop.base();
 }
-
 
 // Transposes the tensor and indices together so that all the non-null indices
 // index the first k dimensions of the tensor. Returns the transposed tensor
@@ -100,11 +123,13 @@ static C10_UNUSED bool hasContiguousSubspace(TensorList tl) {
 // transposeToFront(tensor, {nullptr, a, nullptr, b})
 // returns
 // tensor.permute([1, 3, 0, 2]), {a, b, nullptr, nullptr}
-static C10_UNUSED std::tuple<Tensor, std::vector<Tensor>>
-transposeToFront(const Tensor& self, TensorList indices) {
+[[maybe_unused]] static std::tuple<Tensor, std::vector<Tensor>> transposeToFront(
+    const Tensor& self,
+    TensorList indices) {
   std::vector<int64_t> dims;
   std::vector<Tensor> transposedIndices;
   dims.reserve(self.dim());
+  transposedIndices.reserve(self.dim());
   for (const auto i : c10::irange(self.dim())) {
     if (indices[i].defined()) {
       dims.push_back(i);
@@ -127,6 +152,7 @@ transposeToFrontAndInvPerm(const Tensor& self, TensorList indices) {
   std::vector<Tensor> transposedIndices;
   dims.reserve(self.dim());
   invPerm.resize(self.dim());
+  transposedIndices.reserve(self.dim());
   for (const auto i : c10::irange(self.dim())) {
     if (indices[i].defined()) {
       dims.push_back(i);

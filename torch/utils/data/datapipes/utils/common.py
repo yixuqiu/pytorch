@@ -1,14 +1,15 @@
+# mypy: allow-untyped-defs
 import fnmatch
 import functools
 import inspect
 import os
 import warnings
-
+from collections.abc import Callable, Iterable
 from io import IOBase
+from typing import Any, NoReturn
 
-from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from torch.utils._import_utils import dill_available
+
 
 __all__ = [
     "validate_input_col",
@@ -24,7 +25,7 @@ __all__ = [
 DILL_AVAILABLE = dill_available()
 
 
-def validate_input_col(fn: Callable, input_col: Optional[Union[int, tuple, list]]):
+def validate_input_col(fn: Callable, input_col: int | tuple | list | None) -> None:
     """
     Check that function used in a callable datapipe works with the input column.
 
@@ -43,8 +44,8 @@ def validate_input_col(fn: Callable, input_col: Optional[Union[int, tuple, list]
         >>> assert validate_input_col(f_def, [1, 2])
 
     Notes:
-        If the function contains variable positional (`inspect.VAR_POSITIONAL`) arguments,
-        for example, f(a, *args), the validator will accept any size of input column
+        If the function contains variable positional (``inspect.VAR_POSITIONAL``) arguments,
+        for example, ``f(a, *args)``, the validator will accept any size of input column
         greater than or equal to the number of positional arguments.
         (in this case, 1).
 
@@ -57,7 +58,9 @@ def validate_input_col(fn: Callable, input_col: Optional[Union[int, tuple, list]
     """
     try:
         sig = inspect.signature(fn)
-    except ValueError:  # Signature cannot be inspected, likely it is a built-in fn or written in C
+    except (
+        ValueError
+    ):  # Signature cannot be inspected, likely it is a built-in fn or written in C
         return
     if isinstance(input_col, (list, tuple)):
         input_col_size = len(input_col)
@@ -69,7 +72,10 @@ def validate_input_col(fn: Callable, input_col: Optional[Union[int, tuple, list]
     non_default_kw_only = []
 
     for p in sig.parameters.values():
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
             pos.append(p)
         elif p.kind is inspect.Parameter.VAR_POSITIONAL:
             var_positional = True
@@ -125,9 +131,9 @@ def _is_local_fn(fn):
     return False
 
 
-def _check_unpickable_fn(fn: Callable):
+def _check_unpickable_fn(fn: Callable) -> None:
     """
-    Check function is pickable or not.
+    Check function is picklable or not.
 
     If it is a lambda or local function, a UserWarning will be raised. If it's not a callable function, a TypeError will be raised.
     """
@@ -136,14 +142,15 @@ def _check_unpickable_fn(fn: Callable):
 
     # Extract function from partial object
     # Nested partial function is automatically expanded as a single partial object
-    if isinstance(fn, partial):
+    if isinstance(fn, functools.partial):
         fn = fn.func
 
     # Local function
     if _is_local_fn(fn) and not dill_available():
         warnings.warn(
             "Local function is not supported by pickle, please use "
-            "regular python function or functools.partial instead."
+            "regular python function or functools.partial instead.",
+            stacklevel=2,
         )
         return
 
@@ -151,12 +158,13 @@ def _check_unpickable_fn(fn: Callable):
     if hasattr(fn, "__name__") and fn.__name__ == "<lambda>" and not dill_available():
         warnings.warn(
             "Lambda function is not supported by pickle, please use "
-            "regular python function or functools.partial instead."
+            "regular python function or functools.partial instead.",
+            stacklevel=2,
         )
         return
 
 
-def match_masks(name : str, masks : Union[str, List[str]]) -> bool:
+def match_masks(name: str, masks: str | list[str]) -> bool:
     # empty mask matches any input name
     if not masks:
         return True
@@ -171,15 +179,15 @@ def match_masks(name : str, masks : Union[str, List[str]]) -> bool:
 
 
 def get_file_pathnames_from_root(
-        root: str,
-        masks: Union[str, List[str]],
-        recursive: bool = False,
-        abspath: bool = False,
-        non_deterministic: bool = False) -> Iterable[str]:
-
+    root: str,
+    masks: str | list[str],
+    recursive: bool = False,
+    abspath: bool = False,
+    non_deterministic: bool = False,
+) -> Iterable[str]:
     # print out an error message and raise the error out
-    def onerror(err : OSError):
-        warnings.warn(err.filename + " : " + err.strerror)
+    def onerror(err: OSError) -> NoReturn:
+        warnings.warn(err.filename + " : " + err.strerror, stacklevel=2)
         raise err
 
     if os.path.isfile(root):
@@ -207,26 +215,38 @@ def get_file_pathnames_from_root(
                 dirs.sort()
 
 
-def get_file_binaries_from_pathnames(pathnames: Iterable, mode: str, encoding: Optional[str] = None):
+def get_file_binaries_from_pathnames(
+    pathnames: Iterable, mode: str, encoding: str | None = None
+):
     if not isinstance(pathnames, Iterable):
-        pathnames = [pathnames, ]
+        pathnames = [
+            pathnames,
+        ]
 
-    if mode in ('b', 't'):
-        mode = 'r' + mode
+    if mode in ("b", "t"):
+        mode = "r" + mode
 
     for pathname in pathnames:
         if not isinstance(pathname, str):
-            raise TypeError(f"Expected string type for pathname, but got {type(pathname)}")
-        yield pathname, StreamWrapper(open(pathname, mode, encoding=encoding))
+            raise TypeError(
+                f"Expected string type for pathname, but got {type(pathname)}"
+            )
+        yield pathname, StreamWrapper(open(pathname, mode, encoding=encoding))  # noqa:SIM115
 
 
-def validate_pathname_binary_tuple(data: Tuple[str, IOBase]):
+def validate_pathname_binary_tuple(data: tuple[str, IOBase]) -> None:
     if not isinstance(data, tuple):
-        raise TypeError(f"pathname binary data should be tuple type, but it is type {type(data)}")
+        raise TypeError(
+            f"pathname binary data should be tuple type, but it is type {type(data)}"
+        )
     if len(data) != 2:
-        raise TypeError(f"pathname binary stream tuple length should be 2, but got {len(data)}")
+        raise TypeError(
+            f"pathname binary stream tuple length should be 2, but got {len(data)}"
+        )
     if not isinstance(data[0], str):
-        raise TypeError(f"pathname within the tuple should have string type pathname, but it is type {type(data[0])}")
+        raise TypeError(
+            f"pathname within the tuple should have string type pathname, but it is type {type(data[0])}"
+        )
     if not isinstance(data[1], IOBase) and not isinstance(data[1], StreamWrapper):
         raise TypeError(
             f"binary stream within the tuple should have IOBase or"
@@ -235,8 +255,8 @@ def validate_pathname_binary_tuple(data: Tuple[str, IOBase]):
 
 
 # Deprecated function names and its corresponding DataPipe type and kwargs for the `_deprecation_warning` function
-_iter_deprecated_functional_names: Dict[str, Dict] = {}
-_map_deprecated_functional_names: Dict[str, Dict] = {}
+_iter_deprecated_functional_names: dict[str, dict] = {}
+_map_deprecated_functional_names: dict[str, dict] = {}
 
 
 def _deprecation_warning(
@@ -252,12 +272,18 @@ def _deprecation_warning(
     deprecate_functional_name_only: bool = False,
 ) -> None:
     if new_functional_name and not old_functional_name:
-        raise ValueError("Old functional API needs to be specified for the deprecation warning.")
+        raise ValueError(
+            "Old functional API needs to be specified for the deprecation warning."
+        )
     if new_argument_name and not old_argument_name:
-        raise ValueError("Old argument name needs to be specified for the deprecation warning.")
+        raise ValueError(
+            "Old argument name needs to be specified for the deprecation warning."
+        )
 
     if old_functional_name and old_argument_name:
-        raise ValueError("Deprecating warning for functional API and argument should be separated.")
+        raise ValueError(
+            "Deprecating warning for functional API and argument should be separated."
+        )
 
     msg = f"`{old_class_name}()`"
     if deprecate_functional_name_only and old_functional_name:
@@ -286,7 +312,7 @@ def _deprecation_warning(
     if new_argument_name:
         msg = f"{msg}\nPlease use `{old_class_name}({new_argument_name}=)` instead."
 
-    warnings.warn(msg, FutureWarning)
+    warnings.warn(msg, FutureWarning, stacklevel=2)
 
 
 class StreamWrapper:
@@ -296,10 +322,10 @@ class StreamWrapper:
     StreamWrapper would guarantee the wrapped file handler is closed when it's out of scope.
     """
 
-    session_streams: Dict[Any, int] = {}
+    session_streams: dict[Any, int] = {}
     debug_unclosed_streams: bool = False
 
-    def __init__(self, file_obj, parent_stream=None, name=None):
+    def __init__(self, file_obj, parent_stream=None, name=None) -> None:
         self.file_obj = file_obj
         self.child_counter = 0
         self.parent_stream = parent_stream
@@ -308,14 +334,16 @@ class StreamWrapper:
         self.closed = False
         if parent_stream is not None:
             if not isinstance(parent_stream, StreamWrapper):
-                raise RuntimeError(f'Parent stream should be StreamWrapper, {type(parent_stream)} was given')
+                raise RuntimeError(
+                    f"Parent stream should be StreamWrapper, {type(parent_stream)} was given"
+                )
             parent_stream.child_counter += 1
             self.parent_stream = parent_stream
         if StreamWrapper.debug_unclosed_streams:
             StreamWrapper.session_streams[self] = 1
 
     @classmethod
-    def close_streams(cls, v, depth=0):
+    def close_streams(cls, v, depth=0) -> None:
         """Traverse structure and attempts to close all found StreamWrappers on best effort basis."""
         if depth > 10:
             return
@@ -331,17 +359,20 @@ class StreamWrapper:
                     cls.close_streams(vv, depth=depth + 1)
 
     def __getattr__(self, name):
-        file_obj = self.__dict__['file_obj']
+        file_obj = self.__dict__["file_obj"]
         return getattr(file_obj, name)
 
-    def close(self, *args, **kwargs):
+    def close(self, *args, **kwargs) -> None:
         if self.closed:
             return
         if StreamWrapper.debug_unclosed_streams:
             del StreamWrapper.session_streams[self]
         if hasattr(self, "parent_stream") and self.parent_stream is not None:
             self.parent_stream.child_counter -= 1
-            if not self.parent_stream.child_counter and self.parent_stream.close_on_last_child:
+            if (
+                not self.parent_stream.child_counter
+                and self.parent_stream.close_on_last_child
+            ):
                 self.parent_stream.close()
         try:
             self.file_obj.close(*args, **kwargs)
@@ -349,7 +380,7 @@ class StreamWrapper:
             pass
         self.closed = True
 
-    def autoclose(self):
+    def autoclose(self) -> None:
         """Automatically close stream when all child streams are closed or if there are none."""
         self.close_on_last_child = True
         if self.child_counter == 0:
@@ -360,7 +391,7 @@ class StreamWrapper:
         attrs += dir(self.file_obj)
         return list(set(attrs))
 
-    def __del__(self):
+    def __del__(self) -> None:
         if not self.closed:
             self.close()
 
@@ -370,7 +401,7 @@ class StreamWrapper:
     def __next__(self):
         return next(self.file_obj)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self.name is None:
             return f"StreamWrapper<{self.file_obj!r}>"
         else:

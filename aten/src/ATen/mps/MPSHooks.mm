@@ -6,11 +6,12 @@
 #include <ATen/mps/MPSHooks.h>
 #include <ATen/mps/MPSProfiler.h>
 #include <ATen/mps/MPSStream.h>
+#include <ATen/native/mps/OperationUtils.h>
 #include <c10/util/Logging.h>
 
 namespace at::mps {
 
-void MPSHooks::initMPS() const {
+void MPSHooks::init() const {
   C10_LOG_API_USAGE_ONCE("aten.init.mps");
   // TODO: initialize MPS devices and streams here
 }
@@ -20,27 +21,35 @@ bool MPSHooks::hasMPS() const {
 }
 
 bool MPSHooks::isOnMacOSorNewer(unsigned major, unsigned minor) const {
-  if (major >= 14) {
-    if (major > 14) {
-      TORCH_WARN("Can't check whether running on ", major, ".", minor, "+ returning one for 14.0+");
-    } else if (minor > 0) {
-      TORCH_WARN("Can't check whether running on 14.", minor, "+ returning one for 14.0+");
-    }
-    return is_macos_13_or_newer(MacOSVersion::MACOS_VER_14_0_PLUS);
-  }
-  TORCH_CHECK(major == 13, "Trying to check for unexpected MacOS major ", major);
-  switch (minor) {
-    case 0:
-      return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_0_PLUS);
-    case 1:
-      return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_1_PLUS);
-    case 2:
-      return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_2_PLUS);
-    case 3:
-      return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_3_PLUS);
+  switch (major) {
+    case 26:
+      switch (minor) {
+        case 0:
+          return is_macos_at_least(MacOSVersion::MACOS_26_0);
+        case 2:
+          return is_macos_at_least(MacOSVersion::MACOS_26_2);
+        case 4:
+          return is_macos_at_least(MacOSVersion::MACOS_26_4);
+        default:
+          TORCH_WARN("Can't check whether running on 26.", minor, "+ returning one for 26.4+");
+          return is_macos_at_least(MacOSVersion::MACOS_26_4);
+      }
+    case 15:
+      switch (minor) {
+        case 0:
+          return is_macos_at_least(MacOSVersion::MACOS_15_0);
+        case 1:
+          return is_macos_at_least(MacOSVersion::MACOS_15_1);
+        default:
+          TORCH_WARN("Can't check whether running on 15.", minor, "+ returning one for 15.1+");
+          return is_macos_at_least(MacOSVersion::MACOS_15_1);
+      }
+    case 14:
+    case 13:
+      return true;
     default:
-      TORCH_WARN("Can't check whether running on 13.", minor, "+ returning one for 13.3+");
-      return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_3_PLUS);
+      TORCH_WARN("Checking for unexpected MacOS ", major, ".", minor, " returning false");
+      return false;
   }
 }
 
@@ -48,28 +57,48 @@ Allocator* MPSHooks::getMPSDeviceAllocator() const {
   return at::mps::GetMPSAllocator();
 }
 
-const Generator& MPSHooks::getDefaultMPSGenerator() const {
+const Generator& MPSHooks::getDefaultGenerator([[maybe_unused]] DeviceIndex device_index) const {
   return at::mps::detail::getDefaultMPSGenerator();
 }
 
-void MPSHooks::deviceSynchronize() const {
-  at::mps::getDefaultMPSStream()->synchronize(SyncType::COMMIT_AND_WAIT);
+Generator MPSHooks::getNewGenerator([[maybe_unused]] DeviceIndex device_index) const {
+  return make_generator<at::MPSGeneratorImpl>();
 }
 
+// Unlike commitStream()/getCommandBuffer() below, every caller of this one
+// (torch.mps.synchronize() and torch::mps::synchronize()) is off the serial
+// queue, so it has to take the queue itself: synchronize() ends and releases
+// the encoder, which races whichever thread is mid-encode.
+void MPSHooks::deviceSynchronize() const {
+  at::mps::synchronizeAllMPSStreams(SyncType::COMMIT_AND_WAIT);
+}
+
+// torch::mps::commit() and get_command_buffer() are encoding-time calls: per
+// torch/mps.h the caller drives them from inside a dispatch_sync() on
+// get_dispatch_queue(), so they must not dispatch again. Assert that contract
+// rather than leave it to the docs -- dispatching here would trap on re-entry,
+// and running off-queue would race whoever owns the encoder.
 void MPSHooks::commitStream() const {
-  at::mps::getDefaultMPSStream()->synchronize(SyncType::COMMIT);
+  auto stream = at::mps::getCurrentMPSStream();
+  dispatch_assert_queue(stream->queue());
+  stream->synchronize(SyncType::COMMIT);
 }
 
 void* MPSHooks::getCommandBuffer() const {
-  return at::mps::getDefaultMPSStream()->commandBuffer();
+  auto stream = at::mps::getCurrentMPSStream();
+  dispatch_assert_queue(stream->queue());
+  // Release pending computeCommandEncoder, as extensions is likely to allocate new one
+  stream->endKernelCoalescing();
+  return stream->commandBuffer();
 }
 
 void* MPSHooks::getDispatchQueue() const {
-  return at::mps::getDefaultMPSStream()->queue();
+  return at::mps::getCurrentMPSStream()->queue();
 }
 
 void MPSHooks::emptyCache() const {
   at::mps::getIMPSAllocator()->emptyCache();
+  at::native::mps::MPSGraphCache::getInstance()->clear();
 }
 
 size_t MPSHooks::getCurrentAllocatedMemory() const {
@@ -78,6 +107,14 @@ size_t MPSHooks::getCurrentAllocatedMemory() const {
 
 size_t MPSHooks::getDriverAllocatedMemory() const {
   return at::mps::getIMPSAllocator()->getDriverAllocatedMemory();
+}
+
+size_t MPSHooks::getRecommendedMaxMemory() const {
+  return at::mps::getIMPSAllocator()->getRecommendedMaxMemory();
+}
+
+size_t MPSHooks::getMaxBufferLength() const {
+  return [MPSDevice::getInstance()->device() maxBufferLength];
 }
 
 void MPSHooks::setMemoryFraction(double ratio) const {
@@ -100,12 +137,16 @@ void MPSHooks::releaseEvent(uint32_t event_id) const {
   at::mps::getMPSEventPool()->releaseEvent(event_id);
 }
 
-void MPSHooks::recordEvent(uint32_t event_id) const {
-  at::mps::getMPSEventPool()->recordEvent(event_id, /* syncEvent*/ true);
+void MPSHooks::recordEvent(uint32_t event_id, int64_t stream_id) const {
+  at::mps::getMPSEventPool()->recordEvent(event_id, /* syncEvent*/ true, at::mps::getStreamByID(stream_id));
 }
 
-void MPSHooks::waitForEvent(uint32_t event_id) const {
-  at::mps::getMPSEventPool()->waitForEvent(event_id, /* syncEvent*/ true);
+Device MPSHooks::getDeviceFromPtr(void* data) const {
+  return at::mps::getDeviceFromPtr(data);
+}
+
+void MPSHooks::waitForEvent(uint32_t event_id, int64_t stream_id) const {
+  at::mps::getMPSEventPool()->waitForEvent(event_id, /* syncEvent*/ true, at::mps::getStreamByID(stream_id));
 }
 
 void MPSHooks::synchronizeEvent(uint32_t event_id) const {
@@ -118,6 +159,14 @@ bool MPSHooks::queryEvent(uint32_t event_id) const {
 
 double MPSHooks::elapsedTimeOfEvents(uint32_t start_event_id, uint32_t end_event_id) const {
   return at::mps::getMPSEventPool()->elapsedTime(start_event_id, end_event_id);
+}
+
+bool MPSHooks::isPinnedPtr(const void* data) const {
+  return at::mps::isMPSPinnedPtr(data);
+}
+
+Allocator* MPSHooks::getPinnedMemoryAllocator() const {
+  return at::mps::getMPSPinnedAllocator();
 }
 
 using at::MPSHooksRegistry;

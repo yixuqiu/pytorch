@@ -38,13 +38,15 @@ TypePtr ScriptTypeParser::subscriptToType(
       // here. See https://docs.python.org/3/library/typing.html#typing.Tuple
       auto tup_literal = TupleLiteral(subscript.subscript_exprs()[0]);
       if (!tup_literal.inputs().empty()) {
-        throw ErrorReport(tup_literal.range())
+        throw(
+            ErrorReport(tup_literal.range())
             << "Tuple literal in Tuple type annotation must not "
-            << "have any elements!";
+            << "have any elements!");
       }
       return TupleType::create({});
     }
     std::vector<TypePtr> subscript_expr_types;
+    subscript_expr_types.reserve(subscript.subscript_exprs().size());
     for (auto expr : subscript.subscript_exprs()) {
       subscript_expr_types.emplace_back(parseTypeFromExprImpl(expr));
     }
@@ -118,7 +120,7 @@ TypePtr ScriptTypeParser::subscriptToType(
   }
 }
 
-c10::optional<std::pair<TypePtr, int32_t>> ScriptTypeParser::parseBroadcastList(
+std::optional<std::pair<TypePtr, int32_t>> ScriptTypeParser::parseBroadcastList(
     const Expr& expr) const {
   // Alias torch.nn._common_types._size_?_t to BroadcastingList?[int]
   if (expr.kind() == TK_VAR) {
@@ -128,7 +130,7 @@ c10::optional<std::pair<TypePtr, int32_t>> ScriptTypeParser::parseBroadcastList(
     constexpr auto _size_suffix = "_t";
     constexpr auto _size_n_len = 9; // strlen("_size_X_t")
     constexpr auto _size_prefix_len = 6; // strlen("_size_");
-    if (name.find(_size_prefix) == 0 && name.length() == _size_n_len &&
+    if (name.starts_with(_size_prefix) && name.length() == _size_n_len &&
         name.find(_size_suffix) == _size_prefix_len + 1 &&
         ::isdigit(name[_size_prefix_len])) {
       int n = name[_size_prefix_len] - '0';
@@ -137,24 +139,24 @@ c10::optional<std::pair<TypePtr, int32_t>> ScriptTypeParser::parseBroadcastList(
   }
 
   if (expr.kind() != TK_SUBSCRIPT)
-    return c10::nullopt;
+    return std::nullopt;
   auto subscript = Subscript(expr);
   if (subscript.value().kind() != TK_VAR)
-    return c10::nullopt;
+    return std::nullopt;
   auto var = Var(subscript.value());
   auto subscript_exprs = subscript.subscript_exprs();
 
-  // handle the case where the BroadcastingList is wrapped in a Optional type
+  // handle the case where the BroadcastingList is wrapped in an Optional type
   if (var.name().name() == "Optional") {
     auto broadcast_list = parseBroadcastList(subscript_exprs[0]);
     if (broadcast_list) {
       TypePtr opt_type = OptionalType::create(broadcast_list->first);
       return std::pair<TypePtr, int32_t>(opt_type, broadcast_list->second);
     } else {
-      return c10::nullopt;
+      return std::nullopt;
     }
-  } else if (var.name().name().find("BroadcastingList") != 0) {
-    return c10::nullopt;
+  } else if (!var.name().name().starts_with("BroadcastingList")) {
+    return std::nullopt;
   }
 
   if (subscript_exprs.size() != 1)
@@ -179,19 +181,19 @@ c10::optional<std::pair<TypePtr, int32_t>> ScriptTypeParser::parseBroadcastList(
   TypePtr list_ptr = ListType::create(elem_ptr->second);
 
   const char* len_c = len.c_str();
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  char* end;
+  char* end = nullptr;
   size_t len_v = strtoull(len_c, &end, 10);
   if (end != len_c + len.size()) {
-    throw ErrorReport(subscript.subscript_exprs().range())
-        << "subscript of Broadcastable list must be a positive integer";
+    throw(
+        ErrorReport(subscript.subscript_exprs().range())
+        << "subscript of Broadcastable list must be a positive integer");
   }
   return std::pair<TypePtr, int32_t>(list_ptr, len_v);
 }
 
 // gets the base type name given namespaces where the types live
 // turns torch.Tensor -> Tensor, X -> X
-c10::optional<std::string> ScriptTypeParser::parseBaseTypeName(
+std::optional<std::string> ScriptTypeParser::parseBaseTypeName(
     const Expr& expr) const {
   switch (expr.kind()) {
     case TK_VAR: {
@@ -224,9 +226,9 @@ c10::optional<std::string> ScriptTypeParser::parseBaseTypeName(
         // Otherwise, it's a fully qualified class name
         return collectQualname(select);
       }
-    } break;
+    }
   }
-  return at::nullopt;
+  return std::nullopt;
 }
 
 TypePtr ScriptTypeParser::parseTypeFromExpr(const Expr& expr) const {
@@ -265,7 +267,7 @@ TypePtr ScriptTypeParser::parseTypeFromExprImpl(const Expr& expr) const {
 
     // Check if the type is a custom class. This is done by checking
     // if type_name starts with "torch.classes."
-    if (type_name.find("torch.classes.") == 0) {
+    if (type_name.starts_with("torch.classes.")) {
       auto custom_class_type = getCustomClass("__torch__." + type_name);
       return custom_class_type;
     }
@@ -274,13 +276,13 @@ TypePtr ScriptTypeParser::parseTypeFromExprImpl(const Expr& expr) const {
     // custom classes of type torch.classes.cuda.Stream and
     // torch.classes.cuda.Event respectively. Return the respective
     // custom class types for these two cases.
-    if (type_name.find("torch.cuda.Stream") == 0) {
+    if (type_name.starts_with("torch.cuda.Stream")) {
       auto custom_class_type =
           getCustomClass("__torch__.torch.classes.cuda.Stream");
       return custom_class_type;
     }
 
-    if (type_name.find("torch.cuda.Event") == 0) {
+    if (type_name.starts_with("torch.cuda.Event")) {
       auto custom_class_type =
           getCustomClass("__torch__.torch.classes.cuda.Event");
       return custom_class_type;
@@ -292,7 +294,7 @@ TypePtr ScriptTypeParser::parseTypeFromExprImpl(const Expr& expr) const {
       }
     }
 
-    throw ErrorReport(expr) << "Unknown type name '" << type_name << "'";
+    throw ErrorReport(expr) << "Unknown type name '" << type_name << '\'';
   } else if (auto name = parseBaseTypeName(expr)) {
     auto itr = string_to_type_lut().find(*name);
     if (itr != string_to_type_lut().end()) {
@@ -308,7 +310,7 @@ TypePtr ScriptTypeParser::parseTypeFromExprImpl(const Expr& expr) const {
       return custom_class_type;
     }
 
-    throw ErrorReport(expr) << "Unknown type name '" << *name << "'";
+    throw ErrorReport(expr) << "Unknown type name '" << *name << '\'';
   }
   throw ErrorReport(expr.range())
       << "Expression of type " << kindToString(expr.kind())
@@ -352,7 +354,7 @@ std::vector<IValue> ScriptTypeParser::evaluateDefaults(
 
   CompilationUnit cu;
   cu.define(
-      c10::nullopt,
+      std::nullopt,
       /*properties=*/{},
       /*propResolvers=*/{},
       {def},
@@ -362,7 +364,16 @@ std::vector<IValue> ScriptTypeParser::evaluateDefaults(
   // XXX: We need to turn optimization off here because otherwise we try to
   // recursively initialize stuff in DecomposeOps.
   GraphOptimizerEnabledGuard guard(false);
-  cu.get_function(def.name().name()).run(stack);
+  auto& f = cu.get_function(def.name().name());
+  auto* gf = dynamic_cast<GraphFunction*>(&f);
+  TORCH_INTERNAL_ASSERT(gf);
+  // 2024.08.14: Since we are starting to deprecate Torchscript usages,
+  // we are going to log all the calls for GraphFunction::run. The logging was
+  // noisy we also call GraphFunction::run for the default value evaluation
+  // which generates a lot of useless log samples. Therefore as a workaround we
+  // just directly use the executor API which avoids producing
+  // unnecessary log entries.
+  gf->get_executor().run(stack);
   return stack.at(0).toTupleRef().elements().vec();
 }
 
@@ -407,7 +418,7 @@ std::vector<Argument> ScriptTypeParser::parseArgsFromDecl(
     auto decl_arg = *it;
 
     TypePtr type;
-    c10::optional<int32_t> N = c10::nullopt;
+    std::optional<int32_t> N = std::nullopt;
     if (!decl_arg.type().present()) {
       // If this param doesn't have a type, default to "tensor"
       type = TensorType::getInferred();
@@ -421,7 +432,7 @@ std::vector<Argument> ScriptTypeParser::parseArgsFromDecl(
         type = parseTypeFromExpr(decl_arg.type().get());
       }
     }
-    c10::optional<IValue> default_value = c10::nullopt;
+    std::optional<IValue> default_value = std::nullopt;
     if (decl_arg.defaultValue().present()) {
       default_value = *defaults_it++;
     }
@@ -431,14 +442,14 @@ std::vector<Argument> ScriptTypeParser::parseArgsFromDecl(
         N,
         default_value,
         decl_arg.kwarg_only(),
-        /*alias_info=*/c10::nullopt);
+        /*alias_info=*/std::nullopt);
     retval.push_back(arg);
   }
   return retval;
 }
 
 std::vector<Argument> ScriptTypeParser::parseReturnFromDecl(const Decl& decl) {
-  // we represent no annoation on a return type as having no values in the
+  // we represent no annotation on a return type as having no values in the
   // schema's return() list
   // in emitReturn we take the actual return value to be the value of the
   // return statement if no one was provided here
@@ -455,8 +466,8 @@ std::vector<Argument> ScriptTypeParser::parseReturnFromDecl(const Decl& decl) {
   return {Argument(
       "",
       parsed_type,
-      /*N =*/c10::nullopt,
-      /*default_value =*/c10::nullopt,
+      /*N =*/std::nullopt,
+      /*default_value =*/std::nullopt,
       /*kwarg_only =*/false)};
 }
 FunctionSchema ScriptTypeParser::parseSchemaFromDef(

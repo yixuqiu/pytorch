@@ -206,15 +206,18 @@ class CustomMmaPipelined : public CustomMmaBase<Shape_, Policy_, 2> {
             lane_idx) {}
 
   CUTLASS_DEVICE
-  bool set_prologue_done(bool value) {
+  void set_prologue_done(bool value) {
     // NOT IMPLEMENTED FOR PIPELINED
   }
 
   CUTLASS_DEVICE
-  bool set_zero_outside_bounds(bool value) {
+  void set_zero_outside_bounds(bool value) {
     // NOT NEEDED FOR PIPELINED
     // shared memory will always be zero-filled
   }
+
+  CUTLASS_DEVICE
+  static void drain_cp_asyncs() {}
 
   template <bool kLoadA = true, bool kLoadB = true>
   CUTLASS_DEVICE static void prologue(

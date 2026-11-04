@@ -10,10 +10,7 @@
 #include <ATen/ops/unsqueeze.h>
 #endif
 
-#include <onnx/onnx_pb.h>
-
-namespace torch {
-namespace jit {
+namespace torch::jit {
 namespace onnx {
 using namespace ::c10::onnx;
 
@@ -42,14 +39,8 @@ void eraseUnusedBlockInputs(Block* b) {
 }
 
 void eraseUnusedValuesFromMap(ValueToParamPairMap& valsToParamsMap) {
-  auto it = valsToParamsMap.begin();
-  while (it != valsToParamsMap.end()) {
-    if (!it->first->hasUses()) {
-      it = valsToParamsMap.erase(it);
-    } else {
-      ++it;
-    }
-  }
+  std::erase_if(
+      valsToParamsMap, [](const auto& pr) { return !pr.first->hasUses(); });
 }
 
 void buildParamsMapFromValueToParamsMap(
@@ -61,7 +52,7 @@ void buildParamsMapFromValueToParamsMap(
   }
 }
 
-c10::optional<at::ScalarType> ONNXTypeToATenType(int32_t onnx_type) {
+std::optional<at::ScalarType> ONNXTypeToATenType(int32_t onnx_type) {
   switch (onnx_type) {
     case ::ONNX_NAMESPACE::TensorProto_DataType_UNDEFINED:
       return at::ScalarType::Undefined;
@@ -104,7 +95,6 @@ c10::optional<at::ScalarType> ONNXTypeToATenType(int32_t onnx_type) {
           onnx_type,
           " is an unexpected tensor scalar type");
   }
-  return c10::optional<at::ScalarType>{};
 }
 
 Node* addNodeToBlock(Block* block, Symbol kind, ArrayRef<Value*> inputs) {
@@ -241,7 +231,7 @@ Node* transformToONNXConcatNode(
   return concat_node;
 }
 
-void ONNXLintGraph(
+static void ONNXLintGraph(
     const Block* b,
     std::vector<NodeKind>& n_miss_source_range,
     std::vector<NodeKind>& n_miss_scope) {
@@ -296,5 +286,4 @@ void ONNXLintGraph(const std::shared_ptr<Graph>& graph) {
       " constants.");
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

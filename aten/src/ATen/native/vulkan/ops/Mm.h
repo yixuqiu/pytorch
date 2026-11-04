@@ -61,7 +61,7 @@ class LinearPackedContext final : virtual public VulkanPackedContext,
  public:
   LinearPackedContext(
       const Tensor& weight,
-      const c10::optional<Tensor>& bias,
+      const std::optional<Tensor>& bias,
       const bool use_batch = false);
 
   /*
@@ -89,7 +89,7 @@ class LinearPackedContext final : virtual public VulkanPackedContext,
   static LinearPackedContext pack(c10::impl::GenericList);
 
   const c10::impl::GenericList unpack() const override {
-    TORCH_CHECK(unpacked_.size() > 0u, "unpacked_ does not have any elements!");
+    TORCH_CHECK(!unpacked_.empty(), "unpacked_ does not have any elements!");
 
     return unpacked_;
   }
@@ -97,7 +97,7 @@ class LinearPackedContext final : virtual public VulkanPackedContext,
 
 c10::intrusive_ptr<LinearPackedContext> create_linear_context(
     Tensor&& weight,
-    c10::optional<Tensor>&& bias);
+    std::optional<Tensor>&& bias);
 
 Tensor run_linear_context(
     const Tensor& input,

@@ -2,11 +2,9 @@
 #include <ATen/native/TensorIterator.h>
 #include <c10/util/irange.h>
 
-namespace at {
-namespace native {
+namespace at::native {
 
-namespace {
-static bool is_constant_index(int ntensor, const int64_t* strides) {
+inline bool is_constant_index(int ntensor, const int64_t* strides) {
   AT_ASSERT(ntensor >= 3);
   for (const auto arg : c10::irange(2, ntensor)) {
     if (strides[arg] != 0) {
@@ -49,8 +47,20 @@ struct Indexer {
     }
     return offset;
   }
+
+  // Single index-tensor fast path: same result as get() when num_indexers == 1.
+  int64_t get_1(int64_t idx) {
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(num_indexers == 1);
+    int64_t value = *(int64_t*)&indexers[0][idx * indexer_strides[0]];
+    int64_t size = original_sizes[0];
+    TORCH_CHECK_INDEX(value >= -size && value < size,
+                      "index ", value, " is out of bounds for dimension 0 with size ", size);
+    if (value < 0) {
+      value += size;
+    }
+    return value * original_strides[0];
+  }
 };
-} // anonymous namespace
 
 template <typename scalar_t, typename func_t>
 void cpu_index_kernel(TensorIteratorBase& iter, IntArrayRef index_size, IntArrayRef index_stride,
@@ -71,6 +81,12 @@ void cpu_index_kernel(TensorIteratorBase& iter, IntArrayRef index_size, IntArray
       for (const auto i : c10::irange(n)) {
         f(dst + strides[0] * i, src + strides[1] * i, offset);
       }
+    } else if (indexer.num_indexers == 1) {
+      // specialization for a single index tensor
+      for (const auto i : c10::irange(n)) {
+        int64_t offset = indexer.get_1(i);
+        f(dst + strides[0] * i, src + strides[1] * i, offset);
+      }
     } else {
       for (const auto i : c10::irange(n)) {
         int64_t offset = indexer.get(i);
@@ -85,4 +101,4 @@ void cpu_index_kernel(TensorIteratorBase& iter, IntArrayRef index_size, IntArray
   }
 }
 } // at
-} // native
+// native

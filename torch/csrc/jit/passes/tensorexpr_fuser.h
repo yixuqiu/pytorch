@@ -4,8 +4,7 @@
 #include <torch/csrc/jit/ir/ir.h>
 #include <memory>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // Run TensorExpressions-based fuser.
 // If add_composed_op is true, creates a single operation that
@@ -44,7 +43,7 @@ using tensor_type_converter_t =
 //
 // The TypeCheck includes the types of all Tensor inputs to the guarded_node,
 // as processed by the type_converter, a lambda
-// TensorTypePtr(const TensorTypePtr& t). This allows to erase irrelevant
+// TensorTypePtr(const TensorTypePtr& t). This allows erasing irrelevant
 // aspects of the type.
 //
 // The Fallback graph will have the same subgraph as the guarded node (with the
@@ -67,9 +66,12 @@ TORCH_API bool isSupported(Node* node);
 /// work with dynamic shapes unless explicitly register the shape function via
 /// `torch::jit::RegisterShapeComputeGraphForSchema` for the custom operator.
 ///
-/// @return Reference of the custome operator set
+/// @return Reference of the custom operator set
 ///
 TORCH_API OperatorSet& getCustomOperatorSet();
+
 } // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit
+
+C10_DECLARE_bool(torch_jit_disable_cat);
+C10_DECLARE_bool(torch_jit_enable_dynamic_shape_fusion);

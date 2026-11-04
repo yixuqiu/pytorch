@@ -4,7 +4,7 @@
 #include <cuda.h>
 #include <nvrtc.h>
 
-namespace at { namespace cuda {
+namespace at::cuda {
 
 
 // NOTE [ USE OF NVRTC AND DRIVER API ]
@@ -43,6 +43,7 @@ namespace at { namespace cuda {
   _(nvrtcGetProgramLogSize)                      \
   _(nvrtcGetProgramLog)                          \
   _(nvrtcGetLoweredName)                         \
+  _(cuModuleLoad)                                \
   _(cuModuleLoadData)                            \
   _(cuModuleLoadDataEx)                          \
   _(cuModuleGetFunction)                         \
@@ -50,6 +51,7 @@ namespace at { namespace cuda {
   _(cuGetErrorString)                            \
   _(cuLaunchKernel)                              \
   _(cuLaunchCooperativeKernel)                   \
+  _(cuLaunchKernelEx)                            \
   _(cuCtxGetCurrent)                             \
   _(cuCtxSetCurrent)                             \
   _(cuModuleUnload)                              \
@@ -59,16 +61,30 @@ namespace at { namespace cuda {
   _(cuLinkAddData)                               \
   _(cuLinkComplete)                              \
   _(cuFuncSetAttribute)                          \
-  _(cuFuncGetAttribute)
+  _(cuFuncGetAttribute)                          \
+  _(cuPointerGetAttribute)                       \
+  _(cuFuncSetCacheConfig)                        \
+  _(cuDeviceGetAttribute)                        \
+  _(cuDeviceGet)                        \
 
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 11010
+
+#if defined(CUDA_VERSION)
+#define AT_FORALL_NVRTC_EXTENDED(_)              \
+  AT_FORALL_NVRTC_BASE(_)                        \
+  _(cuTensorMapEncodeTiled)
+#else
+#define AT_FORALL_NVRTC_EXTENDED(_)              \
+  AT_FORALL_NVRTC_BASE(_)
+#endif
+
+#if defined(CUDA_VERSION)
 #define AT_FORALL_NVRTC(_) \
-  AT_FORALL_NVRTC_BASE(_)  \
+  AT_FORALL_NVRTC_EXTENDED(_)  \
   _(nvrtcGetCUBINSize)     \
   _(nvrtcGetCUBIN)
 #else
 #define AT_FORALL_NVRTC(_) \
-  AT_FORALL_NVRTC_BASE(_)
+  AT_FORALL_NVRTC_EXTENDED(_)
 #endif
 
 #else
@@ -82,18 +98,6 @@ namespace at { namespace cuda {
 //
 // The macro below strips out certain unsupported operations on HIP from the full
 // list above.
-//
-// HIP doesn't have
-//   cuGetErrorString  (maps to non-functional hipGetErrorString___)
-//
-// HIP from ROCm 3.5 on renamed hipOccupancyMaxActiveBlocksPerMultiprocessor
-// to hipModuleOccupancyMaxActiveBlocksPerMultiprocessor.
-#if TORCH_HIP_VERSION < 305
-#define HIPOCCUPANCYMAXACTIVEBLOCKSPERMULTIPROCESSOR hipOccupancyMaxActiveBlocksPerMultiprocessor
-#else
-#define HIPOCCUPANCYMAXACTIVEBLOCKSPERMULTIPROCESSOR cuOccupancyMaxActiveBlocksPerMultiprocessor
-#endif
-
 #define AT_FORALL_NVRTC(_)                        \
   _(nvrtcVersion)                                 \
   _(nvrtcCreateProgram)                           \
@@ -102,8 +106,10 @@ namespace at { namespace cuda {
   _(nvrtcGetPTXSize)                              \
   _(nvrtcGetPTX)                                  \
   _(cuModuleLoadData)                             \
+  _(cuModuleLoad)                                 \
+  _(cuGetErrorString)                             \
   _(cuModuleGetFunction)                          \
-  _(HIPOCCUPANCYMAXACTIVEBLOCKSPERMULTIPROCESSOR) \
+  _(cuOccupancyMaxActiveBlocksPerMultiprocessor)  \
   _(nvrtcGetErrorString)                          \
   _(nvrtcGetProgramLogSize)                       \
   _(nvrtcGetProgramLog)                           \
@@ -123,4 +129,4 @@ extern "C" typedef struct NVRTC {
 } NVRTC;
 
 extern "C" TORCH_CUDA_CPP_API NVRTC* load_nvrtc();
-}} // at::cuda
+} // at::cuda

@@ -7,9 +7,10 @@ online tutorials.
 from pathlib import Path
 
 import matplotlib
+from matplotlib import pyplot as plt
 
 import torch
-from matplotlib import pyplot as plt
+
 
 matplotlib.use("Agg")
 
@@ -45,6 +46,10 @@ functions = [
     torch.nn.Softsign(),
     torch.nn.Tanh(),
     torch.nn.Tanhshrink(),
+    torch.nn.Threshold(0, 0.5),
+    # Note: GLU is not included because it requires splitting the input tensor
+    # into two halves (a, b) and computing a * sigmoid(b). A simple 1D input-output
+    # plot doesn't meaningfully represent this behavior.
 ]
 
 
@@ -54,7 +59,9 @@ def plot_function(function, **args):
     be used to specify color, alpha, etc.
     """
     xrange = torch.arange(-7.0, 7.0, 0.01)  # We need to go beyond 6 for ReLU6
-    plt.plot(xrange.numpy(), function(xrange).detach().numpy(), **args)
+    x = xrange.numpy()
+    y = function(xrange).detach().numpy()
+    plt.plot(x, y, **args)
 
 
 # Step through all the functions

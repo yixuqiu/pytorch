@@ -11,10 +11,6 @@
 #include <functional>
 #include <type_traits>
 
-#if defined(C10_IOS) && defined(C10_MOBILE)
-#include <sys/time.h> // for gettimeofday()
-#endif
-
 #if defined(__i386__) || defined(__x86_64__) || defined(__amd64__)
 #define C10_RDTSC
 #if defined(_MSC_VER)
@@ -29,6 +25,11 @@
 #else
 #undef C10_RDTSC
 #endif
+#elif defined(__aarch64__) && !defined(__CUDACC__) && !defined(__HIPCC__)
+#define C10_ARMTSC
+#elif defined(__riscv) && (__riscv_xlen == 64) && !defined(__CUDACC__) && \
+    !defined(__HIPCC__)
+#define C10_RISCVTSC
 #endif
 
 namespace c10 {
@@ -45,21 +46,13 @@ inline time_t getTimeSinceEpoch() {
 }
 
 inline time_t getTime(bool allow_monotonic = false) {
-#if defined(C10_IOS) && defined(C10_MOBILE)
-  // clock_gettime is only available on iOS 10.0 or newer. Unlike OS X, iOS
-  // can't rely on CLOCK_REALTIME, as it is defined no matter if clock_gettime
-  // is implemented or not
-  struct timeval now;
-  gettimeofday(&now, NULL);
-  return static_cast<time_t>(now.tv_sec) * 1000000000 +
-      static_cast<time_t>(now.tv_usec) * 1000;
-#elif defined(_WIN32) || defined(__MACH__)
+#if defined(_WIN32) || defined(__MACH__)
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              steady_clock_t::now().time_since_epoch())
       .count();
 #else
   // clock_gettime is *much* faster than std::chrono implementation on Linux
-  struct timespec t {};
+  struct timespec t{};
   auto mode = CLOCK_REALTIME;
   if (allow_monotonic) {
     mode = CLOCK_MONOTONIC;
@@ -69,6 +62,24 @@ inline time_t getTime(bool allow_monotonic = false) {
       static_cast<time_t>(t.tv_nsec);
 #endif
 }
+
+#if defined(C10_ARMTSC)
+inline uint64_t getArmApproximateTime() {
+  uint64_t val;
+  __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+  return val;
+}
+#endif
+
+#if defined(C10_RISCVTSC)
+inline uint64_t getRiscvApproximateTime() {
+  uint64_t val;
+  // rdtime reads the constant-frequency `time` CSR (user-readable on Linux,
+  // as cntvct_el0 is on aarch64).
+  __asm__ __volatile__("rdtime %0" : "=r"(val));
+  return val;
+}
+#endif
 
 // We often do not need to capture true wall times. If a fast mechanism such
 // as TSC is available we can use that instead and convert back to epoch time
@@ -81,6 +92,10 @@ inline time_t getTime(bool allow_monotonic = false) {
 inline auto getApproximateTime() {
 #if defined(C10_RDTSC)
   return static_cast<uint64_t>(__rdtsc());
+#elif defined(C10_ARMTSC)
+  return getArmApproximateTime();
+#elif defined(C10_RISCVTSC)
+  return getRiscvApproximateTime();
 #else
   return getTime();
 #endif

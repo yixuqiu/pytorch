@@ -3,24 +3,21 @@
 #include <torch/csrc/jit/passes/canonicalize.h>
 
 #include <ATen/core/symbol.h>
-#include <c10/util/StringUtil.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/jit_log.h>
 
 #include <utility>
 
-namespace torch {
-namespace jit {
-namespace SubgraphUtils {
+namespace torch::jit::SubgraphUtils {
 namespace {
 
 bool hasSubgraph(Node* n) {
   return n->hasAttribute(attr::Subgraph);
 }
 
-std::vector<c10::optional<const Use>> gatherLastUses(
+std::vector<std::optional<const Use>> gatherLastUses(
     at::ArrayRef<Value*> values) {
-  return fmap(values, [&](Value* v) -> c10::optional<const Use> {
+  return fmap(values, [&](Value* v) -> std::optional<const Use> {
     return firstOrLastUse(v, /*find_first*/ false);
   });
 }
@@ -33,12 +30,12 @@ std::vector<c10::optional<const Use>> gatherLastUses(
 // Values which do not have uses or which do not have a last use
 // outside of the subgraph to be merged into we do not need to track.
 struct ValueMapper {
-  // `to_merge` is the node we're merginginto a subgraph, `existing_subgraph` is
-  // the subgraph node that we're merging into if it exists
+  // `to_merge` is the node we're merging into a subgraph, `existing_subgraph`
+  // is the subgraph node that we're merging into if it exists
   ValueMapper(
       Node* to_merge,
       AliasDb& db,
-      c10::optional<Node*> existing_subgraph) {
+      std::optional<Node*> existing_subgraph) {
     last_uses_ = gatherLastUses(to_merge->outputs());
     if (existing_subgraph) {
       existing_last_uses_ = gatherLastUses((*existing_subgraph)->outputs());
@@ -64,7 +61,7 @@ struct ValueMapper {
     auto new_outputs = merged_node->outputs();
     for (Value* v : new_outputs) {
       auto maybe_last_use = firstOrLastUse(v, /*find_first*/ false);
-      // if it doesnt have a use it shouldnt have been added as output
+      // if it doesn't have a use it shouldn't have been added as output
       TORCH_INTERNAL_ASSERT(maybe_last_use);
       const Use last_use = *maybe_last_use;
 
@@ -91,14 +88,14 @@ struct ValueMapper {
     placeholder_node_->destroy();
   }
 
-  std::vector<c10::optional<const Use>> last_uses_;
-  std::vector<c10::optional<const Use>> existing_last_uses_;
+  std::vector<std::optional<const Use>> last_uses_;
+  std::vector<std::optional<const Use>> existing_last_uses_;
   Node* placeholder_node_;
 };
 
 Node* executeSubgraphMergeAndUpdateAliasing(
     Node* to_merge,
-    c10::optional<Node*> existing,
+    std::optional<Node*> existing,
     AliasDb& db,
     const std::function<Node*(void)>& merge_fn) {
   // When we merge a node into a subgraph, the new subgraph outputs
@@ -133,7 +130,6 @@ void mergeSubgraph(Node* mergeTo, Node* mergeFrom) {
   }
   ++it;
 
-  std::vector<Node*> merged_nodes;
   while (it != end_it) {
     Node* node = *it;
     ++it;
@@ -162,7 +158,7 @@ void collectNodesToUnfuse(Node* start, std::set<Node*, topo_cmp_node>& s) {
     return;
   }
 
-  if (s.count(start) != 0) {
+  if (s.contains(start)) {
     // already visited, no need to visit descendants
     return;
   }
@@ -233,7 +229,7 @@ static void collectNestedUses(
     std::unordered_map<Value*, Value*>& externalValuesMap,
     Node* input_node) {
   for (auto input : input_node->inputs()) {
-    if (externalValuesMap.count(input) == 0 && new_values.count(input) == 0) {
+    if (!externalValuesMap.contains(input) && !new_values.contains(input)) {
       closed_over_values.insert(input);
     }
   }
@@ -244,14 +240,14 @@ static void collectNestedUses(
             closed_over_values, new_values, externalValuesMap, node);
       }
       for (Value* v : block->outputs()) {
-        if (externalValuesMap.count(v) == 0 && new_values.count(v) == 0) {
+        if (!externalValuesMap.contains(v) && !new_values.contains(v)) {
           closed_over_values.insert(v);
         }
       }
     }
   } else if (input_node->kind() == prim::Loop) {
     for (Value* v : input_node->inputs()) {
-      if (externalValuesMap.count(v) == 0 && new_values.count(v) == 0) {
+      if (!externalValuesMap.contains(v) && !new_values.contains(v)) {
         closed_over_values.insert(v);
       }
     }
@@ -325,14 +321,14 @@ void mergeNodeIntoSubgraph(
     orderedSeenValues.insert(input);
   }
   for (Value* closedValue : closedValues) {
-    if (!orderedSeenValues.count(closedValue)) {
+    if (!orderedSeenValues.contains(closedValue)) {
       orderedClosedValues.push_back(closedValue);
       orderedSeenValues.insert(closedValue);
     }
   }
 
   for (auto input : orderedClosedValues) {
-    if (externalValuesMap.count(input) == 0) {
+    if (!externalValuesMap.contains(input)) {
       // Clone constants inside the subgraph instead of referencing them, to
       // enable more optimizations
       if (auto value = toIValue(input)) {
@@ -429,7 +425,7 @@ Node* createSingletonSubgraphAndUpdateAliasing(
     Symbol subgraphKind,
     AliasDb& db) {
   return executeSubgraphMergeAndUpdateAliasing(
-      to_merge, c10::nullopt, db, [&]() {
+      to_merge, std::nullopt, db, [&]() {
         return createSingletonSubgraph(to_merge, subgraphKind);
       });
 }
@@ -520,15 +516,14 @@ void unmergeNode(Node* n, Node* subgraphNode) {
         false,
         "all inputs should've been mapped. Couldn't map %",
         v->debugName());
-    return v;
   };
 
   for (auto i : c10::irange(subgraph->outputs().size())) {
-    if (node_outputs.count(subgraph->outputs().at(i)) != 0) {
+    if (node_outputs.contains(subgraph->outputs().at(i))) {
       output_indices.insert(i);
     }
 
-    if (node_inputs.count(subgraph->outputs().at(i)) != 0) {
+    if (node_inputs.contains(subgraph->outputs().at(i))) {
       GRAPH_DEBUG(
           "output %",
           subgraph->outputs().at(i)->debugName(),
@@ -548,7 +543,7 @@ void unmergeNode(Node* n, Node* subgraphNode) {
   // these node inputs need to be added to subgraph's outputs
   // put them in vmap
   for (auto ni : node_inputs) {
-    if (local_map.count(ni) != 0) {
+    if (local_map.contains(ni)) {
       // this could happen if `n` uses two or more outputs
       // of a constant node and we already cloned the constant
       // into the outer graph and mapped its outputs
@@ -606,7 +601,7 @@ static std::string truncateStrWithHash(const std::string& s, size_t maxlen) {
   if (s.size() <= maxlen) {
     return s;
   }
-  std::string hash_str = c10::to_string(c10::hash<std::string>{}(s));
+  std::string hash_str = std::to_string(c10::hash<std::string>{}(s));
   // If hash-string plus '_' can fit into maxlen, then truncate the original
   // string correspondingly so that the final string with the hash included fits
   // into maxlen. If that's not possible, at least truncate the original string
@@ -615,8 +610,8 @@ static std::string truncateStrWithHash(const std::string& s, size_t maxlen) {
       (maxlen > hash_str.size() + 1) ? (maxlen - hash_str.size() - 1) : maxlen;
   std::stringstream truncated;
   truncated << s.substr(0, trunc_len);
-  truncated << "_" << hash_str;
-  return truncated.str();
+  truncated << '_' << hash_str;
+  return std::move(truncated).str();
 }
 
 std::string generateNameForGraph(
@@ -629,11 +624,9 @@ std::string generateNameForGraph(
     if (!node->kind().is_aten()) {
       continue;
     }
-    graph_name << "_" << node->kind().toUnqualString();
+    graph_name << '_' << node->kind().toUnqualString();
   }
-  return truncateStrWithHash(graph_name.str(), maxlen);
+  return truncateStrWithHash(std::move(graph_name).str(), maxlen);
 }
 
-} // namespace SubgraphUtils
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::SubgraphUtils

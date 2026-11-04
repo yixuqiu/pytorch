@@ -1,7 +1,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/cuda/Sorting.h>
 #include <ATen/core/Tensor.h>
-#include <ATen/core/NamedTensor.h>
 #include <ATen/Context.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/MemoryOverlap.h>
@@ -21,6 +20,9 @@
 #include <ATen/ops/median_native.h>
 #include <ATen/ops/nanmedian_native.h>
 #include <ATen/ops/where.h>
+#include <ATen/ops/rsub.h>
+#include <ATen/ops/div.h>
+#include <ATen/ops/index.h>
 #endif
 
 namespace at::native {
@@ -39,6 +41,12 @@ std::tuple<Tensor&, Tensor&> kthvalue_out_impl_cuda(
 
   TORCH_CHECK(k >= 1 && k <= slicesize,
               "kthvalue(): selected number k out of range for dimension ", dim);
+
+  TORCH_CHECK(
+      slicesize <= std::numeric_limits<int32_t>::max(),
+      "kthvalue(): dimension ", dim, " is too large (", slicesize,
+      "). The current CUDA implementation supports dimension sizes up to ",
+      std::numeric_limits<int32_t>::max());
 
   at::assert_no_overlap(self, values);
 
@@ -76,12 +84,6 @@ std::tuple<Tensor&, Tensor&> median_with_indices_impl(
     int64_t dim,
     bool keepdim,
     bool ignore_nan) {
-  // See note [Writing Nondeterministic Operations]
-  // If there are duplicate elements of a median value, the procedure for choosing which
-  // of the duplicates to use for the indices output is nondeterministic.
-  at::globalContext().alertNotDeterministic("median CUDA with indices output");
-  NoNamesGuard guard;
-
   dim = at::maybe_wrap_dim(dim, self.dim());
   Tensor in = self.dim() > 0 ? self.contiguous() : self.unsqueeze(0);
 
@@ -120,15 +122,10 @@ std::tuple<Tensor&, Tensor&> median_with_indices_impl(
     launch_median_kernel(vals, inds, in, dim, ignore_nan);
   }
 
-  guard.reset();
-  namedinference::propagate_names_for_reduction(values, self, dim, keepdim);
-  namedinference::propagate_names_for_reduction(indices, self, dim, keepdim);
-
   return std::forward_as_tuple(values, indices);
 }
 
 Tensor median_impl(const Tensor& self, bool ignore_nan) {
-  NoNamesGuard guard;
 
   int64_t size = self.numel();
   // Return nan for empty tensors
@@ -146,8 +143,8 @@ Tensor median_impl(const Tensor& self, bool ignore_nan) {
     return at::where(sorted[-1].isnan(), sorted[-1], sorted[k]);
   } else {
     // For torch.nanmedian return the middle element among the non-nan values
-    int64_t k = ((size - 1) - sorted.isnan().sum().item<int64_t>()) / 2;
-    return sorted[k].clone();  // Clone so we aren't keeping `sorted` alive
+    Tensor k = at::div(at::rsub(sorted.isnan().sum(), (size - 1)), 2).to(kLong);
+    return at::index(sorted, {k});
   }
 }
 
@@ -160,17 +157,10 @@ std::tuple<Tensor&, Tensor&> kthvalue_out_cuda(
     bool keepdim,
     Tensor& values,
     Tensor& indices) {
-  // See note [Writing Nondeterministic Operations]
-  // If there are duplicate elements of the kth value, the procedure for choosing which
-  // of the duplicates to use for the indices output is nondeterministic.
-  at::globalContext().alertNotDeterministic("kthvalue CUDA");
   auto result = [&]() {
-    NoNamesGuard guard;
     // `kthvalue_out_impl_cuda` expects contiguous in input `self`.
     return kthvalue_out_impl_cuda(values, indices, self.contiguous(), k, dim, keepdim);
   }();
-  namedinference::propagate_names_for_reduction(values, self, dim, keepdim);
-  namedinference::propagate_names_for_reduction(indices, self, dim, keepdim);
   return result;
 }
 

@@ -16,7 +16,11 @@ from torch.distributed.elastic.metrics.api import (
     MetricStream,
     prof,
 )
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 def foo_1():
@@ -24,7 +28,7 @@ def foo_1():
 
 
 class TestMetricsHandler(MetricHandler):
-    def __init__(self):
+    def __init__(self) -> None:
         self.metric_data = {}
 
     def emit(self, metric_data: MetricData):
@@ -48,6 +52,8 @@ class Child(Parent):
 
 
 class MetricsApiTest(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def foo_2(self):
         pass
 

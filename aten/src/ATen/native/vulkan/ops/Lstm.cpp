@@ -1,6 +1,7 @@
 #include <ATen/TensorOperators.h>
 #include <ATen/native/vulkan/ops/Lstm.h>
 #include <ATen/native/vulkan/ops/Mm.h>
+#include <c10/util/irange.h>
 #include <torch/library.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
@@ -101,7 +102,7 @@ std::tuple<Tensor, Tensor, Tensor> lstm_input(
   h_n_list.reserve(num_layers);
   c_n_list.reserve(num_layers);
 
-  for (int64_t l = 0; l < num_layers; ++l) {
+  for (const auto l : c10::irange(num_layers)) {
     // extract each hidden state and squeeze into 2D dim
     auto h = at::slice(hx_vk, 0, l, l + 1, 1);
     h = h.reshape({h.size(0) * h.size(1), h.size(2)});
@@ -158,7 +159,8 @@ std::tuple<Tensor, Tensor, Tensor> lstm_input(
   x = x.reshape({batch_size, seq_length, x.size(1)});
   h_n = h_n.reshape({h_n.size(0) * h_n.size(1), h_n.size(2), h_n.size(3)});
   c_n = c_n.reshape({c_n.size(0) * c_n.size(1), c_n.size(2), c_n.size(3)});
-  return std::tuple<Tensor, Tensor, Tensor>(x, h_n, c_n);
+  return std::tuple<Tensor, Tensor, Tensor>(
+      std::move(x), std::move(h_n), std::move(c_n));
 }
 
 #ifdef USE_VULKAN_API
@@ -171,7 +173,7 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
 
 } // namespace
 
-std::vector<c10::intrusive_ptr<LinearPackedContext>>
+static std::vector<c10::intrusive_ptr<LinearPackedContext>>
 pack_lstm_linear_op_contexts(
     const std::vector<Tensor>& params_cpu,
     int64_t num_layers) {
@@ -185,7 +187,7 @@ pack_lstm_linear_op_contexts(
   std::vector<c10::intrusive_ptr<LinearPackedContext>> linear_op_contexts;
   linear_op_contexts.reserve(num_layers * 8);
 
-  for (int64_t l = 0; l < num_layers; ++l) {
+  for (const auto l : c10::irange(num_layers)) {
     const auto& w_ih = params_cpu[l * 4];
     const auto& w_hh = params_cpu[l * 4 + 1];
     const auto& b_ih = params_cpu[l * 4 + 2];
@@ -282,7 +284,7 @@ const c10::impl::GenericList LstmPackedContext::unpack() const {
         packed_linear_context.toCustomClass<LinearPackedContext>()->unpack();
 
     TORCH_CHECK(
-        unpacked_linear_context.size() > 0u,
+        !unpacked_linear_context.empty(),
         "unpacked_linear_context does not have any elements!");
 
     params_cpu.emplace_back(
@@ -419,7 +421,8 @@ std::tuple<Tensor, Tensor, Tensor> run_lstm_context(
   x = x.reshape({batch_size, seq_length, x.size(1)});
   h_n = h_n.reshape({h_n.size(0) * h_n.size(1), h_n.size(2), h_n.size(3)});
   c_n = c_n.reshape({c_n.size(0) * c_n.size(1), c_n.size(2), c_n.size(3)});
-  return std::tuple<Tensor, Tensor, Tensor>(x, h_n, c_n);
+  return std::tuple<Tensor, Tensor, Tensor>(
+      std::move(x), std::move(h_n), std::move(c_n));
 }
 
 } // namespace ops

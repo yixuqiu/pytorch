@@ -1,4 +1,5 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/Context.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/native/Resize.h>
@@ -24,8 +25,7 @@
 #include <ATen/ops/resize_native.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 /*
 All comparator operators will be named "<aten op name>_quantized_cpu".
@@ -81,7 +81,7 @@ AT_FORALL_OPERATORS(DEFINE_COMPARATOR)
 const Tensor& quantized_resize_cpu_(
     const Tensor& self,
     IntArrayRef size,
-    c10::optional<MemoryFormat> optional_memory_format) {
+    std::optional<MemoryFormat> optional_memory_format) {
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because if storage is resized, new elements are uninitialized
   globalContext().alertNotDeterministic("quantized_resize_cpu_");
@@ -95,9 +95,8 @@ const Tensor& quantized_resize_cpu_(
           qscheme == QScheme::PER_TENSOR_SYMMETRIC,
       "Can only resize quantized tensors with per-tensor schemes!");
   auto* self_ = self.unsafeGetTensorImpl();
-  // NOLINTNEXTLINE(bugprone-argument-comment)
-  resize_impl_cpu_(self_, size, /*strides=*/c10::nullopt);
+  resize_impl_cpu_(self_, size, /*stride=*/std::nullopt);
   return self;
 }
 
-}}  // at::native
+}  // namespace at::native

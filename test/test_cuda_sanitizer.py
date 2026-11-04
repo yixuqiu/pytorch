@@ -3,17 +3,17 @@
 import sys
 import textwrap
 import traceback
-from typing import List
 
 import torch
 import torch.cuda._sanitizer as csan
 from torch.cuda._sanitizer import DataPtr, EventId, StreamId
 from torch.testing._internal.common_utils import NoTest, run_tests, TEST_CUDA, TestCase
+from torch.testing._internal.two_tensor import TwoTensor
 
 
 if not TEST_CUDA:
     print("CUDA not available, skipping tests", file=sys.stderr)
-    TestCase = NoTest  # noqa: F811
+    TestCase = NoTest
 
 
 class TestArgumentHandler(TestCase):
@@ -23,9 +23,9 @@ class TestArgumentHandler(TestCase):
         b = torch.randn(5, 3, device="cuda")
 
         argument_handler = csan.ArgumentHandler()
-        argument_handler.parse_inputs(add_func._schema, (a, b), {})
+        argument_handler.parse_inputs(add_func._schema, (a, b), {}, is_factory=False)
         c = torch.add(a, b)
-        argument_handler.parse_outputs(c)
+        argument_handler.parse_outputs(add_func._schema, c, is_factory=False)
 
         self.assertEqual({a.data_ptr(), b.data_ptr()}, argument_handler.dataptrs_read)
         self.assertEqual({c.data_ptr()}, argument_handler.dataptrs_written)
@@ -37,9 +37,11 @@ class TestArgumentHandler(TestCase):
         c = torch.rand(2, 7, 5, device="cuda")
 
         argument_handler = csan.ArgumentHandler()
-        argument_handler.parse_inputs(cat_func._schema, ([a, b, c], 1), {})
+        argument_handler.parse_inputs(
+            cat_func._schema, ([a, b, c], 1), {}, is_factory=False
+        )
         d = torch.cat((a, b, c), dim=1)
-        argument_handler.parse_outputs(d)
+        argument_handler.parse_outputs(cat_func._schema, d, is_factory=False)
 
         self.assertEqual(
             {a.data_ptr(), b.data_ptr(), c.data_ptr()}, argument_handler.dataptrs_read
@@ -51,25 +53,24 @@ class TestArgumentHandler(TestCase):
         a = torch.arange(10, device="cuda").reshape(5, 2)
 
         argument_handler = csan.ArgumentHandler()
-        argument_handler.parse_inputs(split_func._schema, (a, 2), {})
+        argument_handler.parse_inputs(split_func._schema, (a, 2), {}, is_factory=False)
         out = torch.split(a, 2)
-        argument_handler.parse_outputs(out)
+        argument_handler.parse_outputs(split_func._schema, out, is_factory=False)
 
-        outputs = {out[0].data_ptr(), out[1].data_ptr(), out[2].data_ptr()}
-        self.assertEqual({a.data_ptr()}, argument_handler.dataptrs_read)
-        self.assertEqual(
-            outputs,
-            argument_handler.dataptrs_written,
-        )
+        # Split is a view op, no data is read or written!
+        self.assertEqual(len(argument_handler.dataptrs_read), 0)
+        self.assertEqual(len(argument_handler.dataptrs_written), 0)
 
     def test_inplace(self):
         add_inplace_func = torch.ops.aten.add_.Tensor
         a = torch.rand(4, 2, device="cuda")
 
         argument_handler = csan.ArgumentHandler()
-        argument_handler.parse_inputs(add_inplace_func._schema, (a, 5), {})
+        argument_handler.parse_inputs(
+            add_inplace_func._schema, (a, 5), {}, is_factory=False
+        )
         a.add_(5)
-        argument_handler.parse_outputs(a)
+        argument_handler.parse_outputs(add_inplace_func._schema, a, is_factory=False)
 
         self.assertEqual(set(), argument_handler.dataptrs_read)
         self.assertEqual({a.data_ptr()}, argument_handler.dataptrs_written)
@@ -80,9 +81,11 @@ class TestArgumentHandler(TestCase):
         b = torch.empty(8, device="cuda")
 
         argument_handler = csan.ArgumentHandler()
-        argument_handler.parse_inputs(mul_out_func._schema, (a, 3), {"out": b})
+        argument_handler.parse_inputs(
+            mul_out_func._schema, (a, 3), {"out": b}, is_factory=False
+        )
         torch.mul(a, 3, out=b)
-        argument_handler.parse_outputs(b)
+        argument_handler.parse_outputs(mul_out_func._schema, b, is_factory=False)
 
         self.assertEqual({a.data_ptr()}, argument_handler.dataptrs_read)
         self.assertEqual({b.data_ptr()}, argument_handler.dataptrs_written)
@@ -92,9 +95,11 @@ class TestArgumentHandler(TestCase):
         a = torch.ones(5, 3, 2, device="cuda")
 
         argument_handler = csan.ArgumentHandler()
-        argument_handler.parse_inputs(nonzero_func._schema, (a,), {"as_tuple": True})
+        argument_handler.parse_inputs(
+            nonzero_func._schema, (a,), {"as_tuple": True}, is_factory=False
+        )
         out = torch.nonzero(a, as_tuple=True)
-        argument_handler.parse_outputs(out)
+        argument_handler.parse_outputs(nonzero_func._schema, out, is_factory=False)
 
         outputs = {out[0].data_ptr(), out[1].data_ptr(), out[2].data_ptr()}
         self.assertEqual({a.data_ptr()}, argument_handler.dataptrs_read)
@@ -106,9 +111,11 @@ class TestArgumentHandler(TestCase):
         M = torch.zeros(3, 3, device="cuda")
 
         argument_handler = csan.ArgumentHandler()
-        argument_handler.parse_inputs(addr_func._schema, (M, vec, vec), {})
+        argument_handler.parse_inputs(
+            addr_func._schema, (M, vec, vec), {}, is_factory=False
+        )
         out = torch.addr(M, vec, vec)
-        argument_handler.parse_outputs(out)
+        argument_handler.parse_outputs(addr_func._schema, out, is_factory=False)
 
         self.assertEqual(
             argument_handler.tensor_aliases,
@@ -135,14 +142,15 @@ def event_id(i: int) -> EventId:
 
 class TestEventHandler(TestCase):
     def setUp(self):
+        super().setUp()
         self.handler = csan.EventHandler()
 
     def kernel_launch(
         self,
         stream: StreamId,
-        read_only: List[DataPtr] = None,
-        read_write: List[DataPtr] = None,
-    ) -> List[csan.SynchronizationError]:
+        read_only: list[DataPtr] | None = None,
+        read_write: list[DataPtr] | None = None,
+    ) -> list[csan.SynchronizationError]:
         if read_only is None:
             read_only = []
         if read_write is None:
@@ -159,8 +167,8 @@ class TestEventHandler(TestCase):
     def assert_good_kernel_launch(
         self,
         stream: StreamId,
-        read_only: List[DataPtr] = None,
-        read_write: List[DataPtr] = None,
+        read_only: list[DataPtr] | None = None,
+        read_write: list[DataPtr] | None = None,
     ) -> None:
         self.assertEqual(self.kernel_launch(stream, read_only, read_write), [])
 
@@ -168,8 +176,8 @@ class TestEventHandler(TestCase):
         self,
         number_of_errors: int,
         stream: StreamId,
-        read_only: List[DataPtr] = None,
-        read_write: List[DataPtr] = None,
+        read_only: list[DataPtr] | None = None,
+        read_write: list[DataPtr] | None = None,
     ) -> None:
         errors = self.kernel_launch(stream, read_only, read_write)
         self.assertEqual(len(errors), number_of_errors)
@@ -389,6 +397,7 @@ class TestEventHandler(TestCase):
 
 class TestMessages(TestCase):
     def setUp(self):
+        super().setUp()
         self.handler = csan.EventHandler()
 
     def test_ensure_exists(self):
@@ -493,6 +502,22 @@ class TestMessages(TestCase):
                 """
             ),
         )
+
+    def test_subclass(self):
+        class MyT(torch.Tensor):
+            def __new__(cls, data):
+                new_data = data.clone()
+                return new_data.as_subclass(cls)
+
+        try:
+            csan.enable_cuda_sanitizer()
+
+            # These two tests ensure that subclass creation
+            # happens smoothly under the mode used by csan
+            TwoTensor(torch.rand(2), torch.rand(2))
+            MyT(torch.rand(2))
+        finally:
+            csan.cuda_sanitizer.disable()
 
 
 if __name__ == "__main__":

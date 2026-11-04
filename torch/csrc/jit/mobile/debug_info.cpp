@@ -9,8 +9,7 @@
 
 #include <c10/util/string_view.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 namespace {
 
@@ -77,7 +76,7 @@ std::pair<std::vector<StackEntry>, std::string> getStackTraceWithModuleHierarchy
 // This function construct stacktrace with module hierarchy
 // Module hierarchy will contain information about where in the
 // module hierarchy this source is. For example if conv2d op
-// exist in hierarcy A->B->C->Conv2d with type annotations of
+// exist in hierarchy A->B->C->Conv2d with type annotations of
 // A -> TopM, B->MyModule, C->SomeModule, then module hierarchy
 // will be TopM(A).MyModule(B).SomeModule(C).Conv2d(conv)
 // Source level stack information will be from model source code.
@@ -104,9 +103,9 @@ std::pair<std::string, std::string> getStackTraceWithModuleHierarchy(
       std::get<kDebugInfoTupleNodeNameIndex>(last_entry);
   module_info.append(".").append(node_name);
   std::ostringstream ss;
-  ss << "Module hierarchy:" << module_info << "\n";
+  ss << "Module hierarchy:" << module_info << '\n';
   format_stack_trace(ss, stack_entries);
-  return {ss.str(), std::move(module_info)};
+  return {std::move(ss).str(), std::move(module_info)};
 }
 
 } // namespace
@@ -116,9 +115,9 @@ MobileDebugTable::MobileDebugTable(
     const std::shared_ptr<CompilationUnit>& cu) {
   ska::flat_hash_map<int64_t, SourceRange> source_range_map;
   const std::vector<std::string>& record_names = reader->getAllRecords();
-  const c10::string_view suffix(".debug_pkl");
+  constexpr std::string_view suffix(".debug_pkl");
   for (const auto& record_name : record_names) {
-    if (c10::string_view(record_name).ends_with(suffix)) {
+    if (c10::ends_with(std::string_view(record_name), suffix)) {
       auto [debug_data, debug_size] = reader->getRecord(record_name);
       auto ivalueTuple = jit::unpickle(
           reinterpret_cast<const char*>(debug_data.get()),
@@ -140,7 +139,7 @@ MobileDebugTable::MobileDebugTable(
       }
 
       for (auto& val : lines.toTuple()->elements()) {
-        auto tup_elems = std::move(*std::move(val).toTuple()).elements();
+        auto tup_elems = std::move(*val.toTuple()).elements();
         // For BC we decode only tuples with 3 elements
         // assuming it contains
         // byte_offset, debug_handle (=source range tag), source range
@@ -159,7 +158,7 @@ MobileDebugTable::MobileDebugTable(
         reader->getRecord(callstack_debug_file);
     CallStackDebugInfoUnpickler unpickler;
     callstack_ptr_map_ = unpickler.unpickle(
-        std::move(callstack_data), callstack_data_size, source_range_map, cu);
+        callstack_data, callstack_data_size, source_range_map, cu);
   }
 }
 
@@ -221,13 +220,14 @@ std::pair<std::string, std::string> MobileDebugTable::
     for (const auto debug_handle : debug_handles) {
       debug_handles_string += std::to_string(debug_handle);
     }
-    debug_handles_string += "}";
+    debug_handles_string += '}';
     debug_handles_string = debugHandlesNotFoundMessage(debug_handles_string);
-    return {debug_handles_string, debug_handles_string};
+    auto debug_handles_string_copy = debug_handles_string;
+    return {
+        std::move(debug_handles_string), std::move(debug_handles_string_copy)};
   }
   return (getStackTraceWithModuleHierarchy(
       debug_infos, "top", top_module_type_name));
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

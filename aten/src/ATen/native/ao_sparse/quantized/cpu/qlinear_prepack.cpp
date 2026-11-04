@@ -18,10 +18,9 @@
 
 #include <algorithm>
 
-namespace ao {
-namespace sparse {
+namespace ao::sparse {
 
-int register_linear_params();
+
 
 #ifdef USE_FBGEMM
 namespace {
@@ -53,7 +52,7 @@ void calc_col_offsets_transpose(
 c10::intrusive_ptr<LinearPackedParamsBase> PackedLinearWeight::
     prepack(
         const at::Tensor& weight,
-        const c10::optional<at::Tensor>& bias,
+        const std::optional<at::Tensor>& bias,
         const int64_t out_features_block_size,
         const int64_t in_features_block_size) {
   TORCH_CHECK(
@@ -98,8 +97,8 @@ c10::intrusive_ptr<LinearPackedParamsBase> PackedLinearWeight::
     }
   }
 
-  int8_t* weight_ptr_int8 =
-      reinterpret_cast<int8_t*>(weight_contig.data_ptr<c10::qint8>());
+  const int8_t* weight_ptr_int8 =
+      reinterpret_cast<const int8_t*>(weight_contig.const_data_ptr<c10::qint8>());
 
   std::vector<int32_t> col_offsets(N);
   calc_col_offsets_transpose(
@@ -110,7 +109,7 @@ c10::intrusive_ptr<LinearPackedParamsBase> PackedLinearWeight::
       /*col_offsets=*/col_offsets.data(),
       /*qtype=*/qtype);
 
-  c10::optional<at::Tensor> bias_contig;
+  std::optional<at::Tensor> bias_contig;
   if (bias.has_value()) {
     const at::Tensor& bias_vec = bias.value();
     TORCH_CHECK(bias_vec.dim() == 1, "bias should be a vector (1D Tensor)");
@@ -139,7 +138,7 @@ c10::intrusive_ptr<LinearPackedParamsBase> PackedLinearWeight::
 c10::intrusive_ptr<LinearPackedParamsBase> PackedLinearWeightQnnp::
     prepack(
         const at::Tensor& weight,
-        const c10::optional<at::Tensor>& bias,
+        const std::optional<at::Tensor>& bias,
         const int64_t out_features_block_size,
         const int64_t in_features_block_size) {
   at::native::initQNNPACK();
@@ -147,10 +146,9 @@ c10::intrusive_ptr<LinearPackedParamsBase> PackedLinearWeightQnnp::
       weight, bias, out_features_block_size, in_features_block_size);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 PackedLinearWeightQnnp::PackedLinearWeightQnnp(
     const at::Tensor& weight,
-    const c10::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& bias,
     const int64_t out_features_block_size,
     const int64_t in_features_block_size)
     : LinearPackedParamsBase(out_features_block_size, in_features_block_size),
@@ -192,10 +190,10 @@ PackedLinearWeightQnnp::PackedLinearWeightQnnp(
       at::device(c10::kCPU).dtype(c10::kQUInt8),
       weight_scales_data[0],
       w_zero_points_[0]);
-  auto* qnnp_w_data = qnnp_weight.data_ptr<c10::quint8>();
+  auto* qnnp_w_data = qnnp_weight.mutable_data_ptr<c10::quint8>();
   auto wt_numel = weight_contig.numel();
-  int8_t* w_data =
-      reinterpret_cast<int8_t*>(weight_contig.data_ptr<c10::qint8>());
+  const int8_t* w_data =
+      reinterpret_cast<const int8_t*>(weight_contig.const_data_ptr<c10::qint8>());
   for (const auto i : c10::irange(wt_numel)) {
     qnnp_w_data[i] = static_cast<c10::quint8>(w_data[i] + 128);
   }
@@ -215,7 +213,7 @@ class QLinearPackWeightInt8 final {
  public:
   static c10::intrusive_ptr<LinearPackedParamsBase> run(
       const at::Tensor& weight,
-      const c10::optional<at::Tensor>& bias,
+      const std::optional<at::Tensor>& bias,
       const int64_t out_features_block_size,
       const int64_t in_features_block_size) {
     auto& ctx = at::globalContext();
@@ -246,4 +244,4 @@ TORCH_LIBRARY_IMPL(sparse, QuantizedCPU, m) {
       TORCH_FN(QLinearPackWeightInt8::run));
 }
 }  // namespace
-}}  // namespace ao::sparse
+}  // namespace ao::sparse

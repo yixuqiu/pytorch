@@ -5,16 +5,15 @@
 // LICENSE file in the root directory of this source tree.
 
 #include <ATen/functorch/BatchRulesHelper.h>
-#include <ATen/functorch/PlumbingHelper.h>
 
 namespace at::functorch {
 
 namespace{
-std::tuple<Tensor,optional<int64_t>>
+std::tuple<Tensor, std::optional<int64_t>>
 clone_batch_rule(
     const Tensor& self,
-    optional<int64_t> self_bdim,
-    optional<MemoryFormat> memory_format) {
+    std::optional<int64_t> self_bdim,
+    std::optional<MemoryFormat> memory_format) {
   // Memory format support is a little tricky because vmap is allowed to move
   // around batch dimensions and some memory formats are rank-dependent.
   // Another weird case is:
@@ -40,32 +39,25 @@ clone_batch_rule(
     // philosophically vmap hides the batch dims and operates on a per-sample level.
     auto self_ = moveBatchDimToFront(self, self_bdim);
     auto result = at::clone(self_, memory_format);
-    return std::make_tuple(result, 0);
+    return std::make_tuple(std::move(result), 0);
   }
 
   TORCH_INTERNAL_ASSERT(!memory_format.has_value() || memory_format == MemoryFormat::Preserve);
   auto result = at::clone(self, memory_format);
-  return std::make_tuple(result, self_bdim);
+  return std::make_tuple(std::move(result), self_bdim);
 }
 
-std::tuple<Tensor,optional<int64_t>>
-view_as_complex_batch_rule(const Tensor& self, optional<int64_t> self_bdim) {
+std::tuple<Tensor, std::optional<int64_t>>
+view_as_complex_batch_rule(const Tensor& self, std::optional<int64_t> self_bdim) {
   // guard against the user passing in a batch of scalar tensors with batch
   // size equal to 2.
   TORCH_CHECK(self.sym_sizes().size() > 1, "Input tensor must have one or more dimensions");
 
   auto self_ = moveBatchDimToFront(self, self_bdim);
   auto result = at::view_as_complex(self_);
-  return std::make_tuple(result, 0);
+  return std::make_tuple(std::move(result), 0);
 }
 
-std::tuple<Tensor,optional<int64_t>>
-to_other_batch_rule(const Tensor& self, optional<int64_t> self_bdim,
-                    const Tensor& other, optional<int64_t> other_bdim,
-                    bool non_blocking,
-                    bool copy, c10::optional<at::MemoryFormat> memory_format) {
-  return std::make_tuple(self.to(other, non_blocking, copy, memory_format), self_bdim);
-}
 }
 
 TORCH_LIBRARY_IMPL(aten, FuncTorchBatched, m) {
@@ -178,6 +170,8 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatched, m) {
 
   POINTWISE_BOXED(fill_.Scalar);
   POINTWISE_BOXED(zero_);
+  // This is special because this op doesn't return anything
+  m.impl("_assert_tensor_metadata", native::_assert_tensor_metadata);
 
 #undef UNARY_POINTWISE
 #undef UNARY_POINTWISE_ALL

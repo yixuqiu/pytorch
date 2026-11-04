@@ -1,6 +1,4 @@
-#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
-#include <ATen/cuda/CUDASparse.h>
 #include <ATen/cuda/CUDASparseDescriptors.h>
 #include <ATen/native/LinearAlgebraUtils.h>
 #include <ATen/native/cuda/MiscUtils.h>
@@ -8,10 +6,9 @@
 namespace at::cuda::sparse {
 
 cusparseStatus_t destroyConstDnMat(const cusparseDnMatDescr* dnMatDescr) {
+  // NOLINTNEXTLINE(*const-cast)
   return cusparseDestroyDnMat(const_cast<cusparseDnMatDescr*>(dnMatDescr));
 }
-
-#if AT_USE_CUSPARSE_GENERIC_API() || AT_USE_HIPSPARSE_GENERIC_API()
 
 namespace {
 
@@ -55,7 +52,6 @@ cusparseIndexType_t getCuSparseIndexType(const c10::ScalarType& scalar_type) {
   }
 }
 
-#if AT_USE_CUSPARSE_GENERIC_API() || AT_USE_HIPSPARSE_GENERIC_API()
 cusparseDnMatDescr_t createRawDnMatDescriptor(const Tensor& input, int64_t batch_offset, bool is_const=false) {
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(input.layout() == kStrided);
   IntArrayRef input_strides = input.strides();
@@ -75,14 +71,10 @@ cusparseDnMatDescr_t createRawDnMatDescriptor(const Tensor& input, int64_t batch
   auto leading_dimension =
       is_row_major ? input_strides[ndim - 2] : input_strides[ndim - 1];
 
-#if !defined(USE_ROCM)
   auto order = is_row_major ? CUSPARSE_ORDER_ROW : CUSPARSE_ORDER_COL;
-#else
-  TORCH_INTERNAL_ASSERT(is_column_major, "Expected column major input.");
-  auto order = CUSPARSE_ORDER_COL;
-#endif
 
   auto batch_stride = ndim > 2 && batch_offset >= 0 ? input_strides[ndim - 3] : 0;
+  // NOLINTNEXTLINE(*const-cast)
   void* data_ptr = is_const ? const_cast<void*>(input.const_data_ptr()) : input.data_ptr();
   void* values_ptr = static_cast<char*>(data_ptr) +
       batch_offset * batch_stride * input.itemsize();
@@ -93,7 +85,7 @@ cusparseDnMatDescr_t createRawDnMatDescriptor(const Tensor& input, int64_t batch
   // NOTE: Ideally, in the const case, we would use cusparseConstDnMatDescr_t
   // and cusparseCreateConstDnMat, but those were introduced in CUDA 12, and we
   // still need to support CUDA 11
-  cusparseDnMatDescr_t raw_descriptor;
+  cusparseDnMatDescr_t raw_descriptor = nullptr;
   TORCH_CUDASPARSE_CHECK(cusparseCreateDnMat(
       &raw_descriptor,
       rows,
@@ -119,7 +111,6 @@ CuSparseDnMatDescriptor::CuSparseDnMatDescriptor(const Tensor& input, int64_t ba
 CuSparseConstDnMatDescriptor::CuSparseConstDnMatDescriptor(const Tensor& input, int64_t batch_offset) {
   descriptor_.reset(createRawDnMatDescriptor(input, batch_offset, /*is_const*/true));
 }
-#endif // AT_USE_CUSPARSE_GENERIC_API() || AT_USE_HIPSPARSE_GENERIC_API()
 
 CuSparseDnVecDescriptor::CuSparseDnVecDescriptor(const Tensor& input) {
   // cuSPARSE doesn't support batched vectors
@@ -132,7 +123,7 @@ CuSparseDnVecDescriptor::CuSparseDnVecDescriptor(const Tensor& input) {
   cudaDataType value_type = ScalarTypeToCudaDataType(input.scalar_type());
   check_supported_cuda_type(value_type);
 
-  cusparseDnVecDescr_t raw_descriptor;
+  cusparseDnVecDescr_t raw_descriptor = nullptr;
   TORCH_CUDASPARSE_CHECK(cusparseCreateDnVec(
       &raw_descriptor, input.numel(), input.data_ptr(), value_type));
   descriptor_.reset(raw_descriptor);
@@ -169,7 +160,7 @@ CuSparseSpMatCsrDescriptor::CuSparseSpMatCsrDescriptor(const Tensor& input, int6
   auto values_batch_stride =
       values.dim() >= 2 && batch_offset >= 0 ? values_->stride(-2) : 0;
 
-  cusparseSpMatDescr_t raw_descriptor;
+  cusparseSpMatDescr_t raw_descriptor = nullptr;
   TORCH_CUDASPARSE_CHECK(cusparseCreateCsr(
       &raw_descriptor, // output descriptor
       rows,
@@ -186,19 +177,29 @@ CuSparseSpMatCsrDescriptor::CuSparseSpMatCsrDescriptor(const Tensor& input, int6
           batch_offset * values_batch_stride * values.itemsize(),
       index_type, // data type of row offsets index
       index_type, // data type of col indices
-      CUSPARSE_INDEX_BASE_ZERO, // base index of row offset and col indes
+      CUSPARSE_INDEX_BASE_ZERO, // base index of row offset and col index
       value_type // data type of values
       ));
+
+  descriptor_.reset(raw_descriptor);
 
   if (ndim == 3 && batch_offset == -1) {
     int batch_count =
         at::native::cuda_int_cast(at::native::batchCount(input), "batch_count");
     if (crow_indices.dim() >= 2 || values.dim() >= 2 ||
         col_indices.dim() >= 2) {
-      // cuSPARSE ignores the strides and uses only the first batch
-      TORCH_INTERNAL_ASSERT(
-          false,
-          "Support for batched CSR indices and values is not implemented.");
+      TORCH_CHECK(
+          crow_indices.dim() >= 2 && col_indices.dim() >= 2 &&
+              values.dim() >= 2,
+          "Expected crow_indices, col_indices and values of a batched CSR "
+          "tensor to be batched, got dimensionalities ",
+          crow_indices.dim(), ", ", col_indices.dim(), " and ", values.dim());
+      // cuSPARSE uses a single batch stride for column indices and values.
+      TORCH_CHECK(
+          col_indices.stride(-2) == values_->stride(-2),
+          "Expected col_indices and values of a batched CSR tensor to have "
+          "equal batch strides, got ",
+          col_indices.stride(-2), " and ", values_->stride(-2));
       TORCH_CUDASPARSE_CHECK(cusparseCsrSetStridedBatch(
           raw_descriptor,
           batch_count,
@@ -211,10 +212,6 @@ CuSparseSpMatCsrDescriptor::CuSparseSpMatCsrDescriptor(const Tensor& input, int6
           cusparseCsrSetStridedBatch(raw_descriptor, batch_count, 0, 0));
     }
   }
-
-  descriptor_.reset(raw_descriptor);
 }
-
-#endif // AT_USE_CUSPARSE_GENERIC_API() || AT_USE_HIPSPARSE_GENERIC_API()
 
 } // namespace at::cuda::sparse

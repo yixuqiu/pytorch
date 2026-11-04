@@ -1,5 +1,6 @@
 # Owner(s): ["module: intel"]
 
+import copy
 import itertools
 import math
 import unittest
@@ -9,8 +10,8 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._C._dynamo.guards import assert_size_stride
 from torch.testing import make_tensor
-from torch.testing._internal.common_cuda import tf32_is_not_fp32
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,
@@ -29,8 +30,8 @@ from torch.testing._internal.common_utils import (
     TEST_WITH_ROCM,
 )
 
-assert_size_stride = torch._C._dynamo.guards.assert_size_stride
-AMPERE_OR_ROCM = TEST_WITH_ROCM or tf32_is_not_fp32()
+
+AMPERE_OR_ROCM = TEST_WITH_ROCM or torch.cuda.is_tf32_supported()
 if TEST_SCIPY:
     import scipy.ndimage
     import scipy.signal
@@ -272,7 +273,8 @@ class TestConvolutionNNDeviceType(NNTestCase):
         output = module(input)
 
         grad = torch.randn(2, 2, 5, 10, 10, dtype=dtype, device=device)[:, 1]
-        assert not grad.is_contiguous()
+        if grad.is_contiguous():
+            raise AssertionError("Expected grad to not be contiguous")
         output.backward(grad, retain_graph=True)
         self.assertIsNotNone(input.grad)
         result = input.grad.data.clone()
@@ -365,6 +367,31 @@ class TestConvolutionNNDeviceType(NNTestCase):
                     dilation,
                     no_weight,
                 )
+
+    @dtypes(torch.float)
+    def test_conv1d_large_input(self, device, dtype):
+        N, C_in, L = 4, 512, 441
+        C_out, K, P = 512, 3, 1
+        torch.manual_seed(42)
+
+        conv_cpu = (
+            nn.Conv1d(C_in, C_out, kernel_size=K, padding=P, bias=True)
+            .to(torch.float32)
+            .requires_grad_()
+        )
+        x_cpu = torch.randn(N, C_in, L, dtype=torch.float32)
+        out_cpu = conv_cpu(x_cpu)
+
+        conv_dev = nn.Conv1d(C_in, C_out, kernel_size=K, padding=P, bias=True).to(
+            device, dtype
+        )
+        conv_dev.weight.data.copy_(conv_cpu.weight.data.to(dtype))
+        conv_dev.bias.data.copy_(conv_cpu.bias.data.to(dtype))
+
+        x_dev = x_cpu.to(device, dtype).requires_grad_()
+        out_dev = conv_dev(x_dev)
+
+        self.assertEqual(out_cpu, out_dev, atol=1e-5, rtol=1e-5, exact_device=False)
 
     @dtypes(torch.float)
     def test_conv1d_same_padding(self, device, dtype):
@@ -581,6 +608,23 @@ class TestConvolutionNNDeviceType(NNTestCase):
         with set_default_dtype(torch.float):
             _test(t, weight_even, mode)
             _test(t, weight_odd, mode)
+
+    @dtypes(torch.double)
+    def test_conv1d_backward_depthwise(self, device, dtype):
+        batch, channels, width = 2, 4, 2
+        x = make_tensor(
+            (batch, 1, channels), device=device, dtype=dtype, requires_grad=True
+        ).transpose(1, 2)
+        weight = make_tensor(
+            (channels, width), device=device, dtype=dtype, requires_grad=True
+        )
+
+        def conv1d_depthwise(x, weight):
+            return torch.nn.functional.conv1d(
+                x, weight.unsqueeze(1), padding=width - 1, groups=channels
+            )
+
+        gradcheck(conv1d_depthwise, (x, weight))
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy required for the test.")
     @dtypes(torch.float)
@@ -1191,6 +1235,25 @@ class TestConvolutionNNDeviceType(NNTestCase):
                 output = m(input)
                 self.assertEqual(output, output_ng, rtol=1e-2, atol=1e-5)
 
+    @unittest.skipIf(torch.xpu.device_count() < 2, "only one GPU detected")
+    @dtypes(torch.double, torch.float, torch.half)
+    def test_conv2d_on_multi_device(self, dtype):
+        input = torch.randn(3, 256, 224, 224, dtype=dtype, requires_grad=True)
+        conv = torch.nn.Conv2d(256, 256, kernel_size=3, padding=1, dtype=dtype)
+        output_grad = torch.randn(3, 256, 224, 224, dtype=dtype)
+        input_0 = input.to(device="xpu:0")
+        conv_0 = copy.deepcopy(conv).to(device="xpu:0")
+        output_0 = conv_0(input_0)
+        input_1 = input.to(device="xpu:1")
+        conv_1 = copy.deepcopy(conv).to(device="xpu:1")
+        output_1 = conv_1(input_1)
+        self.assertEqual(output_0.cpu(), output_1.cpu())
+        output_grad_0 = output_grad.to(device="xpu:0")
+        output_0.backward(output_grad_0)
+        output_grad_1 = output_grad.to(device="xpu:1")
+        output_1.backward(output_grad_1)
+        self.assertEqual(output_grad_0.cpu(), output_grad_1.cpu())
+
     def test_conv_double_backward_strided_with_3D_input_and_weight(self, device):
         input = torch.randn(2, 3, 6, device=device)
         weight = torch.randn(3, 3, 3, device=device)
@@ -1242,6 +1305,59 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertEqual(grad_input.shape, input.shape)
         self.assertEqual(grad_weight.shape, weight.shape)
 
+    def test_aten_conv_backward_op(self, device):
+        # test low-level aten.convolution_backward ops
+        def test_aten_conv_backward_op_output_mask(output_mask):
+            input_cpu = torch.randn(1, 1, 4, 4, device="cpu")
+            weight_cpu = torch.randn(1, 1, 3, 3, device="cpu")
+            grad_output_cpu = torch.randn(1, 1, 2, 2, device="cpu")
+            grad_input_cpu, grad_weight_cpu, grad_bias_cpu = (
+                torch.ops.aten.convolution_backward(
+                    grad_output_cpu,
+                    input_cpu,
+                    weight_cpu,
+                    [1],
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    False,
+                    (0, 0),
+                    1,
+                    output_mask,
+                )
+            )
+            input = input_cpu.to(device=device)
+            weight = weight_cpu.to(device=device)
+            grad_output = grad_output_cpu.to(device=device)
+            grad_input, grad_weight, grad_bias = torch.ops.aten.convolution_backward(
+                grad_output,
+                input,
+                weight,
+                [1],
+                (1, 1),
+                (0, 0),
+                (1, 1),
+                False,
+                (0, 0),
+                1,
+                output_mask,
+            )
+            if output_mask[0]:
+                self.assertEqual(grad_input_cpu, grad_input)
+            if output_mask[1]:
+                self.assertEqual(grad_weight_cpu, grad_weight)
+            if output_mask[2]:
+                self.assertEqual(grad_bias_cpu, grad_bias)
+
+        test_aten_conv_backward_op_output_mask([True, True, True])
+        test_aten_conv_backward_op_output_mask([True, True, False])
+        test_aten_conv_backward_op_output_mask([True, False, True])
+        test_aten_conv_backward_op_output_mask([True, False, False])
+        test_aten_conv_backward_op_output_mask([False, True, True])
+        test_aten_conv_backward_op_output_mask([False, True, False])
+        test_aten_conv_backward_op_output_mask([False, False, True])
+        test_aten_conv_backward_op_output_mask([False, False, False])
+
     @onlyXPU
     @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
     def test_channels_last_ouput_stride(self, device, dtype):
@@ -1255,16 +1371,235 @@ class TestConvolutionNNDeviceType(NNTestCase):
         weight = weight.to(memory_format=torch.channels_last)
         out = torch.conv2d(input, weight, None, (2, 2), (0, 0), (1, 1), 1)
 
-        if dtype is torch.float64:
-            # Like most conv backend, xpu does not support float64 for chanel last conv.
-            # input NHWC, output NCHW
-            assert_size_stride(out, (2, 512, 7, 7), (25088, 49, 7, 1))
-        else:
-            # input NHWC, output NHWC
-            assert_size_stride(out, (2, 512, 7, 7), (25088, 1, 3584, 512))
+        # input NHWC, output NHWC
+        assert_size_stride(out, (2, 512, 7, 7), (25088, 1, 3584, 512))
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    def test_conv_misaligned_input(self, device, dtype):
+        N, C, OUT_CHANNELS = 2, 3, 4
+
+        def make_misaligned_tensor(tensor, shape):
+            numel = math.prod(shape)
+            base = torch.empty(numel + 1, device=device, dtype=dtype)
+            tensor_device = base[1:].reshape(shape)
+            tensor_device.copy_(tensor.to(device))
+            self.assertTrue(tensor_device.data_ptr() % 64 != 0)
+            return tensor_device
+
+        for conv_fn, spatial in [
+            (F.conv1d, (16,)),
+            (F.conv2d, (8, 8)),
+            (F.conv3d, (4, 4, 4)),
+        ]:
+            kernel = (3,) * len(spatial)
+            input_shape = (N, C) + spatial
+            weight_shape = (OUT_CHANNELS, C) + kernel
+
+            input_cpu = torch.randn(input_shape, dtype=dtype)
+            weight_cpu = torch.randn(weight_shape, dtype=dtype)
+            bias_cpu = torch.randn(OUT_CHANNELS, dtype=dtype)
+
+            input_device = make_misaligned_tensor(input_cpu, input_shape)
+            weight_device = make_misaligned_tensor(weight_cpu, weight_shape)
+            bias_device = make_misaligned_tensor(bias_cpu, (OUT_CHANNELS,))
+
+            output_cpu = conv_fn(input_cpu, weight_cpu, bias_cpu)
+            output_device = conv_fn(input_device, weight_device, bias_device)
+            self.assertEqual(output_device.cpu(), output_cpu)
+
+    @onlyXPU
+    def test_onednn_allow_tf32_get_set(self):
+        with torch.backends.mkldnn.flags(
+            enabled=None, deterministic=None, allow_tf32=False
+        ):
+            self.assertFalse(torch.backends.mkldnn.allow_tf32)
+        with torch.backends.mkldnn.flags(
+            enabled=None, deterministic=None, allow_tf32=True
+        ):
+            self.assertTrue(torch.backends.mkldnn.allow_tf32)
+
+    @dtypes(torch.float)
+    def test_conv_cow_input(self, device, dtype):
+        # 1D
+        x1 = torch.randn(2, 4, 16, device=device, dtype=dtype)
+        w1 = torch.randn(8, 4, 3, device=device, dtype=dtype)
+        b1 = torch.randn(8, device=device, dtype=dtype)
+        x1_cow = torch._lazy_clone(x1)
+        w1_cow = torch._lazy_clone(w1)
+        b1_cow = torch._lazy_clone(b1)
+        x1_copy, w1_copy, b1_copy = x1_cow.clone(), w1_cow.clone(), b1_cow.clone()
+        F.conv1d(x1_cow, w1_cow, b1_cow)
+        self.assertTrue(torch._C._is_cow_tensor(x1_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w1_cow))
+        self.assertTrue(torch._C._is_cow_tensor(b1_cow))
+        self.assertEqual(x1_cow, x1_copy)
+        self.assertEqual(w1_cow, w1_copy)
+        self.assertEqual(b1_cow, b1_copy)
+
+        # 2D
+        x2 = torch.randn(2, 4, 8, 8, device=device, dtype=dtype)
+        w2 = torch.randn(8, 4, 3, 3, device=device, dtype=dtype)
+        b2 = torch.randn(8, device=device, dtype=dtype)
+        x2_cow = torch._lazy_clone(x2)
+        w2_cow = torch._lazy_clone(w2)
+        b2_cow = torch._lazy_clone(b2)
+        x2_copy, w2_copy, b2_copy = x2_cow.clone(), w2_cow.clone(), b2_cow.clone()
+        F.conv2d(x2_cow, w2_cow, b2_cow)
+        self.assertTrue(torch._C._is_cow_tensor(x2_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w2_cow))
+        self.assertTrue(torch._C._is_cow_tensor(b2_cow))
+        self.assertEqual(x2_cow, x2_copy)
+        self.assertEqual(w2_cow, w2_copy)
+        self.assertEqual(b2_cow, b2_copy)
+
+        # 3D
+        x3 = torch.randn(2, 4, 4, 8, 8, device=device, dtype=dtype)
+        w3 = torch.randn(8, 4, 3, 3, 3, device=device, dtype=dtype)
+        b3 = torch.randn(8, device=device, dtype=dtype)
+        x3_cow = torch._lazy_clone(x3)
+        w3_cow = torch._lazy_clone(w3)
+        b3_cow = torch._lazy_clone(b3)
+        x3_copy, w3_copy, b3_copy = x3_cow.clone(), w3_cow.clone(), b3_cow.clone()
+        F.conv3d(x3_cow, w3_cow, b3_cow)
+        self.assertTrue(torch._C._is_cow_tensor(x3_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w3_cow))
+        self.assertTrue(torch._C._is_cow_tensor(b3_cow))
+        self.assertEqual(x3_cow, x3_copy)
+        self.assertEqual(w3_cow, w3_copy)
+        self.assertEqual(b3_cow, b3_copy)
+
+        # Without bias
+        x2_nobias = torch._lazy_clone(x2)
+        w2_nobias = torch._lazy_clone(w2)
+        x2_nobias_copy, w2_nobias_copy = x2_nobias.clone(), w2_nobias.clone()
+        F.conv2d(x2_nobias, w2_nobias, None)
+        self.assertTrue(torch._C._is_cow_tensor(x2_nobias))
+        self.assertTrue(torch._C._is_cow_tensor(w2_nobias))
+        self.assertEqual(x2_nobias, x2_nobias_copy)
+        self.assertEqual(w2_nobias, w2_nobias_copy)
+
+    @dtypes(torch.float)
+    def test_conv_backward_cow_input(self, device, dtype):
+        grad = torch.randn(2, 8, 6, 6, device=device, dtype=dtype)
+        x = torch.randn(2, 4, 8, 8, device=device, dtype=dtype)
+        w = torch.randn(8, 4, 3, 3, device=device, dtype=dtype)
+        grad_cow = torch._lazy_clone(grad)
+        x_cow = torch._lazy_clone(x)
+        w_cow = torch._lazy_clone(w)
+        grad_copy, x_copy, w_copy = grad_cow.clone(), x_cow.clone(), w_cow.clone()
+        dx, dw, db = torch.ops.aten.convolution_backward(
+            grad_cow,
+            x_cow,
+            w_cow,
+            [8],
+            [1, 1],
+            [0, 0],
+            [1, 1],
+            False,
+            [0, 0],
+            1,
+            [True, True, True],
+        )
+        self.assertTrue(torch._C._is_cow_tensor(grad_cow))
+        self.assertTrue(torch._C._is_cow_tensor(x_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w_cow))
+        self.assertEqual(grad_cow, grad_copy)
+        self.assertEqual(x_cow, x_copy)
+        self.assertEqual(w_cow, w_copy)
+
+    @dtypes(torch.float)
+    def test_deconv_cow_input(self, device, dtype):
+        # 1D
+        x1 = torch.randn(2, 8, 16, device=device, dtype=dtype)
+        w1 = torch.randn(8, 4, 3, device=device, dtype=dtype)
+        b1 = torch.randn(4, device=device, dtype=dtype)
+        x1_cow = torch._lazy_clone(x1)
+        w1_cow = torch._lazy_clone(w1)
+        b1_cow = torch._lazy_clone(b1)
+        x1_copy, w1_copy, b1_copy = x1_cow.clone(), w1_cow.clone(), b1_cow.clone()
+        F.conv_transpose1d(x1_cow, w1_cow, b1_cow)
+        self.assertTrue(torch._C._is_cow_tensor(x1_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w1_cow))
+        self.assertTrue(torch._C._is_cow_tensor(b1_cow))
+        self.assertEqual(x1_cow, x1_copy)
+        self.assertEqual(w1_cow, w1_copy)
+        self.assertEqual(b1_cow, b1_copy)
+
+        # 2D
+        x2 = torch.randn(2, 8, 8, 8, device=device, dtype=dtype)
+        w2 = torch.randn(8, 4, 3, 3, device=device, dtype=dtype)
+        b2 = torch.randn(4, device=device, dtype=dtype)
+        x2_cow = torch._lazy_clone(x2)
+        w2_cow = torch._lazy_clone(w2)
+        b2_cow = torch._lazy_clone(b2)
+        x2_copy, w2_copy, b2_copy = x2_cow.clone(), w2_cow.clone(), b2_cow.clone()
+        F.conv_transpose2d(x2_cow, w2_cow, b2_cow)
+        self.assertTrue(torch._C._is_cow_tensor(x2_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w2_cow))
+        self.assertTrue(torch._C._is_cow_tensor(b2_cow))
+        self.assertEqual(x2_cow, x2_copy)
+        self.assertEqual(w2_cow, w2_copy)
+        self.assertEqual(b2_cow, b2_copy)
+
+        # 3D
+        x3 = torch.randn(2, 8, 4, 8, 8, device=device, dtype=dtype)
+        w3 = torch.randn(8, 4, 3, 3, 3, device=device, dtype=dtype)
+        b3 = torch.randn(4, device=device, dtype=dtype)
+        x3_cow = torch._lazy_clone(x3)
+        w3_cow = torch._lazy_clone(w3)
+        b3_cow = torch._lazy_clone(b3)
+        x3_copy, w3_copy, b3_copy = x3_cow.clone(), w3_cow.clone(), b3_cow.clone()
+        F.conv_transpose3d(x3_cow, w3_cow, b3_cow)
+        self.assertTrue(torch._C._is_cow_tensor(x3_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w3_cow))
+        self.assertTrue(torch._C._is_cow_tensor(b3_cow))
+        self.assertEqual(x3_cow, x3_copy)
+        self.assertEqual(w3_cow, w3_copy)
+        self.assertEqual(b3_cow, b3_copy)
+
+        # Without bias
+        x2_nobias = torch._lazy_clone(x2)
+        w2_nobias = torch._lazy_clone(w2)
+        x2_nobias_copy, w2_nobias_copy = x2_nobias.clone(), w2_nobias.clone()
+        F.conv_transpose2d(x2_nobias, w2_nobias, None)
+        self.assertTrue(torch._C._is_cow_tensor(x2_nobias))
+        self.assertTrue(torch._C._is_cow_tensor(w2_nobias))
+        self.assertEqual(x2_nobias, x2_nobias_copy)
+        self.assertEqual(w2_nobias, w2_nobias_copy)
+
+    @dtypes(torch.float)
+    def test_deconv_backward_cow_input(self, device, dtype):
+        grad = torch.randn(2, 4, 10, 10, device=device, dtype=dtype)
+        x = torch.randn(2, 8, 8, 8, device=device, dtype=dtype)
+        w = torch.randn(8, 4, 3, 3, device=device, dtype=dtype)
+        grad_cow = torch._lazy_clone(grad)
+        x_cow = torch._lazy_clone(x)
+        w_cow = torch._lazy_clone(w)
+        grad_copy, x_copy, w_copy = grad_cow.clone(), x_cow.clone(), w_cow.clone()
+        dx, dw, db = torch.ops.aten.convolution_backward(
+            grad_cow,
+            x_cow,
+            w_cow,
+            [4],
+            [1, 1],
+            [0, 0],
+            [1, 1],
+            True,
+            [0, 0],
+            1,
+            [True, True, True],
+        )
+        self.assertTrue(torch._C._is_cow_tensor(grad_cow))
+        self.assertTrue(torch._C._is_cow_tensor(x_cow))
+        self.assertTrue(torch._C._is_cow_tensor(w_cow))
+        self.assertEqual(grad_cow, grad_copy)
+        self.assertEqual(x_cow, x_copy)
+        self.assertEqual(w_cow, w_copy)
 
 
-instantiate_device_type_tests(TestConvolutionNNDeviceType, globals(), only_for="xpu")
+instantiate_device_type_tests(
+    TestConvolutionNNDeviceType, globals(), only_for="xpu", allow_xpu=True
+)
 
 if __name__ == "__main__":
     run_tests()

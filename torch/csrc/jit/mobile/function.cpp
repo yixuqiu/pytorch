@@ -2,23 +2,19 @@
 #include <torch/csrc/jit/mobile/function.h>
 #include <torch/csrc/jit/mobile/interpreter.h>
 #include <torch/csrc/jit/mobile/parse_bytecode.h>
-#include <torch/csrc/jit/mobile/parse_operators.h>
 #include <torch/csrc/jit/mobile/prim_ops_registery.h>
-#include <torch/csrc/jit/mobile/type_parser.h>
 #include <torch/csrc/jit/runtime/instruction.h>
 #include <torch/csrc/jit/runtime/operator.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
-char const* toString(OpCode op);
 namespace mobile {
 Function::Function(c10::QualifiedName name) : name_(std::move(name)) {}
 
 Function::Function(
     c10::QualifiedName name,
     Code code,
-    at::optional<c10::FunctionSchema> schema)
+    std::optional<c10::FunctionSchema> schema)
     : name_(std::move(name)),
       code_(std::move(code)),
       schema_(std::move(schema)) {}
@@ -27,7 +23,11 @@ const c10::QualifiedName& Function::qualname() const {
   return name_;
 }
 
-void Function::append_instruction(OpCode op, int X, int N, int64_t dbg_handle) {
+void Function::append_instruction(
+    OpCode op,
+    int64_t X,
+    int64_t N,
+    int64_t dbg_handle) {
   TORCH_CHECK(
       isOpSupportedInMobile(op),
       toString(op),
@@ -36,7 +36,7 @@ void Function::append_instruction(OpCode op, int X, int N, int64_t dbg_handle) {
   code_.debug_handles_.emplace_back(dbg_handle);
 }
 
-void Function::append_instruction(OpCode op, int X, int N) {
+void Function::append_instruction(OpCode op, int64_t X, int64_t N) {
   TORCH_CHECK(
       isOpSupportedInMobile(op),
       toString(op),
@@ -47,7 +47,7 @@ void Function::append_instruction(OpCode op, int X, int N) {
 void Function::append_operator(
     const std::string& name,
     const std::string& overload_name,
-    const c10::optional<int>& num_specified_args) {
+    const std::optional<int>& num_specified_args) {
   // Keep the original opname in code_
   code_.op_names_.emplace_back(name, overload_name);
   code_.operator_input_sizes_.emplace_back(num_specified_args.value_or(-1));
@@ -71,8 +71,8 @@ bool Function::initialize_operators(bool should_check_operators) {
   for (unsigned i = 0; i < code_.op_names_.size(); i++) {
     const auto& opname = code_.op_names_[i];
     int num_args = code_.operator_input_sizes_[i];
-    c10::optional<int> num_specified_args =
-        num_args < 0 ? c10::nullopt : c10::optional<int>(num_args);
+    std::optional<int> num_specified_args =
+        num_args < 0 ? std::nullopt : std::optional<int>(num_args);
     auto func = makeOperatorFunction(opname, num_specified_args);
     if (!func.has_value()) {
       unsupported_op_names.insert(operator_str(opname));
@@ -147,7 +147,9 @@ size_t Function::num_inputs() const {
   return schema_->arguments().size();
 }
 
-bool Function::call(Stack&, c10::function_ref<void(const mobile::Code&)> f) {
+bool Function::call(
+    Stack& /*unused*/,
+    c10::function_ref<void(const mobile::Code&)> f) {
   initialize_operators(true);
   f(code_);
   return true;
@@ -165,9 +167,9 @@ const std::vector<int64_t>& Function::getExceptionDebugHandles() const {
   return getInterpretersExceptionDebugHandles();
 }
 
-c10::optional<std::function<void(Stack&)>> makeOperatorFunction(
-    c10::OperatorName opname,
-    c10::optional<int> num_specified_args) {
+std::optional<std::function<void(Stack&)>> makeOperatorFunction(
+    const c10::OperatorName& opname,
+    std::optional<int> num_specified_args) {
   std::function<void(Stack&)> fn;
   const auto full_name = c10::toString(opname);
   const std::vector<c10::Argument>* pArgs = nullptr;
@@ -189,7 +191,7 @@ c10::optional<std::function<void(Stack&)>> makeOperatorFunction(
           TORCH_CHECK(false, "arguments are missing for operator ", opname);
         }
       } else {
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
   }
@@ -215,7 +217,7 @@ c10::optional<std::function<void(Stack&)>> makeOperatorFunction(
             static_cast<size_t>(num_specified_args.value()) >= out_args.size(),
             "The number of output arguments is: ",
             out_args.size(),
-            ", which is more then the number of specified arguments: ",
+            ", which is more than the number of specified arguments: ",
             num_specified_args.value());
         size_t start_index = num_specified_args.value() - out_args.size();
         for (size_t i = start_index; i < (args.size() - out_args.size()); ++i) {
@@ -246,12 +248,9 @@ Function& Function::registerFunc(
   static std::unordered_map<c10::QualifiedName, Function>
       upgrader_function_holder;
   c10::QualifiedName name = c10::QualifiedName(qualified_name);
-  auto found = upgrader_function_holder.find(name);
-  // Register the function if it's not found in the map.
-  if (found == upgrader_function_holder.end()) {
-    auto name_function_pair =
-        upgrader_function_holder.emplace(name, Function(name));
-    auto& func = name_function_pair.first->second;
+  auto [it, inserted] = upgrader_function_holder.try_emplace(name, name);
+  if (inserted) {
+    auto& func = it->second;
     for (auto const& inst : instructions) {
       func.append_instruction(inst.op, inst.X, inst.N);
     }
@@ -264,10 +263,8 @@ Function& Function::registerFunc(
     func.set_register_size(register_size);
     return func;
   }
-  auto& upgrader_function_in_holder = found->second;
-  return upgrader_function_in_holder;
+  return it->second;
 }
 
 } // namespace mobile
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

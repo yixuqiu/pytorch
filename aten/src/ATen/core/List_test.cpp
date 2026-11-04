@@ -1,9 +1,100 @@
 #include <ATen/core/List.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <version>
+
 using namespace c10;
 
-// NOLINTBEGIN(performance-move-const-arg, bugprone-use-after-move)
+namespace {
+// Ts cover the three shapes ListElementReference's conversion takes.
+template <class T>
+using ListIter =
+    c10::impl::ListIterator<T, c10::detail::ListImpl::list_type::iterator>;
+
+template <class... Ts>
+constexpr bool list_iterators_conform =
+    ((std::random_access_iterator<ListIter<Ts>> &&
+      std::indirectly_writable<ListIter<Ts>, Ts> &&
+      std::permutable<ListIter<Ts>>) &&
+     ...);
+
+static_assert(list_iterators_conform<
+              c10::IValue,
+              int64_t,
+              at::Tensor,
+              std::optional<std::string>>);
+
+template <class T>
+using ListMoveIter = std::move_iterator<ListIter<T>>;
+
+template <class... Ts>
+constexpr bool list_move_iterator_refs_conform =
+    ((std::same_as<std::iter_rvalue_reference_t<ListIter<Ts>>, Ts> &&
+      std::same_as<std::iter_reference_t<ListMoveIter<Ts>>, Ts>) &&
+     ...);
+
+static_assert(list_move_iterator_refs_conform<
+              c10::IValue,
+              int64_t,
+              at::Tensor,
+              std::optional<std::string>>);
+
+#if defined(__cpp_lib_move_iterator_concept) && \
+    __cpp_lib_move_iterator_concept >= 202207L
+template <class... Ts>
+constexpr bool list_move_iterators_are_random_access =
+    (std::random_access_iterator<ListMoveIter<Ts>> && ...);
+
+static_assert(list_move_iterators_are_random_access<
+              c10::IValue,
+              int64_t,
+              at::Tensor,
+              std::optional<std::string>>);
+#endif
+
+// The plain ListIter random_access_iterator check above passes via a stdlib
+// fallback on libstdc++/libc++ even without the specialization; this instantiates
+// basic_common_reference's ::type directly so removing it fails to compile.
+template <class T>
+using ListRef =
+    c10::impl::ListElementReference<T, c10::detail::ListImpl::list_type::iterator>;
+
+template <class... Ts>
+constexpr bool list_element_reference_has_basic_common_reference =
+    ((std::is_same_v<
+          typename std::basic_common_reference<
+              Ts,
+              ListRef<Ts>,
+              std::type_identity_t,
+              std::type_identity_t>::type,
+          Ts> &&
+      std::is_same_v<
+          typename std::basic_common_reference<
+              ListRef<Ts>,
+              Ts,
+              std::type_identity_t,
+              std::type_identity_t>::type,
+          Ts>) &&
+     ...);
+
+static_assert(list_element_reference_has_basic_common_reference<
+              c10::IValue,
+              int64_t,
+              at::Tensor,
+              std::optional<std::string>>);
+} // namespace
+
+using std::string;
+
+// TODO(NS): Remove me
+// For some reason emplace tests in this file fails to compile with C++20 with the following warning
+// aten/src/ATen/core/ivalue.h:240:3: error: array subscript 0 is outside array bounds of 'c10::IValue [0]'
+#if defined(__GNUC__) && __GNUC__ == 13
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
+
+// NOLINTBEGIN(performance-move-const-arg, bugprone-use-after-move, *analyzer*Move)
 TEST(ListTestIValueBasedList, givenEmptyList_whenCallingEmpty_thenReturnsTrue) {
     List<string> list;
     EXPECT_TRUE(list.empty());
@@ -38,7 +129,6 @@ TEST(ListTestIValueBasedList, whenCallingGetWithExistingPosition_thenReturnsElem
 
 TEST(ListTestIValueBasedList, whenCallingGetWithNonExistingPosition_thenThrowsException) {
   List<string> list({"3", "4"});
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list.get(2), std::out_of_range);
 }
 
@@ -56,7 +146,6 @@ TEST(ListTestIValueBasedList, whenCallingExtractWithExistingPosition_thenListEle
 
 TEST(ListTestIValueBasedList, whenCallingExtractWithNonExistingPosition_thenThrowsException) {
   List<string> list({"3", "4"});
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list.extract(2), std::out_of_range);
 }
 
@@ -79,14 +168,12 @@ TEST(ListTestIValueBasedList, whenCallingMovingSetWithExistingPosition_thenChang
 TEST(ListTestIValueBasedList, whenCallingCopyingSetWithNonExistingPosition_thenThrowsException) {
   List<string> list({"3", "4"});
   string value = "5";
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list.set(2, value), std::out_of_range);
 }
 
 TEST(ListTestIValueBasedList, whenCallingMovingSetWithNonExistingPosition_thenThrowsException) {
   List<string> list({"3", "4"});
   string value = "5";
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list.set(2, std::move(value)), std::out_of_range);
 }
 
@@ -122,7 +209,6 @@ TEST(ListTestIValueBasedList, whenSwappingFromAccessOperator_thenSwapsElements) 
 
 TEST(ListTestIValueBasedList, whenCallingAccessOperatorWithNonExistingPosition_thenThrowsException) {
   List<string> list({"3", "4"});
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list[2], std::out_of_range);
 }
 
@@ -526,6 +612,27 @@ TEST(ListTestIValueBasedList, isReferenceType) {
   EXPECT_EQ(1, list3.size());
 }
 
+TEST(ListTestIValueBasedList, useCountCountsSharedStorage) {
+  List<string> list;
+  EXPECT_EQ(1, list.use_count());
+  {
+    // A second owner, not a reference: use_count checks two distinct handles.
+    // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
+    List<string> shared = list;
+    EXPECT_EQ(2, list.use_count());
+    EXPECT_EQ(2, shared.use_count());
+
+    // copy() takes a separate storage, so neither side gains a reference.
+    List<string> copied = list.copy();
+    EXPECT_EQ(2, list.use_count());
+    EXPECT_EQ(1, copied.use_count());
+  }
+  EXPECT_EQ(1, list.use_count());
+
+  list.push_back("three");
+  EXPECT_EQ(1, list.use_count());
+}
+
 TEST(ListTestIValueBasedList, copyHasSeparateStorage) {
   List<string> list1;
   List<string> list2(list1.copy());
@@ -586,7 +693,6 @@ TEST(ListTestNonIValueBasedList, whenCallingGetWithExistingPosition_thenReturnsE
 
 TEST(ListTestNonIValueBasedList, whenCallingGetWithNonExistingPosition_thenThrowsException) {
   List<int64_t> list({3, 4});
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list.get(2), std::out_of_range);
 }
 
@@ -598,7 +704,6 @@ TEST(ListTestNonIValueBasedList, whenCallingExtractWithExistingPosition_thenRetu
 
 TEST(ListTestNonIValueBasedList, whenCallingExtractWithNonExistingPosition_thenThrowsException) {
   List<int64_t> list({3, 4});
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list.extract(2), std::out_of_range);
 }
 
@@ -622,14 +727,12 @@ TEST(ListTestNonIValueBasedList, whenCallingMovingSetWithExistingPosition_thenCh
 TEST(ListTestNonIValueBasedList, whenCallingCopyingSetWithNonExistingPosition_thenThrowsException) {
   List<int64_t> list({3, 4});
   int64_t value = 5;
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list.set(2, value), std::out_of_range);
 }
 
 TEST(ListTestNonIValueBasedList, whenCallingMovingSetWithNonExistingPosition_thenThrowsException) {
   List<int64_t> list({3, 4});
   int64_t value = 5;
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,performance-move-const-arg,hicpp-avoid-goto)
   EXPECT_THROW(list.set(2, std::move(value)), std::out_of_range);
 }
 
@@ -665,7 +768,6 @@ TEST(ListTestNonIValueBasedList, whenSwappingFromAccessOperator_thenSwapsElement
 
 TEST(ListTestNonIValueBasedList, whenCallingAccessOperatorWithNonExistingPosition_thenThrowsException) {
   List<int64_t> list({3, 4});
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   EXPECT_THROW(list[2], std::out_of_range);
 }
 
@@ -1074,6 +1176,41 @@ TEST(ListTestNonIValueBasedList, isReferenceType) {
   EXPECT_EQ(1, list3.size());
 }
 
+TEST(ListTestNonIValueBasedList, useCountCountsSharedStorage) {
+  List<int64_t> list;
+  EXPECT_EQ(1, list.use_count());
+  {
+    // A second owner, not a reference: use_count checks two distinct handles.
+    // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
+    List<int64_t> shared = list;
+    EXPECT_EQ(2, list.use_count());
+    EXPECT_EQ(2, shared.use_count());
+
+    // copy() takes a separate storage, so neither side gains a reference.
+    List<int64_t> copied = list.copy();
+    EXPECT_EQ(2, list.use_count());
+    EXPECT_EQ(1, copied.use_count());
+  }
+  EXPECT_EQ(1, list.use_count());
+
+  list.push_back(3);
+  EXPECT_EQ(1, list.use_count());
+}
+
+TEST(ListTestNonIValueBasedList, emplaceConvertsToTheElementType) {
+  // The argument names an IValue overload of its own; emplace has to build the
+  // element type first, or the list holds a value elementType() disagrees with
+  // and reading it back fails.
+  List<double> list({1.5});
+  list.emplace(list.begin(), 1);
+  list.emplace_back(2);
+
+  EXPECT_EQ(3, list.size());
+  EXPECT_DOUBLE_EQ(1.0, list.get(0));
+  EXPECT_DOUBLE_EQ(1.5, list.get(1));
+  EXPECT_DOUBLE_EQ(2.0, list.get(2));
+}
+
 TEST(ListTestNonIValueBasedList, copyHasSeparateStorage) {
   List<int64_t> list1;
   List<int64_t> list2(list1.copy());
@@ -1126,19 +1263,28 @@ TEST(ListTest, canAccessStringByReference) {
   EXPECT_EQ("two", strRef);
 }
 
+TEST(ListTest, rangesMoveTransfersElements) {
+  List<std::string> source({"one", "two"});
+  std::vector<std::string> destination;
+
+  std::ranges::move(source, std::back_inserter(destination));
+
+  EXPECT_EQ((std::vector<std::string>{"one", "two"}), destination);
+}
+
 TEST(ListTest, canAccessOptionalStringByReference) {
-  List<c10::optional<std::string>> list({"one", "two", c10::nullopt});
+  List<std::optional<std::string>> list({"one", "two", std::nullopt});
   const auto& listRef = list;
   static_assert(
-      std::is_same_v<decltype(listRef[1]), c10::optional<std::reference_wrapper<const std::string>>>,
-      "List<c10::optional<std::string>> access should be by const reference");
-  c10::optional<std::string> str1 = list[1];
-  c10::optional<std::string> str2 = list[2];
-  decltype(auto) strRef1 = listRef[1];
-  decltype(auto) strRef2 = listRef[2];
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-  EXPECT_EQ("two", str1.value());
+      std::is_same_v<decltype(listRef[1]), std::optional<std::reference_wrapper<const std::string>>>,
+      "List<std::optional<std::string>> access should be by const reference");
+  std::optional<std::string> str1 = list[1];
+  std::optional<std::string> str2 = list[2];
+  auto const& strRef1 = listRef[1];
+  auto const& strRef2 = listRef[2];
+  EXPECT_EQ("two", str1);
   EXPECT_FALSE(str2.has_value());
+  EXPECT_TRUE(strRef1.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ("two", strRef1.value().get());
   EXPECT_FALSE(strRef2.has_value());
@@ -1162,4 +1308,4 @@ TEST(ListTest, toTypedList) {
   genericList = impl::toList(std::move(stringList));
   EXPECT_THROW(c10::impl::toTypedList<int64_t>(std::move(genericList)), c10::Error);
 }
-// NOLINTEND(performance-move-const-arg, bugprone-use-after-move)
+// NOLINTEND(performance-move-const-arg, bugprone-use-after-move, *analyzer*Move)

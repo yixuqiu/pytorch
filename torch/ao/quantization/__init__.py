@@ -1,27 +1,29 @@
-# flake8: noqa: F403
+# mypy: allow-untyped-defs
+
+import sys
+from collections.abc import Callable
+from typing_extensions import TypeAliasType
+
+import torch
+from torch import Tensor
 
 from .fake_quantize import *  # noqa: F403
-from .fuse_modules import fuse_modules  # noqa: F403
-from .fuse_modules import fuse_modules_qat  # noqa: F403
+from .fuse_modules import fuse_modules, fuse_modules_qat
 from .fuser_method_mappings import *  # noqa: F403
 from .observer import *  # noqa: F403
 from .qconfig import *  # noqa: F403
 from .qconfig_mapping import *  # noqa: F403
 from .quant_type import *  # noqa: F403
-from .quantization_mappings import *  # type: ignore[no-redef]
+from .quantization_mappings import *  # noqa: F403 # type: ignore[no-redef]
 from .quantize import *  # noqa: F403
-from .quantize_jit import *  # noqa: F403
 from .stubs import *  # noqa: F403
-from .pt2e.export_utils import _move_exported_model_to_eval as move_exported_model_to_eval
-from .pt2e.export_utils import _move_exported_model_to_train as move_exported_model_to_train
-from .pt2e.export_utils import _allow_exported_model_train_eval as allow_exported_model_train_eval
-from .pt2e.generate_numeric_debug_handle import generate_numeric_debug_handle  # noqa: F401
-from typing import Union, List, Callable, Tuple, Optional
-from torch import Tensor
-import torch
 
-ObserverOrFakeQuantize = Union[ObserverBase, FakeQuantizeBase]
-ObserverOrFakeQuantize.__module__ = "torch.ao.quantization"
+
+# ensure __module__ is set correctly for public APIs
+ObserverOrFakeQuantize = TypeAliasType(
+    "ObserverOrFakeQuantize", ObserverBase | FakeQuantizeBase
+)
+
 
 __all__ = [
     "DeQuantStub",
@@ -31,6 +33,7 @@ __all__ = [
     "FixedQParamsObserver",
     "FusedMovingAvgObsFakeQuantize",
     "HistogramObserver",
+    # pyrefly: ignore [bad-dunder-all]
     "MatchAllNode",
     "MinMaxObserver",
     "MovingAverageMinMaxObserver",
@@ -38,6 +41,7 @@ __all__ = [
     "NoopObserver",
     "ObserverBase",
     "ObserverOrFakeQuantize",
+    # pyrefly: ignore [bad-dunder-all]
     "Pattern",
     "PerChannelMinMaxObserver",
     "PlaceholderObserver",
@@ -53,8 +57,6 @@ __all__ = [
     "UniformQuantizationObserverBase",
     "add_quant_dequant",
     "convert",
-    "convert_dynamic_jit",
-    "convert_jit",
     "default_affine_fixed_qparams_fake_quant",
     "default_affine_fixed_qparams_observer",
     "default_debug_observer",
@@ -89,7 +91,6 @@ __all__ = [
     "enable_fake_quant",
     "enable_observer",
     "fuse_conv_bn",
-    "fuse_conv_bn_jit",
     "fuse_conv_bn_relu",
     "fuse_convtranspose_bn",
     "fuse_linear_bn",
@@ -97,6 +98,7 @@ __all__ = [
     "fuse_modules_qat",
     "fused_per_channel_wt_fake_quant_range_neg_127_to_127",
     "fused_wt_fake_quant_range_neg_127_to_127",
+    # pyrefly: ignore [bad-dunder-all]
     "get_combined_dict",
     "get_default_compare_output_module_list",
     "get_default_custom_config_dict",
@@ -123,28 +125,33 @@ __all__ = [
     "get_quantized_operator",
     "get_static_quant_module_class",
     "load_observer_state_dict",
-    "move_exported_model_to_eval",
-    "move_exported_model_to_train",
-    "allow_exported_model_train_eval",
     "no_observer_set",
     "per_channel_weight_observer_range_neg_127_to_127",
     "prepare",
-    "prepare_dynamic_jit",
-    "prepare_jit",
     "prepare_qat",
     "propagate_qconfig_",
     "qconfig_equals",
     "quantize",
     "quantize_dynamic",
-    "quantize_dynamic_jit",
-    "quantize_jit",
     "quantize_qat",
-    "script_qconfig",
-    "script_qconfig_dict",
     "swap_module",
     "weight_observer_range_neg_127_to_127",
-    "generate_numeric_debug_handle",
+    # from torchao, should be merged with torchao
+    # in the future
+    "AffineQuantizedObserverBase",
+    "Granularity",
+    "MappingType",
+    "PerAxis",
+    "PerBlock",
+    "PerGroup",
+    "PerRow",
+    "PerTensor",
+    "PerToken",
+    "TorchAODType",
+    "ZeroPointDomain",
+    "get_block_size",
 ]
+
 
 def default_eval_fn(model, calib_data):
     r"""Define the default evaluation function.
@@ -152,8 +159,9 @@ def default_eval_fn(model, calib_data):
     Default evaluation function takes a torch.utils.data.Dataset or a list of
     input Tensors and run the model on the dataset
     """
-    for data, target in calib_data:
+    for data, _target in calib_data:
         model(data)
+
 
 class _DerivedObserverOrFakeQuantize(ObserverBase):
     r"""This observer is used to describe an observer whose quantization parameters
@@ -163,12 +171,14 @@ class _DerivedObserverOrFakeQuantize(ObserverBase):
     def __init__(
         self,
         dtype: torch.dtype,
-        obs_or_fqs: List[ObserverOrFakeQuantize],
-        derive_qparams_fn: Callable[[List[ObserverOrFakeQuantize]], Tuple[Tensor, Tensor]],
-        quant_min: Optional[int]=None,
-        quant_max: Optional[int]=None,
-        qscheme: Optional[torch.qscheme]=None,
-        ch_axis: Optional[int] = None
+        obs_or_fqs: list[ObserverOrFakeQuantize],
+        derive_qparams_fn: Callable[
+            [list[ObserverOrFakeQuantize]], tuple[Tensor, Tensor]
+        ],
+        quant_min: int | None = None,
+        quant_max: int | None = None,
+        qscheme: torch.qscheme | None = None,
+        ch_axis: int | None = None,
     ):
         super().__init__(dtype)
         self.obs_or_fqs = obs_or_fqs
@@ -179,11 +189,15 @@ class _DerivedObserverOrFakeQuantize(ObserverBase):
         self.ch_axis = ch_axis
 
         from .utils import is_per_channel
+
         if is_per_channel(self.qscheme):
-            assert self.ch_axis is not None, "Must provide a valid ch_axis if qscheme is per channel"
+            if self.ch_axis is None:
+                raise AssertionError(
+                    "Must provide a valid ch_axis if qscheme is per channel"
+                )
 
     def forward(self, x: Tensor) -> Tensor:
         return x
 
-    def calculate_qparams(self):
+    def calculate_qparams(self):  # type:ignore[override]
         return self.derive_qparams_fn(self.obs_or_fqs)

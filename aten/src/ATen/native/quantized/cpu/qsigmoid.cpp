@@ -20,8 +20,7 @@
 #include <algorithm>
 #include <utility>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 DEFINE_DISPATCH(qsigmoid_stub);
 
@@ -75,9 +74,9 @@ static Tensor qnnpack_sigmoid(
   const pytorch_qnnp_status setupStatus = pytorch_qnnp_setup_sigmoid_nc_q8(
     sigmoid_op,
     input_contig.size(0) /* batch size */,
-    (uint8_t*)input_contig.data_ptr<c10::quint8>() /* input data */,
+    (uint8_t*)input_contig.const_data_ptr<c10::quint8>() /* input data */,
     num_elems /* input stride */,
-    (uint8_t*)qy.data_ptr<c10::quint8>() /* output data */,
+    reinterpret_cast<uint8_t*>(qy.mutable_data_ptr<c10::quint8>()) /* output data */,
     num_elems /* output stride */);
   TORCH_INTERNAL_ASSERT(setupStatus == pytorch_qnnp_status_success,
                         "failed to setup QNNPACK sigmoid operator");
@@ -116,7 +115,6 @@ Tensor sigmoid_quantized_cpu(const Tensor& qx) {
     // optimizations
     double output_scale = 0.00390625;  // 1.0 / 2^8
     int64_t output_zero_point = 0;
-    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     if (SCALAR_TYPE == at::kQInt32) {
       output_scale = 2.3283064365386963e-10;  // 1.0 / 2^32
     } else if (SCALAR_TYPE == at::kQInt8) {
@@ -149,4 +147,4 @@ TORCH_LIBRARY_IMPL(quantized, QuantizedCPU, m) {
 }
 } // namespace
 
-}}  // namespace at::native
+}  // namespace at::native

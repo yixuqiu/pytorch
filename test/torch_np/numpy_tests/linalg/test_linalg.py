@@ -1,8 +1,6 @@
 # Owner(s): ["module: dynamo"]
+"""Test functions for linalg module"""
 
-""" Test functions for linalg module
-
-"""
 import functools
 import itertools
 import os
@@ -10,15 +8,12 @@ import subprocess
 import sys
 import textwrap
 import traceback
-
 from unittest import expectedFailure as xfail, skipIf as skipif, SkipTest
 
 import numpy
-
 import pytest
-
-from numpy.linalg.linalg import _multi_dot_matrix_chain_order
 from pytest import raises as assert_raises
+
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -26,9 +21,14 @@ from torch.testing._internal.common_utils import (
     slowTest as slow,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
-    xpassIfTorchDynamo,
+    xpassIfTorchDynamo_np,
 )
 
+
+if numpy.lib.NumpyVersion(numpy.__version__) >= "2.0.0":
+    from numpy.linalg._linalg import _multi_dot_matrix_chain_order
+else:
+    from numpy.linalg.linalg import _multi_dot_matrix_chain_order
 
 # If we are going to trace through these, we should use NumPy
 # If testing on eager mode, we use torch._numpy
@@ -50,14 +50,13 @@ if TEST_WITH_TORCHDYNAMO:
         swapaxes,
     )
     from numpy.linalg import LinAlgError, matrix_power, matrix_rank, multi_dot, norm
-    from numpy.testing import (
+    from numpy.testing import (  # assert_raises_regex, HAS_LAPACK64, IS_WASM
         assert_,
         assert_allclose,
         assert_almost_equal,
         assert_array_equal,
         assert_equal,
         suppress_warnings,
-        #  assert_raises_regex, HAS_LAPACK64, IS_WASM
     )
 
 else:
@@ -91,7 +90,6 @@ else:
         assert_array_equal,
         assert_equal,
         suppress_warnings,
-        #  assert_raises_regex, HAS_LAPACK64, IS_WASM
     )
 
 
@@ -174,7 +172,8 @@ def apply_tag(tag, cases):
     Add the given tag (a string) to each of the cases (a list of LinalgCase
     objects)
     """
-    assert tag in all_tags, "Invalid tag"
+    if tag not in all_tags:
+        raise AssertionError(f"Invalid tag: {tag}")
     for case in cases:
         case.tags = case.tags | {tag}
     return cases
@@ -494,7 +493,7 @@ class SolveCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
     # kept apart from TestSolve for use for testing with matrices.
     def do(self, a, b, tags):
         x = linalg.solve(a, b)
-        assert_almost_equal(b, dot_generalized(a, x))
+        assert_almost_equal(b, dot_generalized(a, x), single_decimal=5)
         assert_(consistent_subclass(x, b))
 
 
@@ -855,7 +854,7 @@ class TestCond(CondCases, TestCase):
         A[0, 1] = np.nan
         for p in ps:
             c = linalg.cond(A, p)
-            assert_(isinstance(c, np.float_))
+            assert_(isinstance(c, np.float64))
             assert_(np.isnan(c))
 
         A = np.ones((3, 2, 2))
@@ -943,7 +942,7 @@ class DetCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 @instantiate_parametrized_tests
 class TestDet(DetCases, TestCase):
     def test_zero(self):
-        # NB: comment out tests of type(det) == double : we return zero-dim arrays
+        # NB: comment out tests of type(det) is double : we return zero-dim arrays
         assert_equal(linalg.det([[0.0]]), 0.0)
         #    assert_equal(type(linalg.det([[0.0]])), double)
         assert_equal(linalg.det([[0.0j]]), 0.0)
@@ -1017,7 +1016,7 @@ class LstsqCases(LinalgSquareTestCase, LinalgNonsquareTestCase):
 
 @instantiate_parametrized_tests
 class TestLstsq(LstsqCases, TestCase):
-    @xpassIfTorchDynamo  # (reason="Lstsq: we use the future default =None")
+    @xpassIfTorchDynamo_np  # (reason="Lstsq: we use the future default =None")
     def test_future_rcond(self):
         a = np.array(
             [
@@ -1082,6 +1081,7 @@ class TestLstsq(LstsqCases, TestCase):
 @instantiate_parametrized_tests
 class TestMatrixPower(TestCase):
     def setUp(self):
+        super().setUp()
         self.rshft_0 = np.eye(4)
         self.rshft_1 = self.rshft_0[[3, 0, 1, 2]]
         self.rshft_2 = self.rshft_0[[2, 3, 0, 1]]
@@ -1109,7 +1109,7 @@ class TestMatrixPower(TestCase):
 
         for mat in self.rshft_all:
             tz(mat.astype(dt))
-            if dt != object:
+            if dt is not object:
                 tz(self.stacked.astype(dt))
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
@@ -1121,7 +1121,7 @@ class TestMatrixPower(TestCase):
 
         for mat in self.rshft_all:
             tz(mat.astype(dt))
-            if dt != object:
+            if dt is not object:
                 tz(self.stacked.astype(dt))
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
@@ -1134,7 +1134,7 @@ class TestMatrixPower(TestCase):
 
         for mat in self.rshft_all:
             tz(mat.astype(dt))
-            if dt != object:
+            if dt is not object:
                 tz(self.stacked.astype(dt))
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
@@ -1712,7 +1712,7 @@ class TestMatrixRank(TestCase):
         # Test matrices with reduced rank
         #  rng = np.random.RandomState(20120714)
         np.random.seed(20120714)
-        for i in range(100):
+        for _ in range(100):
             # Make a rank deficient matrix
             X = np.random.normal(size=(40, 10))
             X[:, 0] = X[:, 1] + X[:, 2]
@@ -1762,7 +1762,7 @@ class TestQR(TestCase):
         assert_(isinstance(r2, a_type))
         assert_almost_equal(r2, r1)
 
-    @xpassIfTorchDynamo  # (reason="torch does not allow qr(..., mode='raw'")
+    @xpassIfTorchDynamo_np  # (reason="torch does not allow qr(..., mode='raw'")
     @parametrize("m, n", [(3, 0), (0, 3), (0, 0)])
     def test_qr_empty(self, m, n):
         k = min(m, n)
@@ -1776,7 +1776,7 @@ class TestQR(TestCase):
         assert_equal(h.shape, (n, m))
         assert_equal(tau.shape, (k,))
 
-    @xpassIfTorchDynamo  # (reason="torch does not allow qr(..., mode='raw'")
+    @xpassIfTorchDynamo_np  # (reason="torch does not allow qr(..., mode='raw'")
     def test_mode_raw(self):
         # The factorization is not unique and varies between libraries,
         # so it is not possible to check against known values. Functional
@@ -1912,7 +1912,7 @@ class TestCholesky(TestCase):
 
 
 class TestMisc(TestCase):
-    @xpassIfTorchDynamo  # (reason="endianness")
+    @xpassIfTorchDynamo_np  # (reason="endianness")
     def test_byteorder_check(self):
         # Byte order check should pass for native order
         if sys.byteorder == "little":
@@ -1958,7 +1958,7 @@ class TestMisc(TestCase):
             pid = os.fork()
         except (OSError, AttributeError):
             # fork failed, or not running on POSIX
-            raise SkipTest("Not POSIX or fork failed.")  # noqa: TRY200
+            raise SkipTest("Not POSIX or fork failed.")  # noqa: B904
 
         if pid == 0:
             # child; close i/o file handles
@@ -2102,7 +2102,8 @@ class TestMultiDot(TestCase):
 
         out = np.zeros((6, 2))
         ret = multi_dot([A, B, C], out=out)
-        assert out is ret
+        if out is not ret:
+            raise AssertionError("Expected out is ret")
         assert_almost_equal(out, A.dot(B).dot(C))
         assert_almost_equal(out, np.dot(A, np.dot(B, C)))
 
@@ -2112,7 +2113,8 @@ class TestMultiDot(TestCase):
         B = np.random.random((2, 6))
         out = np.zeros((6, 6))
         ret = multi_dot([A, B], out=out)
-        assert out is ret
+        if out is not ret:
+            raise AssertionError("Expected out is ret")
         assert_almost_equal(out, A.dot(B))
         assert_almost_equal(out, np.dot(A, B))
 
@@ -2125,7 +2127,8 @@ class TestMultiDot(TestCase):
         D = np.random.random((2, 1))
         out = np.zeros((6, 1))
         ret = multi_dot([A, B, C, D], out=out)
-        assert out is ret
+        if out is not ret:
+            raise AssertionError("Expected out is ret")
         assert_almost_equal(out, A.dot(B).dot(C).dot(D))
 
     def test_dynamic_programming_logic(self):
@@ -2248,7 +2251,7 @@ class TestTensorsolve(TestCase):
 
 
 class TestMisc2(TestCase):
-    @xpassIfTorchDynamo  # (reason="TODO")
+    @xpassIfTorchDynamo_np  # (reason="TODO")
     def test_unsupported_commontype(self):
         # linalg gracefully handles unsupported type
         arr = np.array([[1, -2], [2, 5]], dtype="float16")

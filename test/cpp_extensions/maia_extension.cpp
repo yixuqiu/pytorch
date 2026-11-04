@@ -20,8 +20,8 @@ Tensor get_tensor(caffe2::TypeMeta dtype, IntArrayRef size) {
   return Tensor(std::move(tensor_impl));
 }
 
-Tensor empty_override(IntArrayRef size, c10::optional<ScalarType> dtype, c10::optional<Layout> layout, c10::optional<Device> device,
-                      c10::optional<bool> pin_memory, c10::optional<c10::MemoryFormat> optional_memory_format) {
+Tensor empty_override(IntArrayRef size, std::optional<ScalarType> dtype, std::optional<Layout> layout, std::optional<Device> device,
+                      std::optional<bool> pin_memory, std::optional<c10::MemoryFormat> optional_memory_format) {
   test_int = 0;
   return get_tensor(scalarTypeToTypeMeta(dtype_or_default(dtype)), size);
 }
@@ -32,7 +32,7 @@ Tensor& add_out_override(const Tensor & a, const Tensor & b , const Scalar& c, T
 }
 
 Tensor fake_convolution(
-    const Tensor& input, const Tensor& weight, const c10::optional<Tensor>& bias,
+    const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
     IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation,
     bool transposed, IntArrayRef output_padding, int64_t groups) {
   test_int = 2;
@@ -52,11 +52,28 @@ std::tuple<Tensor,Tensor,Tensor> fake_convolution_backward(
             get_tensor(input.dtype(), {}));
 }
 
+at::Tensor maia_to_dtype_override(
+  const at::Tensor & self, at::ScalarType dtype, bool non_blocking,
+  bool copy, ::std::optional<at::MemoryFormat> memory_format
+) {
+  return get_tensor(scalarTypeToTypeMeta(dtype), self.sizes());
+}
+
+at::Tensor maia_matmul_override(const at::Tensor & self, const at::Tensor & other) {
+  AT_ASSERT(self.dim() == 2);
+  AT_ASSERT(other.dim() == 2);
+  AT_ASSERT(self.dtype() == other.dtype());
+  AT_ASSERT(self.device() == other.device());
+  return get_tensor(self.dtype(), {self.size(0), other.size(1)});
+}
+
 TORCH_LIBRARY_IMPL(aten, MAIA, m) {
   m.impl("empty.memory_format",                empty_override);
   m.impl("add.out",                            add_out_override);
   m.impl("convolution_overrideable",           fake_convolution);
   m.impl("convolution_backward_overrideable",  fake_convolution_backward);
+  m.impl("to.dtype",                           maia_to_dtype_override);
+  m.impl("matmul",                             maia_matmul_override);
 }
 
 // TODO: Extend this to exercise multi-device setting.  In that case,

@@ -6,6 +6,7 @@
 #include <ATen/native/TriangularOpsUtils.h>
 #include <ATen/TensorSubclassLikeUtils.h>
 #include <c10/util/irange.h>
+#include <c10/util/Exception.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -52,16 +53,17 @@ void apply_triu_tril_single(
     int64_t self_col_stride,
     bool upper) {
   constexpr int64_t zero = 0;
+  k = std::clamp(k, -n, m); // Clamp k to [-n, m] to prevent i + k arithmetic overflow, especially if k approaches INT64_MAX/INT64_MIN.
 
   if (upper) {
     parallel_for(0, n, 0, [&](int64_t start, int64_t end) {
       for (int64_t i : c10::irange(start, end)) {
-        for (int64_t j = 0; j < std::min(m, i + k); j++) {
+        for (const auto j : c10::irange(std::min(m, i + k))) {
           result[i * res_row_stride + j * res_col_stride] = static_cast<scalar_t>(0);
         }
         if (!inplace) {  // copy the rest of the self if not inplace
           for (int64_t j = std::max(zero, i + k); j < m; j++) {
-            result[i * res_row_stride + j * res_col_stride] = self[i * self_row_stride + j * self_col_stride];
+            result[i * res_row_stride + j * res_col_stride] = c10::load(&self[i * self_row_stride + j * self_col_stride]);
           }
         }
       }
@@ -73,8 +75,8 @@ void apply_triu_tril_single(
           result[i * res_row_stride + j * res_col_stride] = static_cast<scalar_t>(0);
         }
         if (!inplace) {  // copy the rest of the self if not inplace
-          for (int64_t j = zero; j < std::min(m, i + k + 1); j++) {
-            result[i * res_row_stride + j * res_col_stride] = self[i * self_row_stride + j * self_col_stride];
+          for (const auto j : c10::irange(zero, std::min(m, i + k + 1))) {
+            result[i * res_row_stride + j * res_col_stride] = c10::load(&self[i * self_row_stride + j * self_col_stride]);
           }
         }
       }
@@ -93,8 +95,7 @@ void apply_triu_tril(const Tensor& result, const Tensor& self, bool inplace, int
   auto self_col_stride = self.stride(-1);
 
   auto result_data = result.data_ptr<scalar_t>();
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  int64_t result_stride, result_row_stride, result_col_stride;
+  int64_t result_stride = 0, result_row_stride = 0, result_col_stride = 0;
   if (result_data != self_data) {
     result_stride = (result.dim() > 2 && result.stride(-3) > 0) ? result.stride(-3) : 1;
     result_row_stride = result.stride(-2);
@@ -180,17 +181,14 @@ TORCH_IMPL_FUNC(triu_cpu)(const Tensor& self, int64_t k, const Tensor &result) {
   compute_triu_tril<UpperTriangle>(self, k, result);
 }
 
-static Tensor trace_backward(const Tensor& grad, at::IntArrayRef sizes) {
-    return at::native::trace_backward_symint(grad, c10::fromIntArrayRefSlow(sizes));
-}
-
 Tensor trace_backward_symint(const Tensor& grad, c10::SymIntArrayRef sizes) {
-  if (sizes.size() != 2) {
-    throw std::runtime_error("expected matrix input");
-  }
+  TORCH_CHECK(sizes.size() == 2, "expected matrix input");
 
   auto grad_input = at::zeros_symint(sizes[0] * sizes[1], grad.options());
-  auto indices = at::arange(0, grad_input.numel(), sizes[1] + 1, grad.options().dtype(at::kLong));
+  // Only min(M, N) diagonal elements exist for an (M, N) matrix
+  auto diag_size = std::min(sizes[0], sizes[1]);
+  auto step = sizes[1] + 1;
+  auto indices = at::arange(0, diag_size * step, step, grad.options().dtype(at::kLong));
   // for composite compliance, use out-of-place variant of
   // `index_fill` if grad tensor is a Tensor Subclass.
   if (isTensorSubclassLike(grad)) {

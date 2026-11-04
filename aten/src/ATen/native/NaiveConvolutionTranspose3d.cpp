@@ -6,6 +6,7 @@
 #include <ATen/native/ConvUtils.h>
 #include <ATen/native/CPUBlas.h>
 #include <ATen/native/vol2col.h>
+#include <utility>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -20,12 +21,9 @@
 
 namespace at::native {
 
-template<typename scalar_t>
-void gemv(char trans, int64_t m, int64_t n, scalar_t alpha, scalar_t *a, int64_t lda, scalar_t *x, int64_t incx, scalar_t beta, scalar_t *y, int64_t incy);
-
 namespace {
 
-static inline void slow_conv_transpose3d_shape_check(
+inline void slow_conv_transpose3d_shape_check(
     const Tensor& input,
     const Tensor& grad_output,
     const Tensor& weight,
@@ -103,11 +101,17 @@ static inline void slow_conv_transpose3d_shape_check(
         " x kernel_height x kernel_width) tensor ",
         "expected for weight, but got: ",
         weight.sizes());
+    TORCH_CHECK(
+        weight.size(2) == kernel_depth && weight.size(3) == kernel_height &&
+            weight.size(4) == kernel_width,
+        "kernel_size (", kernel_depth, ", ", kernel_height, ", ", kernel_width,
+        ") must match weight spatial dimensions (",
+        weight.size(2), ", ", weight.size(3), ", ", weight.size(4), ")");
     if (bias.defined()) {
       check_dim_size(bias, 1, 0, weight.size(1));
     }
   } else if (!weight_nullable) {
-    AT_ERROR("weight tensor is expected to be non-nullable");
+    TORCH_CHECK(false, "weight tensor is expected to be non-nullable");
   }
 
   int ndim = input.dim();
@@ -142,7 +146,7 @@ static inline void slow_conv_transpose3d_shape_check(
       output_padding_width;
 
   if (output_depth < 1 || output_width < 1 || output_height < 1) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Given input size per channel: (",
         input_depth,
         " x ",
@@ -251,8 +255,8 @@ void slow_conv_transpose3d_out_cpu_template(
   Tensor weight = weight_.contiguous();
   Tensor bias = bias_.defined() ? bias_.contiguous() : bias_;
 
-  const int n_input_plane = (int)weight.size(0);
-  const int n_output_plane = (int)weight.size(1);
+  const auto n_input_plane = weight.size(0);
+  const auto n_output_plane = weight.size(1);
 
   bool is_batch = false;
   if (input.dim() == 4) {
@@ -299,7 +303,7 @@ void slow_conv_transpose3d_out_cpu_template(
         int64_t elt;
         // For each elt in batch, do:
         for (elt = 0; elt < batch_size; ++elt) {
-          // Matrix mulitply per output:
+          // Matrix multiply per output:
           input_n = input.select(0, elt);
           output_n = output.select(0, elt);
 
@@ -349,7 +353,7 @@ void slow_conv_transpose3d_out_cpu_template(
               dilation_depth,
               dilation_height,
               dilation_width,
-              output_n.data_ptr<scalar_t>());
+              output_n.mutable_data_ptr<scalar_t>());
 
           // Do Bias after:
           // M,N,K are dims of matrix A and B
@@ -523,7 +527,7 @@ void slow_conv_transpose3d_backward_out_cpu_template(
         int64_t elt;
         // For each elt in batch, do:
         for (elt = 0; elt < batch_size; ++elt) {
-          // Matrix mulitply per sample:
+          // Matrix multiply per sample:
           grad_input_n = grad_input.select(0, elt);
           grad_output_n = grad_output.select(0, elt);
 
@@ -668,8 +672,7 @@ void slow_conv_transpose3d_acc_grad_parameters_cpu(
       output_padding_height,
       1);
 
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  int64_t n_output_plane;
+  int64_t n_output_plane = 0;
   if (grad_weight.defined()) {
     n_output_plane = grad_weight.size(1);
   } else if (grad_bias.defined()) {
@@ -740,12 +743,12 @@ void slow_conv_transpose3d_acc_grad_parameters_cpu(
         int64_t elt;
         // For each elt in batch, do:
         for (elt = 0; elt < batch_size; ++elt) {
-          // Matrix mulitply per output:
+          // Matrix multiply per output:
           grad_output_n = grad_output.select(0, elt);
 
           // Do Weight:
           if (grad_weight.defined()) {
-            // Matrix mulitply per output:
+            // Matrix multiply per output:
             input_n = input.select(0, elt);
 
             if (need_columns) {
@@ -819,7 +822,7 @@ void slow_conv_transpose3d_acc_grad_parameters_cpu(
 
 Tensor& slow_conv_transpose3d_out_cpu(const Tensor& input,
     const Tensor& weight,
-    IntArrayRef kernel_size, const c10::optional<Tensor>& bias_opt,
+    IntArrayRef kernel_size, const std::optional<Tensor>& bias_opt,
     IntArrayRef stride,
     IntArrayRef padding,
     IntArrayRef output_padding,
@@ -846,7 +849,7 @@ Tensor& slow_conv_transpose3d_out_cpu(const Tensor& input,
 Tensor slow_conv_transpose3d_cpu(
     const Tensor& input,
     const Tensor& weight,
-    IntArrayRef kernel_size, const c10::optional<Tensor>& bias_opt,
+    IntArrayRef kernel_size, const std::optional<Tensor>& bias_opt,
     IntArrayRef stride,
     IntArrayRef padding,
     IntArrayRef output_padding,
@@ -869,58 +872,6 @@ Tensor slow_conv_transpose3d_cpu(
       dilation);
 
   return output;
-}
-
-static std::tuple<Tensor&, Tensor&, Tensor&> slow_conv_transpose3d_backward_out_cpu(const Tensor& grad_output,
-    const Tensor& input,
-    const Tensor& weight,
-    IntArrayRef kernel_size,
-    IntArrayRef stride,
-    IntArrayRef padding,
-    IntArrayRef output_padding,
-    IntArrayRef dilation,
-    Tensor& grad_input,
-    Tensor& grad_weight,
-    Tensor& grad_bias) {
-  if (grad_input.defined()) {
-    slow_conv_transpose3d_backward_out_cpu_template(
-        input,
-        grad_output,
-        grad_input,
-        weight,
-        kernel_size,
-        stride,
-        padding,
-        output_padding,
-        dilation);
-  }
-
-  if (grad_weight.defined()) {
-    grad_weight.resize_(weight.sizes());
-    grad_weight.zero_();
-  }
-
-  if (grad_bias.defined()) {
-    grad_bias.resize_({weight.size(1)});
-    grad_bias.zero_();
-  }
-
-  if (grad_weight.defined() || grad_bias.defined()) {
-    slow_conv_transpose3d_acc_grad_parameters_cpu(
-        input,
-        grad_output,
-        grad_weight,
-        grad_bias,
-        kernel_size,
-        stride,
-        padding,
-        output_padding,
-        dilation,
-        1);
-  }
-
-  return std::tuple<Tensor&, Tensor&, Tensor&>(
-      grad_input, grad_weight, grad_bias);
 }
 
 static std::tuple<Tensor, Tensor, Tensor> slow_conv_transpose3d_backward_cpu(
@@ -992,9 +943,10 @@ static std::tuple<Tensor, Tensor, Tensor> slow_conv_transpose3d_backward_cpu(
         1);
   }
 
-  return std::tuple<Tensor, Tensor, Tensor>(grad_input, grad_weight, grad_bias);
+  return std::tuple<Tensor, Tensor, Tensor>(
+      std::move(grad_input), std::move(grad_weight), std::move(grad_bias));
 }
 
-REGISTER_ALL_CPU_DISPATCH(slow_conv_transpose3d_backward_stub, &slow_conv_transpose3d_backward_cpu);
+REGISTER_ALL_CPU_DISPATCH(slow_conv_transpose3d_backward_stub, &slow_conv_transpose3d_backward_cpu)
 
 } // namespace at::native

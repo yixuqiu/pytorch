@@ -17,11 +17,14 @@ from torch.testing._internal.common_quantization import (
 )
 from torch.testing._internal.common_quantized import override_quantized_engine
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     IS_PPC,
-    TEST_WITH_UBSAN,
+    raise_on_run_directly,
 )
 
 class TestQuantizedFunctionalOps(QuantizationTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_relu_api(self):
         X = torch.arange(-5, 5, dtype=torch.float)
         scale = 2.0
@@ -55,7 +58,7 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         # Make sure the results match
         # assert_array_almost_equal compares using the following formula:
         #     abs(desired-actual) < 1.5 * 10**(-decimal)
-        # (https://docs.scipy.org/doc/numpy/reference/generated/numpy.testing.assert_almost_equal.html)
+        # (https://numpy.org/doc/stable/reference/generated/numpy.testing.assert_almost_equal.html)
         # We use decimal = 0 to ignore off-by-1 differences between reference
         # and test. Off-by-1 differences arise due to the order of round and
         # zero_point addition operation, i.e., if addition followed by round is
@@ -94,7 +97,7 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         if qengine not in torch.backends.quantized.supported_engines:
             return
         if qengine == 'qnnpack':
-            if IS_PPC or TEST_WITH_UBSAN:
+            if IS_PPC:
                 return
             use_channelwise = False
 
@@ -147,7 +150,7 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         if qengine not in torch.backends.quantized.supported_engines:
             return
         if qengine == 'qnnpack':
-            if IS_PPC or TEST_WITH_UBSAN:
+            if IS_PPC:
                 return
 
         input_feature_map_size = (H, W)
@@ -238,3 +241,6 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         out_exp = torch.quantize_per_tensor(F.grid_sample(X, grid), scale=scale, zero_point=zero_point, dtype=torch.quint8)
         np.testing.assert_array_almost_equal(
             out.int_repr().numpy(), out_exp.int_repr().numpy(), decimal=0)
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_quantization.py")

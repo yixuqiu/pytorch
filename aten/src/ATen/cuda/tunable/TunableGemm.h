@@ -1,6 +1,6 @@
 // Original TunableOp is from onnxruntime.
 // https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/core/framework/tunable.h
-// https://github.com/microsoft/onnxruntime/tree/main/onnxruntime/core/providers/rocm/tunable
+// https://github.com/microsoft/onnxruntime/tree/main/onnxruntime/core/providers/cuda/tunable
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 //
@@ -11,26 +11,23 @@
 
 #include <ATen/cuda/tunable/GemmCommon.h>
 #ifdef USE_ROCM
-#if ROCM_VERSION >= 50700
 #include <ATen/cuda/tunable/GemmHipblaslt.h>
-#endif
 #include <ATen/cuda/tunable/GemmRocblas.h>
+#else
+#include <ATen/cuda/tunable/GemmCublaslt.h>
 #endif
-#include <ATen/cuda/tunable/StreamTimer.h>
 #include <ATen/cuda/tunable/TunableOp.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/util/Float4_e2m1fn_x2.h>
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Float8_e4m3fnuz.h>
 #include <c10/util/Float8_e5m2.h>
 #include <c10/util/Float8_e5m2fnuz.h>
+#include <c10/util/Float8_e5m3fnu.h>
+#include <c10/util/Float8_e8m0fnu.h>
 #include <c10/util/StringUtil.h>
-
-#ifdef USE_ROCM
-#include <rocm-core/rocm_version.h>
-#endif
-
-#define STRINGIFY(s) #s
-#define XSTRINGIFY(s) STRINGIFY(s)
+#include <fmt/printf.h>
+#include <optional>
 
 namespace at::cuda::tunable {
 
@@ -47,6 +44,31 @@ class DefaultGemmOp : public Callable<GemmParams<T>> {
           params->beta,
           params->c, params->ldc);
       return OK;
+    }
+};
+
+static bool _transposeBoolFromChar(char op) {
+  return op == 't' || op == 'T';
+}
+
+template <typename T>
+class DefaultGemmAndBiasOp : public Callable<GemmAndBiasParams<T>> {
+  public:
+    TuningStatus Call(const GemmAndBiasParams<T>* params) override {
+      // gemm_and_bias returns false when cuBLASLt finds no usable algo, and
+      // leaves the output unwritten. Reporting OK would make the caller skip
+      // its unfused retry and consume that buffer.
+      const bool dispatched = at::cuda::blas::gemm_and_bias<T>(
+          _transposeBoolFromChar(params->transa),
+          _transposeBoolFromChar(params->transb),
+          params->m, params->n, params->k,
+          params->alpha,
+          params->a, params->lda,
+          params->b, params->ldb,
+          params->bias,
+          params->c, params->ldc,
+          params->activation);
+      return dispatched ? OK : FAIL;
     }
 };
 
@@ -81,18 +103,28 @@ class DefaultScaledGemmOp : public Callable<ScaledGemmParams<T>> {
           params->a_scale_ptr,
           params->lda,
           params->a_dtype,
+          params->a_scale_dtype,
+          params->a_scaling_type,
+          params->a_swizzle_type,
           params->b,
           params->b_scale_ptr,
           params->ldb,
           params->b_dtype,
+          params->b_scale_dtype,
+          params->b_scaling_type,
+          params->b_swizzle_type,
           params->bias_ptr,
           params->bias_dtype,
           params->c,
           params->c_scale_ptr,
           params->ldc,
           params->c_dtype,
-          params->amax_ptr,
-          params->use_fast_accum);
+          params->use_fast_accum,
+#ifdef USE_ROCM
+          std::nullopt /* alpha */);
+#else
+          params->alpha);
+#endif
       return OK;
     }
 };
@@ -123,106 +155,106 @@ inline bool IsZero(c10::complex<float> v) {
 }
 
 template <typename T>
-inline std::string TypeName(T v) {
+inline const char* TypeName(T v) {
   return "unknown";
 }
 
 template <>
-inline std::string TypeName(float v) {
+inline const char* TypeName(float v) {
+  const auto precision = at::globalContext().float32Precision(
+      at::Float32Backend::CUDA, at::Float32Op::MATMUL);
+  if (precision == at::Float32Precision::TF32) {
+    return "tf32";
+  }
+  if (at::cuda::blas::useBF16x9()) {
+    return "bfx9";
+  }
   return "float";
 }
 
 template <>
-inline std::string TypeName(double v) {
+inline const char* TypeName(double v) {
   return "double";
 }
 
 template <>
-inline std::string TypeName(BFloat16 v) {
+inline const char* TypeName(BFloat16 v) {
   return "BFloat16";
 }
 
 template <>
-inline std::string TypeName(Half v) {
+inline const char* TypeName(Half v) {
   return "Half";
 }
 
 template <>
-inline std::string TypeName(Float8_e4m3fn v) {
+inline const char* TypeName(Float4_e2m1fn_x2 v) {
+  return "Float4_e2m1fn_x2";
+}
+
+template <>
+inline const char* TypeName(Float8_e4m3fn v) {
   return "Float8_e4m3fn";
 }
 
 template <>
-inline std::string TypeName(Float8_e5m2 v) {
+inline const char* TypeName(Float8_e5m2 v) {
   return "Float8_e5m2";
 }
 
 template <>
-inline std::string TypeName(Float8_e4m3fnuz v) {
+inline const char* TypeName(Float8_e4m3fnuz v) {
   return "Float8_e4m3fnuz";
 }
 
 template <>
-inline std::string TypeName(Float8_e5m2fnuz v) {
+inline const char* TypeName(Float8_e5m2fnuz v) {
   return "Float8_e5m2fnuz";
 }
 
 template <>
-inline std::string TypeName(c10::complex<double> v) {
+inline const char* TypeName(Float8_e8m0fnu v) {
+  return "Float8_e8m0fnu";
+}
+
+template <>
+inline const char* TypeName(Float8_e5m3fnu v) {
+  return "Float8_e5m3fnu";
+}
+
+template <>
+inline const char* TypeName(c10::complex<double> v) {
   return "c10::complex<double>";
 }
 
 template <>
-inline std::string TypeName(c10::complex<float> v) {
+inline const char* TypeName(c10::complex<float> v) {
   return "c10::complex<float>";
 }
 
-
 template <typename T, BlasOp ALayout, BlasOp BLayout>
-class GemmTunableOp : public TunableOp<GemmParams<T>, StreamTimer> {
+class GemmTunableOp
+    : public
+#ifdef USE_ROCM
+          TunableOp<GemmParams<T>>
+#else
+          CublasltGemmTunableOp<T, GemmParams<T>>
+#endif
+{
  public:
   GemmTunableOp() {
     this->RegisterOp(std::string("Default"), std::make_unique<DefaultGemmOp<T>>());
 
-    auto validators = getTuningContext()->GetTuningResultsValidator().GetAllValidators();
-
 #ifdef USE_ROCM
-    for (auto&& [name, op] : GetRocBlasGemmTypeStringAndOps<T>()) {
-      this->RegisterOp(std::move(name), std::move(op));
+    static const auto env_rocblas = c10::utils::check_env("PYTORCH_TUNABLEOP_ROCBLAS_ENABLED");
+    if (!env_rocblas.has_value() || env_rocblas.value()) {
+      for (auto&& [name, op] : GetRocBlasGemmTypeStringAndOps<T>()) {
+        this->RegisterOp(std::move(name), std::move(op));
+      }
     }
 
-    if (validators.find("ROCM_VERSION") == validators.end()) {
-      std::string rocm_version = ROCM_BUILD_INFO;
-      getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-          "ROCM_VERSION",
-          [rocm_version]() { return rocm_version; },
-          [rocm_version](auto&& k) { return rocm_version == k ? OK : FAIL; });
-    }
-
-    if (validators.find("GCN_ARCH_NAME") == validators.end()) {
-      std::string gcn_arch_name = at::cuda::getCurrentDeviceProperties()->gcnArchName;
-      getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-          "GCN_ARCH_NAME",
-          [gcn_arch_name]() { return gcn_arch_name; },
-          [gcn_arch_name](auto&& k) { return gcn_arch_name == k ? OK : FAIL; });
-    }
-
-    if (validators.find("ROCBLAS_VERSION") == validators.end()) {
-      std::string rocblas_version = c10::str(
-          XSTRINGIFY(ROCBLAS_VERSION_MAJOR), ".",
-          XSTRINGIFY(ROCBLAS_VERSION_MINOR), ".",
-          XSTRINGIFY(ROCBLAS_VERSION_PATCH), "-",
-          XSTRINGIFY(ROCBLAS_VERSION_TWEAK));
-      getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-          "ROCBLAS_VERSION",
-          [rocblas_version]() { return rocblas_version; },
-          [rocblas_version](auto&& k) { return rocblas_version == k ? OK : FAIL; });
-    }
-#endif
-
-#if defined(USE_ROCM) && ROCM_VERSION >= 50700
-    static const char *env = std::getenv("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
-    if (env == nullptr || strcmp(env, "1") == 0) {
+    static const auto env_hipblaslt = c10::utils::check_env("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
+    if (!env_hipblaslt.has_value() || env_hipblaslt.value()) {
       // disallow tuning of hipblaslt with c10::complex
       if constexpr (
           !std::is_same_v<T, c10::complex<float>> &&
@@ -231,72 +263,75 @@ class GemmTunableOp : public TunableOp<GemmParams<T>, StreamTimer> {
           this->RegisterOp(std::move(name), std::move(op));
         }
       }
-
-      if (validators.find("HIPBLASLT_VERSION") == validators.end()) {
-        std::string hipblaslt_version = c10::str(
-            XSTRINGIFY(HIPBLASLT_VERSION_MAJOR), ".",
-            XSTRINGIFY(HIPBLASLT_VERSION_MINOR), ".",
-            XSTRINGIFY(HIPBLASLT_VERSION_PATCH), "-",
-            XSTRINGIFY(HIPBLASLT_VERSION_TWEAK));
-        getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-            "HIPBLASLT_VERSION",
-            [hipblaslt_version]() { return hipblaslt_version; },
-            [hipblaslt_version](auto&& k) { return hipblaslt_version == k ? OK : FAIL; });
-      }
     }
 #endif
+
+    this->RegisterOp(std::string("Default"), std::make_unique<DefaultGemmOp<T>>());
   }
 
   std::string Signature() override {
-    return c10::str("GemmTunableOp_", TypeName<T>(T{}), "_", BlasOpToString(ALayout), BlasOpToString(BLayout));
+    return fmt::sprintf("GemmTunableOp_%s_%c%c", TypeName<T>(T{}), BlasOpToString(ALayout), BlasOpToString(BLayout));
   }
 };
 
 template <typename T, BlasOp ALayout, BlasOp BLayout>
-class GemmStridedBatchedTunableOp : public TunableOp<GemmStridedBatchedParams<T>, StreamTimer> {
+class GemmAndBiasTunableOp
+    : public
+#ifdef USE_ROCM
+          TunableOp<GemmAndBiasParams<T>>
+#else
+          CublasltGemmTunableOp<T, GemmAndBiasParams<T>>
+#endif
+{
+ public:
+  GemmAndBiasTunableOp() {
+    this->RegisterOp(std::string("Default"), std::make_unique<DefaultGemmAndBiasOp<T>>());
+
+#ifdef USE_ROCM
+    static const auto env_hipblaslt = c10::utils::check_env("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
+    if (!env_hipblaslt.has_value() || env_hipblaslt.value()) {
+      // disallow tuning of hipblaslt with c10::complex
+      if constexpr (
+          !std::is_same_v<T, c10::complex<float>> &&
+          !std::is_same_v<T, c10::complex<double>>) {
+        for (auto&& [name, op] : GetHipBlasLtGemmAndBiasTypeStringAndOps<T, ALayout, BLayout>()) {
+          this->RegisterOp(std::move(name), std::move(op));
+        }
+      }
+    }
+#endif
+
+    this->RegisterOp(std::string("Default"), std::make_unique<DefaultGemmAndBiasOp<T>>());
+  }
+
+  std::string Signature() override {
+    return fmt::sprintf("GemmAndBiasTunableOp_%s_%c%c", TypeName<T>(T{}), BlasOpToString(ALayout), BlasOpToString(BLayout));
+  }
+};
+
+template <typename T, BlasOp ALayout, BlasOp BLayout>
+class GemmStridedBatchedTunableOp
+    : public
+#ifdef USE_ROCM
+          TunableOp<GemmStridedBatchedParams<T>>
+#else
+          CublasltGemmTunableOp<T, GemmStridedBatchedParams<T>>
+#endif
+{
  public:
   GemmStridedBatchedTunableOp() {
     this->RegisterOp(std::string("Default"), std::make_unique<DefaultGemmStridedBatchedOp<T>>());
 
-    auto validators = getTuningContext()->GetTuningResultsValidator().GetAllValidators();
-
 #ifdef USE_ROCM
-    for (auto&& [name, op] : GetRocBlasGemmStridedBatchedTypeStringAndOps<T>()) {
-      this->RegisterOp(std::move(name), std::move(op));
+    static const auto env_rocblas = c10::utils::check_env("PYTORCH_TUNABLEOP_ROCBLAS_ENABLED");
+    if (!env_rocblas.has_value() || env_rocblas.value()) {
+      for (auto&& [name, op] : GetRocBlasGemmStridedBatchedTypeStringAndOps<T>()) {
+        this->RegisterOp(std::move(name), std::move(op));
+      }
     }
 
-    if (validators.find("ROCM_VERSION") == validators.end()) {
-      std::string rocm_version = ROCM_BUILD_INFO;
-      getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-          "ROCM_VERSION",
-          [rocm_version]() { return rocm_version; },
-          [rocm_version](auto&& k) { return rocm_version == k ? OK : FAIL; });
-    }
-
-    if (validators.find("GCN_ARCH_NAME") == validators.end()) {
-      std::string gcn_arch_name = at::cuda::getCurrentDeviceProperties()->gcnArchName;
-      getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-          "GCN_ARCH_NAME",
-          [gcn_arch_name]() { return gcn_arch_name; },
-          [gcn_arch_name](auto&& k) { return gcn_arch_name == k ? OK : FAIL; });
-    }
-
-    if (validators.find("ROCBLAS_VERSION") == validators.end()) {
-      std::string rocblas_version = c10::str(
-          XSTRINGIFY(ROCBLAS_VERSION_MAJOR), ".",
-          XSTRINGIFY(ROCBLAS_VERSION_MINOR), ".",
-          XSTRINGIFY(ROCBLAS_VERSION_PATCH), "-",
-          XSTRINGIFY(ROCBLAS_VERSION_TWEAK));
-      getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-          "ROCBLAS_VERSION",
-          [rocblas_version]() { return rocblas_version; },
-          [rocblas_version](auto&& k) { return rocblas_version == k ? OK : FAIL; });
-    }
-#endif
-
-#if defined(USE_ROCM) && ROCM_VERSION >= 50700
-    static const char *env = std::getenv("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
-    if (env == nullptr || strcmp(env, "1") == 0) {
+    static const auto env_hipblaslt = c10::utils::check_env("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
+    if (!env_hipblaslt.has_value() || env_hipblaslt.value()) {
       // disallow tuning of hipblaslt with c10::complex
       if constexpr (
           !std::is_same_v<T, c10::complex<float>> &&
@@ -305,64 +340,46 @@ class GemmStridedBatchedTunableOp : public TunableOp<GemmStridedBatchedParams<T>
           this->RegisterOp(std::move(name), std::move(op));
         }
       }
-
-      if (validators.find("HIPBLASLT_VERSION") == validators.end()) {
-        std::string hipblaslt_version = c10::str(
-            XSTRINGIFY(HIPBLASLT_VERSION_MAJOR), ".",
-            XSTRINGIFY(HIPBLASLT_VERSION_MINOR), ".",
-            XSTRINGIFY(HIPBLASLT_VERSION_PATCH), "-",
-            XSTRINGIFY(HIPBLASLT_VERSION_TWEAK));
-        getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-            "HIPBLASLT_VERSION",
-            [hipblaslt_version]() { return hipblaslt_version; },
-            [hipblaslt_version](auto&& k) { return hipblaslt_version == k ? OK : FAIL; });
-      }
     }
 #endif
+
+    this->RegisterOp(std::string("Default"), std::make_unique<DefaultGemmStridedBatchedOp<T>>());
   }
 
   std::string Signature() override {
-    return c10::str("GemmStridedBatchedTunableOp_", TypeName<T>(T{}), "_", BlasOpToString(ALayout), BlasOpToString(BLayout));
+    return fmt::sprintf("GemmStridedBatchedTunableOp_%s_%c%c", TypeName<T>(T{}), BlasOpToString(ALayout), BlasOpToString(BLayout));
   }
 };
 
 template <typename AT, typename BT, typename CT, BlasOp ALayout, BlasOp BLayout>
-class ScaledGemmTunableOp : public TunableOp<ScaledGemmParams<CT>, StreamTimer> {
+class ScaledGemmTunableOp
+    : public
+#ifdef USE_ROCM
+          TunableOp<ScaledGemmParams<CT>>
+#else
+          CublasltScaledGemmTunableOp<AT, BT, CT, ScaledGemmParams<CT>>
+#endif
+{
  public:
   ScaledGemmTunableOp() {
     this->RegisterOp(std::string("Default"), std::make_unique<DefaultScaledGemmOp<CT>>());
 
-    auto validators = getTuningContext()->GetTuningResultsValidator().GetAllValidators();
-
-#if defined(USE_ROCM) && ROCM_VERSION >= 50700
+#ifdef USE_ROCM
     for (auto&& [name, op] : GetHipBlasLtScaledGemmTypeStringAndOps<AT, BT, CT, ALayout, BLayout>()) {
       this->RegisterOp(std::move(name), std::move(op));
     }
-
-    if (validators.find("HIPBLASLT_VERSION") == validators.end()) {
-      std::string hipblaslt_version = c10::str(
-          XSTRINGIFY(HIPBLASLT_VERSION_MAJOR), ".",
-          XSTRINGIFY(HIPBLASLT_VERSION_MINOR), ".",
-          XSTRINGIFY(HIPBLASLT_VERSION_PATCH), "-",
-          XSTRINGIFY(HIPBLASLT_VERSION_TWEAK));
-      getTuningContext()->GetTuningResultsValidator().RegisterValidator(
-          "HIPBLASLT_VERSION",
-          [hipblaslt_version]() { return hipblaslt_version; },
-          [hipblaslt_version](auto&& k) { return hipblaslt_version == k ? OK : FAIL; });
-    }
 #endif
+
+    this->RegisterOp(std::string("Default"), std::make_unique<DefaultScaledGemmOp<CT>>());
   }
 
   std::string Signature() override {
-    return c10::str("ScaledGemmTunableOp",
-            "_", TypeName<AT>(AT{}),
-            "_", TypeName<BT>(BT{}),
-            "_", TypeName<CT>(CT{}),
-            "_", BlasOpToString(ALayout), BlasOpToString(BLayout));
+    return fmt::sprintf("ScaledGemmTunableOp_%s_%s_%s_%c%c",
+      TypeName<AT>(AT{}),
+      TypeName<BT>(BT{}),
+      TypeName<CT>(CT{}),
+      BlasOpToString(ALayout), BlasOpToString(BLayout));
   }
 };
-
-#undef XSTRINGIFY
-#undef STRINGIFY
 
 } // namespace at::cuda::tunable

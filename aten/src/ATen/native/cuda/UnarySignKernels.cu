@@ -25,7 +25,7 @@ void logical_not_kernel_cuda(TensorIteratorBase& iter) {
 }
 
 // NB: Ignores the negative bit on tensors
-CONSTEXPR_EXCEPT_WIN_CUDA char neg_name[] = "neg_kernel";
+constexpr char neg_name[] = "neg_kernel";
 void neg_kernel_cuda(TensorIteratorBase& iter) {
   auto dtype = iter.dtype();
   if (at::isComplexType(dtype)) {
@@ -36,7 +36,7 @@ void neg_kernel_cuda(TensorIteratorBase& iter) {
         return -a;
       }
   ); // neg_string
-  AT_DISPATCH_COMPLEX_TYPES_AND(kComplexHalf, dtype, "neg_cuda", [&]() {
+  AT_DISPATCH_COMPLEX_TYPES_AND2(kComplexHalf, kBComplex32, dtype, "neg_cuda", [&]() {
       jitted_gpu_kernel<
         /*name=*/ neg_name,
         /*return_dtype=*/ scalar_t,
@@ -44,7 +44,7 @@ void neg_kernel_cuda(TensorIteratorBase& iter) {
         /*arity=*/ 1>(iter, neg_string);
   });
 #else
-  AT_DISPATCH_COMPLEX_TYPES_AND(kComplexHalf, dtype, "neg_cuda", [&]() {
+  AT_DISPATCH_COMPLEX_TYPES_AND2(kComplexHalf, kBComplex32, dtype, "neg_cuda", [&]() {
       gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
         return -a;
       });
@@ -96,7 +96,7 @@ C10_HOST_DEVICE static inline c10::complex<T> sgn_wrapper(c10::complex<T> z) {
   }
 }
 
-CONSTEXPR_EXCEPT_WIN_CUDA char sgn_name[] = "sgn_kernel";
+constexpr char sgn_name[] = "sgn_kernel";
 void sgn_kernel_cuda(TensorIteratorBase& iter){
   auto dtype = iter.dtype();
   #if AT_USE_JITERATOR()
@@ -128,10 +128,10 @@ void sgn_kernel_cuda(TensorIteratorBase& iter){
   #endif
 }
 
-REGISTER_DISPATCH(logical_not_stub, &logical_not_kernel_cuda);
-REGISTER_DISPATCH(neg_stub, &neg_kernel_cuda);
-REGISTER_DISPATCH(sign_stub, &sign_kernel_cuda);
-REGISTER_DISPATCH(signbit_stub, &signbit_kernel_cuda);
-REGISTER_DISPATCH(sgn_stub, &sgn_kernel_cuda);
+REGISTER_DISPATCH(logical_not_stub, &logical_not_kernel_cuda)
+REGISTER_DISPATCH(neg_stub, &neg_kernel_cuda)
+REGISTER_DISPATCH(sign_stub, &sign_kernel_cuda)
+REGISTER_DISPATCH(signbit_stub, &signbit_kernel_cuda)
+REGISTER_DISPATCH(sgn_stub, &sgn_kernel_cuda)
 
 } // namespace at::native

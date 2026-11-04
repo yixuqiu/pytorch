@@ -33,6 +33,8 @@ std::string tmppath() {
   // Create temporary file
   auto fd = mkstemp(&tmp[0]);
   if (fd == -1) {
+    // Carries errno as a std::error_code, which TORCH_CHECK cannot express.
+    // @allow-raw-throw: std::system_error carrying errno
     throw std::system_error(errno, std::system_category());
   }
   close(fd);
@@ -40,7 +42,7 @@ std::string tmppath() {
 }
 #endif
 
-void testGetSet(std::string path, std::string prefix = "") {
+void testGetSet(const std::string& path, const std::string& prefix = "") {
   // Basic Set/Get on File Store
   {
     auto fileStore = c10::make_intrusive<c10d::FileStore>(path, 2);
@@ -99,17 +101,17 @@ void stressTestStore(std::string path, std::string prefix = "") {
   std::vector<std::thread> threads;
   c10d::test::Semaphore sem1, sem2;
 
-  for (C10_UNUSED const auto i : c10::irange(numThreads)) {
-    threads.emplace_back(std::thread([&] {
+  for ([[maybe_unused]] const auto i : c10::irange(numThreads)) {
+    threads.emplace_back([&] {
       auto fileStore =
           c10::make_intrusive<c10d::FileStore>(path, numThreads + 1);
       c10d::PrefixStore store(prefix, fileStore);
       sem1.post();
       sem2.wait();
-      for (C10_UNUSED const auto j : c10::irange(numIterations)) {
+      for ([[maybe_unused]] const auto j : c10::irange(numIterations)) {
         store.add("counter", 1);
       }
-    }));
+    });
   }
 
   sem1.wait(numThreads);

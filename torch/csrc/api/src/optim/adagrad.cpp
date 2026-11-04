@@ -1,17 +1,13 @@
 #include <torch/optim/adagrad.h>
 
-#include <torch/csrc/autograd/variable.h>
 #include <torch/optim/serialize.h>
-#include <torch/serialize/archive.h>
 #include <torch/utils.h>
 
-#include <ATen/ATen.h>
 #include <c10/util/irange.h>
 
 #include <functional>
 
-namespace torch {
-namespace optim {
+namespace torch::optim {
 
 AdagradOptions::AdagradOptions(double lr) : lr_(lr) {}
 
@@ -151,5 +147,4 @@ void Adagrad::load(serialize::InputArchive& archive) {
     }
   }
 }
-} // namespace optim
-} // namespace torch
+} // namespace torch::optim

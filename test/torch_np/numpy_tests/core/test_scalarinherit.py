@@ -1,10 +1,8 @@
 # Owner(s): ["module: dynamo"]
 
-""" Test printing of scalar types.
+"""Test printing of scalar types."""
 
-"""
 import functools
-
 from unittest import skipIf as skipif
 
 import pytest
@@ -12,6 +10,7 @@ import pytest
 import torch._numpy as np
 from torch._numpy.testing import assert_
 from torch.testing._internal.common_utils import run_tests, TestCase
+
 
 skip = functools.partial(skipif, True)
 

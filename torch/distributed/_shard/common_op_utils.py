@@ -1,6 +1,8 @@
+# mypy: allow-untyped-defs
+
 import torch
 from torch.utils import _pytree as pytree
-from typing import Optional
+
 
 def _basic_validation(op, args=(), kwargs=None):
     """
@@ -29,20 +31,21 @@ def _basic_validation(op, args=(), kwargs=None):
         )
 
     # Validate all distributed tensors use the same PG.
-    cur_pg: Optional[torch.distributed.ProcessGroup] = None
+    cur_pg: torch.distributed.ProcessGroup | None = None
 
     def validate_pg(e):
         nonlocal cur_pg
         if isinstance(e, ShardedTensor):
             if cur_pg is not None and e._process_group is not cur_pg:
                 raise RuntimeError(
-                    'All distributed tensors should use the '
-                    'same ProcessGroup if used together in an op.'
+                    "All distributed tensors should use the "
+                    "same ProcessGroup if used together in an op."
                 )
             cur_pg = e._process_group
 
     pytree.tree_map_(validate_pg, args)
     pytree.tree_map_(validate_pg, kwargs)
+
 
 def _register_default_op(op, decorator):
     @decorator(op)

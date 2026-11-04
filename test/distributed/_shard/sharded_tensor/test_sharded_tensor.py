@@ -6,7 +6,6 @@ import itertools
 import math
 import pickle
 import sys
-from typing import List
 
 import torch
 import torch.distributed as dist
@@ -50,6 +49,7 @@ from torch.testing._internal.common_distributed import (
 from torch.testing._internal.common_utils import (
     run_tests,
     skip_but_pass_in_sandcastle_if,
+    skipIfRocm,
     TEST_CUDA,
     TEST_WITH_DEV_DBG_ASAN,
     TestCase,
@@ -62,6 +62,7 @@ from torch.testing._internal.distributed._shard.sharded_tensor._test_st_common i
     _chunk_sharding_specs_list_for_test,
     MyShardedModel1,
 )
+
 
 if TEST_WITH_DEV_DBG_ASAN:
     print(
@@ -142,6 +143,50 @@ class TestShardedTensorMetadata(TestCase):
             pickled_obj = pickle.dumps(expected_st_metadata)
             st_metadata = pickle.loads(pickled_obj)
             self.assertEqual(expected_st_metadata, st_metadata)
+
+    def test_wrapper_subclass_preserves_strides(self):
+        spec = ChunkShardingSpec(dim=0, placements=["rank:0/cpu"])
+        strides = (1, 4)
+        st = ShardedTensorBase.__new__(
+            ShardedTensor,
+            spec,
+            4,
+            1,
+            dtype=torch.float32,
+            layout=torch.strided,
+            pin_memory=False,
+            requires_grad=False,
+            strides=strides,
+        )
+        with torch._C.DisableTorchFunction():
+            self.assertEqual(st.stride(), strides)
+        self.assertEqual(st.metadata().tensor_properties.strides, strides)
+
+    def test_wrapper_subclass_defaults_to_contiguous_strides(self):
+        shard_metadata = ShardMetadata(
+            shard_offsets=[0, 0],
+            shard_sizes=[4, 2],
+            placement="rank:0/cpu",
+        )
+        metadata = ShardedTensorMetadata(
+            shards_metadata=[shard_metadata],
+            size=torch.Size([4, 2]),
+            tensor_properties=TensorProperties(
+                dtype=torch.float32,
+                layout=torch.strided,
+                requires_grad=False,
+                pin_memory=False,
+                strides=None,
+            ),
+        )
+        st = ShardedTensorBase._init_from_local_shards_and_global_metadata(
+            [Shard(torch.empty(4, 2), shard_metadata)],
+            metadata,
+        )
+
+        self.assertIsNone(st.metadata().tensor_properties.strides)
+        with torch._C.DisableTorchFunction():
+            self.assertEqual(st.stride(), (2, 1))
 
 
 class TestCreateTensorFromParams(TestCase):
@@ -455,7 +500,7 @@ class TestLocalTensor(ShardedTensorTestBase):
         with self.assertRaisesRegex(
             NotImplementedError, "Only single local shard is supported."
         ):
-            local_shard = st.local_tensor()
+            st.local_tensor()
 
 
 class TestShardedTensorChunked(ShardedTensorTestBase):
@@ -508,6 +553,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
         with self.assertRaisesRegex(RuntimeError, "torch function '__set__'"):
             st.requires_grad = True
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -828,6 +874,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
                 new_op_st = op(st, dtype=dtype)
                 self.assertEqual(new_op_st.local_tensor(), expect_tensor)
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -881,6 +928,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
                 )
                 self.assertEqual((5, 20), shard.tensor.size())
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -936,6 +984,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
                 )
                 self.assertEqual((5, 20), shard.tensor.size())
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -980,7 +1029,6 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
         # Validate remote shards.
         remote_shards = st.remote_shards()
         self.assertEqual(3, len(remote_shards))
-        owners = {}
         for rpc_rank, shards in remote_shards.items():
             self.assertEqual(2, len(shards))
             for remote_shard in shards:
@@ -1244,7 +1292,8 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
         module_load._register_load_state_dict_pre_hook(pre_load_state_dict_hook, True)
 
         buffer.seek(0)
-        state_dict_deser = torch.load(buffer)
+        # weights_only=False as ShardedTensor weights_only is already tested in TestFSDPStateDict.test_torch_save_load
+        state_dict_deser = torch.load(buffer, weights_only=False)
         module_load.load_state_dict(state_dict_deser, strict=False)
 
         module_load._register_state_dict_hook(state_dict_hook)
@@ -1288,7 +1337,8 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
 
         buffer.seek(0)
         with load_with_process_group(pg):
-            state_dict_deser = torch.load(buffer)
+            # ShardedTensor weights_only is already tested in TestFSDPStateDict.test_torch_save_load
+            state_dict_deser = torch.load(buffer, weights_only=False)
             module_load.load_state_dict(state_dict_deser, strict=False)
 
         # Verify after load.
@@ -1360,20 +1410,23 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
         if self.rank != 0:
             with self.assertRaisesRegex(RuntimeError, "Local rank at save time was"):
                 with load_with_process_group(pg):
-                    state_dict_deser = torch.load(buffer)
+                    # ShardedTensor weights_only is already tested in TestFSDPStateDict.test_torch_save_load
+                    torch.load(buffer, weights_only=False)
         else:
             with self.assertRaisesRegex(
                 RuntimeError, "Local world size at save time was"
             ):
                 with load_with_process_group(pg):
-                    state_dict_deser = torch.load(buffer)
+                    # ShardedTensor weights_only is already tested in TestFSDPStateDict.test_torch_save_load
+                    torch.load(buffer, weights_only=False)
 
         dist.destroy_process_group()
         buffer.seek(0)
         with self.assertRaisesRegex(
             RuntimeError, "Need to initialize default process group"
         ):
-            state_dict_deser = torch.load(buffer)
+            # ShardedTensor weights_only is already tested in TestFSDPStateDict.test_torch_save_load
+            torch.load(buffer, weights_only=False)
         rpc.shutdown()
 
     @with_comms
@@ -1390,8 +1443,8 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
                     "rank:3/cuda:3",
                 ],
             )
-            st1 = sharded_tensor.empty(spec, 10, 20, init_rrefs=True)
-            st2 = sharded_tensor.empty(spec, 10, 20)
+            sharded_tensor.empty(spec, 10, 20, init_rrefs=True)
+            sharded_tensor.empty(spec, 10, 20)
 
         create_tensors()
         self.assertEqual(0, len(sharded_tensor.api._sharded_tensor_map))
@@ -1471,6 +1524,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
         st = sharded_tensor.empty(spec, 10, 10, pin_memory=True, init_rrefs=True)
         self.assertTrue(st.is_pinned())
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -1723,7 +1777,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
             self.assertEqual(remote_device_before.rank(), remote_device_after.rank())
             self.assertEqual(str(remote_device_after.device()), "cpu")
 
-        # ensure metdata also get changed to CPU
+        # ensure metadata also get changed to CPU
         metas = new_st.metadata().shards_metadata
         for meta in metas:
             self.assertEqual(str(meta.placement.device()), "cpu")
@@ -1754,7 +1808,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
             self.assertEqual(remote_device_before.rank(), remote_device_after.rank())
             self.assertEqual(str(remote_device_after.device()), "cpu")
 
-        # ensure metdata also get changed to CPU
+        # ensure metadata also get changed to CPU
         metas = new_st.metadata().shards_metadata
         for meta in metas:
             self.assertEqual(str(meta.placement.device()), "cpu")
@@ -1810,7 +1864,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
             self.assertEqual(str(remote_device_before.device().type), "cpu")
             self.assertEqual(str(remote_device_after.device().type), "cuda")
 
-        # ensure metdata also get changed to GPU
+        # ensure metadata also get changed to GPU
         metas = new_st_gpu.metadata().shards_metadata
         for meta in metas:
             self.assertEqual(str(meta.placement.device().type), "cuda")
@@ -1988,6 +2042,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
             verify_size(rank, shard_metadata.shard_sizes)
             self.assertEqual(f"rank:{rank}/cuda:{rank}", str(shard_metadata.placement))
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -2054,6 +2109,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
                 shard = remote_shard.to_here()
                 self.assertEqual((5, 5), shard.tensor.size())
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -2122,6 +2178,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
                 shard = remote_shard.to_here()
                 self.assertEqual((5, 5), shard.tensor.size())
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -2198,7 +2255,6 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
         else:
             self.assertEqual(2, len(remote_shards))
 
-        owners = {}
         for rpc_rank, shards in remote_shards.items():
             self.assertEqual(2, len(shards))
             for remote_shard in shards:
@@ -2206,6 +2262,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
                 shard = remote_shard.to_here()
                 self.assertEqual((5, 5), shard.tensor.size())
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -2296,7 +2353,8 @@ class TestShardedTensorFromLocalTensor(ShardedTensorTestBase):
 
         # TODO: figure out what the API should behave when some rank have no shard
         # see https://github.com/pytorch/pytorch/issues/73133
-        assert local_tensor is not None
+        if local_tensor is None:
+            raise AssertionError("Expected local_tensor to not be None")
         st = ShardedTensor._init_from_local_tensor(
             local_tensor,
             sharding_spec,
@@ -2339,6 +2397,7 @@ class TestShardedTensorFromLocalTensor(ShardedTensorTestBase):
                         rank_to_metadata[rpc_rank].shard_sizes, shard.tensor.size()
                     )
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -2412,11 +2471,9 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             placement=f"rank:{self.rank}/cuda:{self.rank}",
         )
         with self.assertRaisesRegex(ValueError, "Shard tensor size does not match"):
-            local_shard_from_wrong_meta = sharded_tensor.Shard(
-                local_tensor,
-                metadata=wrong_local_shard_metadata,
-            )
+            sharded_tensor.Shard(local_tensor, metadata=wrong_local_shard_metadata)
 
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -2474,6 +2531,127 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
                 self.assertEqual(rpc_rank, remote_shard.owner().id)
                 shard = remote_shard.to_here()
                 self.assertEqual((5, 5), shard.tensor.size())
+
+    @with_comms(init_rpc=False)
+    @skip_if_lt_x_gpu(4)
+    @requires_nccl()
+    def test_recalc_for_metadata(self):
+        shard_sizes = [0, 5]  # test 2 different shard sizes
+        for shard_size in shard_sizes:
+            local_shard_metadata = ShardMetadata(
+                shard_offsets=[0, 0],
+                shard_sizes=[shard_size, shard_size],
+                placement=f"rank:{self.rank}/cuda:{self.rank}",
+            )
+
+            local_shards = [
+                sharded_tensor.Shard(
+                    torch.randn(shard_size, shard_size, device=f"cuda:{self.rank}"),
+                    local_shard_metadata,
+                )
+            ]
+
+            st = sharded_tensor.init_from_local_shards(local_shards, None, None)
+            self.assertEqual((shard_size * 4, shard_size), st.size())
+            self.assertEqual(1, len(st.local_shards()))
+
+            # Verify local shard.
+            local_shard = st.local_shards()[0]
+            self.assertEqual(
+                torch.device(f"cuda:{self.rank}"), local_shard.tensor.device
+            )
+            self.assertEqual((shard_size, shard_size), local_shard.tensor.size())
+
+            # Verify local shard metadata.
+            self.assertEqual(
+                (self.rank * shard_size, 0),
+                local_shard.metadata.shard_offsets,
+            )
+            self.assertEqual((shard_size, shard_size), local_shard.metadata.shard_sizes)
+            self.assertEqual(
+                f"rank:{self.rank}/cuda:{self.rank}",
+                str(local_shard.metadata.placement),
+            )
+
+            # Verify global metadata.
+            shards_metadata = st.metadata().shards_metadata
+            self.assertEqual(4, len(shards_metadata))
+            for rank, shard_metadata in enumerate(shards_metadata):
+                self.assertEqual((rank * shard_size, 0), shard_metadata.shard_offsets)
+                self.assertEqual((shard_size, shard_size), shard_metadata.shard_sizes)
+                self.assertEqual(
+                    f"rank:{rank}/cuda:{rank}", str(shard_metadata.placement)
+                )
+
+            with self.assertRaises(ValueError):
+                st = sharded_tensor.init_from_local_shards(local_shards)
+
+    @with_comms(init_rpc=False)
+    @skip_if_lt_x_gpu(4)
+    @requires_nccl()
+    def test_init_from_local_shards_with_different_glb_size(self):
+        wrong_offset_local_shard_metadata = ShardMetadata(
+            shard_offsets=[0, 0],
+            shard_sizes=[5, 5],
+            placement=f"rank:{self.rank}/cuda:{self.rank}",
+        )
+
+        wrong_offset_local_shards = [
+            sharded_tensor.Shard(
+                torch.randn(5, 5, device=f"cuda:{self.rank}"),
+                wrong_offset_local_shard_metadata,
+            )
+        ]
+        with self.assertRaises(ValueError):
+            sharded_tensor.init_from_local_shards(wrong_offset_local_shards, 0, 0)
+
+        local_shard_metadata = ShardMetadata(
+            shard_offsets=[self.rank * 5, 0],
+            shard_sizes=[5, 5],
+            placement=f"rank:{self.rank}/cuda:{self.rank}",
+        )
+
+        local_shards = [
+            sharded_tensor.Shard(
+                torch.randn(5, 5, device=f"cuda:{self.rank}"), local_shard_metadata
+            )
+        ]
+        with self.assertRaises(ValueError):
+            sharded_tensor.init_from_local_shards(local_shards, 0, 0)
+
+    @with_comms(init_rpc=False)
+    @skip_if_lt_x_gpu(4)
+    @requires_nccl()
+    def test_non_rw_sharded_recalc_for_metadata(self):
+        local_shard_metadata = ShardMetadata(
+            shard_offsets=[(self.rank // 2) * 5, (self.rank % 2) * 5],
+            shard_sizes=[5, 5],
+            placement=f"rank:{self.rank}/cuda:{self.rank}",
+        )
+
+        local_shards = [
+            sharded_tensor.Shard(
+                torch.randn(5, 5, device=f"cuda:{self.rank}"), local_shard_metadata
+            )
+        ]
+
+        st = sharded_tensor.init_from_local_shards(local_shards, None, 5)
+        if self.rank == 0:
+            self.assertEqual(
+                st.local_shards()[0].metadata.shard_offsets,
+                local_shard_metadata.shard_offsets,
+            )
+        else:
+            self.assertNotEqual(
+                st.local_shards()[0].metadata.shard_offsets,
+                local_shard_metadata.shard_offsets,
+            )
+        self.assertEqual(
+            st.local_shards()[0].metadata.shard_sizes, local_shard_metadata.shard_sizes
+        )
+        self.assertEqual(
+            st.local_shards()[0].metadata.placement, local_shard_metadata.placement
+        )
 
     @skip_if_lt_x_gpu(4)
     def test_st_base_init_from_local_shards_and_global_metadata(self):
@@ -2535,6 +2713,177 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             self.assertEqual((5, 5), shard_metadata.shard_sizes)
             self.assertEqual(f"rank:{rank}/cuda:{rank}", str(shard_metadata.placement))
 
+    @with_comms(init_rpc=False)
+    @skip_if_lt_x_gpu(4)
+    @requires_nccl()
+    def test_init_from_local_shards_and_global_metadata_with_all_zeros(self):
+        local_shard_metadata = ShardMetadata(
+            shard_offsets=[0, 0],
+            shard_sizes=[0, 0],
+            placement=f"rank:{self.rank}/cuda:{self.rank}",
+        )
+
+        shards_metadata = []
+        for r in range(self.world_size):
+            if r == self.rank:
+                shards_metadata.append(local_shard_metadata)
+            else:
+                shards_metadata.append(
+                    ShardMetadata(
+                        shard_offsets=[0, 0],
+                        shard_sizes=[0, 0],
+                        placement=f"rank:{r}/cuda:{r}",
+                    )
+                )
+
+        local_shards = [
+            sharded_tensor.Shard(
+                torch.randn(0, 0, device=f"cuda:{self.rank}"), local_shard_metadata
+            )
+        ]
+
+        tensor_properties = TensorProperties(
+            dtype=torch.get_default_dtype(),
+            layout=torch.strided,
+            requires_grad=False,
+            memory_format=torch.contiguous_format,
+            pin_memory=False,
+        )
+
+        sharded_tensor_metadata = sharded_tensor.ShardedTensorMetadata(
+            shards_metadata=shards_metadata,
+            size=torch.Size([0, 0]),
+            tensor_properties=tensor_properties,
+        )
+
+        st = ShardedTensor._init_from_local_shards_and_global_metadata(
+            local_shards,
+            sharded_tensor_metadata,
+        )
+
+        self.assertEqual((0, 0), st.size())
+        self.assertEqual(1, len(st.local_shards()))
+
+        # Verify local shard.
+        local_shard = st.local_shards()[0]
+        self.assertEqual(torch.device(f"cuda:{self.rank}"), local_shard.tensor.device)
+        self.assertEqual((0, 0), local_shard.tensor.size())
+
+        # Verify local shard metadata.
+        self.assertEqual(
+            (0, 0),
+            local_shard.metadata.shard_offsets,
+        )
+        self.assertEqual((0, 0), local_shard.metadata.shard_sizes)
+        self.assertEqual(
+            f"rank:{self.rank}/cuda:{self.rank}", str(local_shard.metadata.placement)
+        )
+
+        # Verify global metadata.
+        shards_metadata = st.metadata().shards_metadata
+        self.assertEqual(4, len(shards_metadata))
+        for rank, shard_metadata in enumerate(shards_metadata):
+            self.assertEqual((0, 0), shard_metadata.shard_offsets)
+            self.assertEqual((0, 0), shard_metadata.shard_sizes)
+            self.assertEqual(f"rank:{rank}/cuda:{rank}", str(shard_metadata.placement))
+
+    @with_comms(init_rpc=False)
+    @skip_if_lt_x_gpu(4)
+    @requires_nccl()
+    def test_init_from_local_shards_and_global_metadata_with_local_view(self):
+        # testing cases where we create ST with local view, meaning we initialize other rank's metadata with 0s
+        shard_offsets = [0, 1]  # valid, invalid
+        for shard_offset in shard_offsets:
+            local_shard_metadata = ShardMetadata(
+                shard_offsets=[shard_offset, 0],
+                shard_sizes=[5, 5],
+                placement=f"rank:{self.rank}/cuda:{self.rank}",
+            )
+
+            shards_metadata = []
+            for r in range(self.world_size):
+                if r == self.rank:
+                    shards_metadata.append(local_shard_metadata)
+                else:
+                    shards_metadata.append(
+                        ShardMetadata(
+                            shard_offsets=[0 if r < self.rank else 5, 0],
+                            shard_sizes=[0, 0],
+                            placement=f"rank:{r}/cuda:{r}",
+                        )
+                    )
+
+            local_shards = [
+                sharded_tensor.Shard(
+                    torch.randn(5, 5, device=f"cuda:{self.rank}"), local_shard_metadata
+                )
+            ]
+
+            tensor_properties = TensorProperties(
+                dtype=torch.get_default_dtype(),
+                layout=torch.strided,
+                requires_grad=False,
+                memory_format=torch.contiguous_format,
+                pin_memory=False,
+            )
+
+            sharded_tensor_metadata = sharded_tensor.ShardedTensorMetadata(
+                shards_metadata=shards_metadata,
+                size=torch.Size([5, 5]),
+                tensor_properties=tensor_properties,
+            )
+            if shard_offset == 0:
+                # valid case
+                st = ShardedTensor._init_from_local_shards_and_global_metadata(
+                    local_shards,
+                    sharded_tensor_metadata,
+                )
+            else:
+                # invalid case
+                with self.assertRaises(ValueError):
+                    ShardedTensor._init_from_local_shards_and_global_metadata(
+                        local_shards,
+                        sharded_tensor_metadata,
+                    )
+                return
+
+            self.assertEqual((5, 5), st.size())
+            self.assertEqual(1, len(st.local_shards()))
+
+            # Verify local shard.
+            local_shard = st.local_shards()[0]
+            self.assertEqual(
+                torch.device(f"cuda:{self.rank}"), local_shard.tensor.device
+            )
+            self.assertEqual((5, 5), local_shard.tensor.size())
+
+            # Verify local shard metadata.
+            self.assertEqual(
+                (0, 0),
+                local_shard.metadata.shard_offsets,
+            )
+            self.assertEqual((5, 5), local_shard.metadata.shard_sizes)
+            self.assertEqual(
+                f"rank:{self.rank}/cuda:{self.rank}",
+                str(local_shard.metadata.placement),
+            )
+
+            # Verify global metadata.
+            shards_metadata = st.metadata().shards_metadata
+            self.assertEqual(4, len(shards_metadata))
+            for rank, shard_metadata in enumerate(shards_metadata):
+                self.assertEqual(
+                    (0 if rank <= self.rank else 5, 0), shard_metadata.shard_offsets
+                )
+                if rank == self.rank:
+                    self.assertEqual((5, 5), shard_metadata.shard_sizes)
+                else:
+                    self.assertEqual((0, 0), shard_metadata.shard_sizes)
+                self.assertEqual(
+                    f"rank:{rank}/cuda:{rank}", str(shard_metadata.placement)
+                )
+
+    @skipIfRocm
     @with_comms
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
@@ -2690,7 +3039,7 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
 
         empty_local_shards = []
         with self.assertRaisesRegex(ValueError, "have no local shards on all ranks"):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 empty_local_shards, [10, 10], init_rrefs=True
             )
 
@@ -2700,7 +3049,7 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
         with self.assertRaisesRegex(
             ValueError, "Only torch.strided layout is currently supported"
         ):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 wrong_layout_shards, [10, 10], init_rrefs=True
             )
 
@@ -2713,23 +3062,19 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             ValueError,
             "Only torch.contiguous_format memory_format is currently supported",
         ):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 wrong_memory_format_shards, [10, 10], init_rrefs=True
             )
 
         with self.assertRaisesRegex(ValueError, "Shard tensor size does not match"):
-            wrong_size_shards = [
-                sharded_tensor.Shard(
-                    torch.randn(2, 3, device=f"cuda:{self.rank}"), local_shard_metadata
-                )
-            ]
+            sharded_tensor.Shard(
+                torch.randn(2, 3, device=f"cuda:{self.rank}"), local_shard_metadata
+            )
 
         with self.assertRaisesRegex(
             ValueError, "Local shard tensor device does not match"
         ):
-            wrong_device_shards = [
-                sharded_tensor.Shard(torch.randn(5, 5), local_shard_metadata)
-            ]
+            sharded_tensor.Shard(torch.randn(5, 5), local_shard_metadata)
 
     @with_comms
     @skip_if_lt_x_gpu(4)
@@ -2750,7 +3095,7 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             ValueError,
             "ShardedTensor global_size property does not match from different ranks!",
         ):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 wrong_dtype_shards, tensor_overall_size, init_rrefs=True
             )
 
@@ -2765,11 +3110,11 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             ValueError,
             "ShardedTensor dtype property does not match from different ranks!",
         ):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 wrong_dtype_shards, [10, 10], init_rrefs=True
             )
 
-        tensor_requires_grad = True if self.rank == 0 else False
+        tensor_requires_grad = self.rank == 0
         wrong_requires_grad_shards = [
             sharded_tensor.Shard(
                 torch.randn(
@@ -2782,7 +3127,7 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             ValueError,
             "ShardedTensor requires_grad property does not match from different ranks!",
         ):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 wrong_requires_grad_shards, [10, 10], init_rrefs=True
             )
 
@@ -2812,11 +3157,11 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
         with self.assertRaisesRegex(
             ValueError, "Local shards' tensor pin_memory property need to be the same"
         ):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 wrong_pin_memory_local_shards, [10, 10], init_rrefs=True
             )
 
-        tensor_pin_memory = True if self.rank == 0 else False
+        tensor_pin_memory = self.rank == 0
         wrong_pin_memory_shards_cross_ranks = [
             sharded_tensor.Shard(
                 torch.randn(5, 5, pin_memory=tensor_pin_memory), local_shard_metadata
@@ -2826,7 +3171,7 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             ValueError,
             "ShardedTensor pin_memory property does not match from different ranks!",
         ):
-            st = sharded_tensor.init_from_local_shards(
+            sharded_tensor.init_from_local_shards(
                 wrong_pin_memory_shards_cross_ranks, [10, 10], init_rrefs=True
             )
 
@@ -2939,19 +3284,15 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
         with self.assertRaisesRegex(
             ValueError, "Shard tensor size does not match with metadata.shard_lengths"
         ):
-            wrong_size_shards = [
-                sharded_tensor.Shard(
-                    torch.randn(2, 3, device=f"cuda:{self.rank}"), local_shard_metadata
-                )
-            ]
+            sharded_tensor.Shard(
+                torch.randn(2, 3, device=f"cuda:{self.rank}"), local_shard_metadata
+            )
 
         with self.assertRaisesRegex(
             ValueError,
             "Local shard tensor device does not match with local Shard's placement",
         ):
-            wrong_device_shards = [
-                sharded_tensor.Shard(torch.randn(5, 5), local_shard_metadata)
-            ]
+            sharded_tensor.Shard(torch.randn(5, 5), local_shard_metadata)
 
         wrong_dtype_shards = [
             sharded_tensor.Shard(
@@ -3180,7 +3521,7 @@ class TestCreateTensorNoProcessGroupMode(TestCase):
             ],
             size=torch.Size([4, 2]),
         )
-        st_local_shards: List[Shard] = []
+        st_local_shards: list[Shard] = []
         for shard_metadata in st_metadata.shards_metadata:
             st_local_shards.append(
                 Shard(
@@ -3209,7 +3550,7 @@ class TestCreateTensorNoProcessGroupMode(TestCase):
             ],
             size=torch.Size([4, 2]),
         )
-        st_local_shards: List[Shard] = []
+        st_local_shards: list[Shard] = []
         src = torch.randn(4, 2)
         for shard_metadata in st_metadata.shards_metadata:
             offsets = shard_metadata.shard_offsets

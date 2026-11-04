@@ -37,7 +37,7 @@ using namespace torch;
     auto _w =                                                              \
         write(STDERR_FILENO, ERROR_MSG, sizeof(ERROR_MSG) / sizeof(char)); \
     (void)_w;                                                              \
-    struct sigaction sa {};                                                \
+    struct sigaction sa{};                                                 \
     sa.sa_handler = SIG_DFL;                                               \
     sa.sa_flags = 0;                                                       \
     if (sigemptyset(&sa.sa_mask) != 0 ||                                   \
@@ -50,19 +50,19 @@ using namespace torch;
 
 // signal(2) is really not portable. So use sigaction.
 // http://man7.org/linux/man-pages/man2/signal.2.html
-static inline void setSignalHandler(
+static void setSignalHandler(
     int signal,
     void (*handler)(int, siginfo_t*, void*),
     struct sigaction* old_sa_ptr) {
-  struct sigaction sa {};
+  struct sigaction sa{};
   sa.sa_sigaction = handler;
   sa.sa_flags = SA_RESTART | SA_SIGINFO | SA_NOCLDSTOP | SA_NODEFER;
   if (sigemptyset(&sa.sa_mask) != 0 ||
       sigaction(signal, &sa, old_sa_ptr) != 0) {
     std::ostringstream oss;
     oss << "An error occurred while setting handler for " << strsignal(signal)
-        << ".";
-    throw std::runtime_error(oss.str());
+        << '.';
+    TORCH_CHECK(false, std::move(oss).str());
   }
 }
 
@@ -70,15 +70,15 @@ SIGNAL_HANDLER(
     SIGBUS,
     handler_SIGBUS,
     "ERROR: Unexpected bus error encountered in worker. "
-    "This might be caused by insufficient shared memory (shm).\n");
+    "This might be caused by insufficient shared memory (shm).\n")
 SIGNAL_HANDLER(
     SIGSEGV,
     handler_SIGSEGV,
-    "ERROR: Unexpected segmentation fault encountered in worker.\n");
+    "ERROR: Unexpected segmentation fault encountered in worker.\n")
 SIGNAL_HANDLER(
     SIGFPE,
     handler_SIGFPE,
-    "ERROR: Unexpected floating-point exception encountered in worker.\n");
+    "ERROR: Unexpected floating-point exception encountered in worker.\n")
 
 // When an error happened in DataLoader methods and Python starts to exit, the
 // error trace will keep the loader alive, and Python may kill the children
@@ -88,11 +88,11 @@ SIGNAL_HANDLER(
 // loader process here to avoid this by _exit(EXIT_SUCCESS). Note that if we
 // exit with nonzero code, the loader SIGCHLD handler may report RuntimeError
 // again, and then it defeats the whole purpose.
-static void handler_SIGTERM(int sig, siginfo_t* info, void* ctx) {
+static void handler_SIGTERM(int /*sig*/, siginfo_t* info, void* /*ctx*/) {
   if (info->si_pid == getppid()) {
     _exit(EXIT_SUCCESS);
   }
-  struct sigaction sa {};
+  struct sigaction sa{};
   sa.sa_handler = SIG_DFL;
   sa.sa_flags = 0;
   if (sigemptyset(&sa.sa_mask) != 0 || sigaction(SIGTERM, &sa, nullptr) != 0) {
@@ -102,11 +102,12 @@ static void handler_SIGTERM(int sig, siginfo_t* info, void* ctx) {
   }
 }
 
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 __attribute__((weak)) void setDataLoaderSignalHandlers() {}
 
 static PyObject* THPModule_setWorkerSignalHandlers(
-    PyObject* module,
-    PyObject* arg) {
+    PyObject* /*module*/,
+    PyObject* /*arg*/) {
   HANDLE_TH_ERRORS
   setSignalHandler(SIGBUS, &handler_SIGBUS, nullptr);
   setSignalHandler(SIGSEGV, &handler_SIGSEGV, nullptr);
@@ -120,8 +121,8 @@ static PyObject* THPModule_setWorkerSignalHandlers(
 static std::map<int64_t, std::set<pid_t>> worker_pids = {};
 
 static PyObject* THPModule_errorIfAnyWorkerFails(
-    PyObject* module,
-    PyObject* noargs) {
+    PyObject* /*module*/,
+    PyObject* /*noargs*/) {
   HANDLE_TH_ERRORS
 
   // Only check the pids we care about
@@ -140,29 +141,32 @@ static PyObject* THPModule_errorIfAnyWorkerFails(
         continue;
       if (infop.si_code == CLD_EXITED &&
           infop.si_status != EXIT_SUCCESS) { // exit with error
-        std::ostringstream oss;
-        oss << "DataLoader worker (pid " << worker_pid << ") exited "
-            << "unexpectedly with exit code " << infop.si_status << ". "
-            << "Details are lost due to multiprocessing. Rerunning with "
-            << "num_workers=0 may give better error trace.";
+        auto error_msg = fmt::format(
+            "DataLoader worker (pid {}) exited unexpectedly with exit code {}. "
+            "Details are lost due to multiprocessing. Rerunning with "
+            "num_workers=0 may give better error trace.",
+            worker_pid,
+            infop.si_status);
         // This is necessary. Otherwise, the runtime error will kill the other
         // workers, and trigger this again.
         pid_set.clear();
-        throw std::runtime_error(oss.str());
+        TORCH_CHECK(false, error_msg);
       } else if (
           infop.si_code == CLD_KILLED ||
           infop.si_code == CLD_DUMPED) { // killed by signal
-        std::ostringstream oss;
-        oss << "DataLoader worker (pid " << worker_pid << ") is killed "
-            << "by signal: " << strsignal(infop.si_status) << ". ";
+        auto error_msg = fmt::format(
+            "DataLoader worker (pid {}) is killed by signal: {}. ",
+            worker_pid,
+            strsignal(infop.si_status));
         if (infop.si_status == SIGBUS) {
-          oss << "It is possible that dataloader's workers are out of shared memory. "
-              << "Please try to raise your shared memory limit.";
+          error_msg +=
+              "It is possible that dataloader's workers are out of shared memory. "
+              "Please try to raise your shared memory limit.";
         }
         // This is necessary. Otherwise, the runtime error will kill the other
         // workers, and trigger this again.
         pid_set.clear();
-        throw std::runtime_error(oss.str());
+        TORCH_CHECK(false, error_msg);
       }
     }
   }
@@ -172,7 +176,7 @@ static PyObject* THPModule_errorIfAnyWorkerFails(
 
 // We don't want to exit on any SIGCHLD from any child. child_pids is a tuple
 // of pids we are interested in.
-static PyObject* THPModule_setWorkerPIDs(PyObject* module, PyObject* args) {
+static PyObject* THPModule_setWorkerPIDs(PyObject* /*module*/, PyObject* args) {
   HANDLE_TH_ERRORS
   TORCH_CHECK_TYPE(
       PyTuple_GET_SIZE(args) == 2,
@@ -201,7 +205,7 @@ static PyObject* THPModule_setWorkerPIDs(PyObject* module, PyObject* args) {
 }
 
 static PyObject* THPModule_removeWorkerPIDs(
-    PyObject* module,
+    PyObject* /*module*/,
     PyObject* loader_id) {
   HANDLE_TH_ERRORS
 

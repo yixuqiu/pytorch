@@ -3,20 +3,19 @@
 #include <c10/core/Scalar.h>
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
-#include <c10/util/Optional.h>
 #include <torch/csrc/lazy/core/permutation_util.h>
 #include <torch/csrc/lazy/core/shape.h>
 #include <torch/csrc/lazy/core/util.h>
 
 #include <complex>
 #include <functional>
+#include <optional>
 #include <tuple>
 #include <vector>
 
 // TODO: Consolidate this file with util.h
 
-namespace torch {
-namespace lazy {
+namespace torch::lazy {
 
 // Converts an iterable container to a vector of int64's.
 template <typename S>
@@ -51,7 +50,7 @@ TORCH_API std::vector<int64_t> MakeTransposePermutation(
     int64_t dim1,
     int64_t rank);
 
-// Calculates the protomoted shape to which the input shapes should be
+// Calculates the promoted shape to which the input shapes should be
 // broadcasted for an elementwise operation. The size of the common dimensions
 // (2,3,4 for shape1, and 0,1,2 for shape2) must either match, or either one
 // of the two be 1.
@@ -66,7 +65,6 @@ TORCH_API std::vector<int64_t> GetPromotedShape(
 TORCH_API Shape
 GetPromotedBinaryOpShape(const Shape& shape1, const Shape& shape2);
 
-TORCH_API std::vector<std::string> StrSplit(c10::string_view text, char delim);
+TORCH_API std::vector<std::string> StrSplit(std::string_view text, char delim);
 
-} // namespace lazy
-} // namespace torch
+} // namespace torch::lazy

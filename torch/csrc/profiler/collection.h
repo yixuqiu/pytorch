@@ -24,9 +24,7 @@
 #include <torch/csrc/profiler/util.h>
 #include <torch/csrc/utils/python_stub.h>
 
-namespace torch {
-namespace profiler {
-namespace impl {
+namespace torch::profiler::impl {
 
 enum class EventType : uint8_t {
   TorchOp = 0,
@@ -36,7 +34,8 @@ enum class EventType : uint8_t {
   OutOfMemory,
   PyCall,
   PyCCall,
-  Kineto
+  Kineto,
+  PythonGC
 };
 
 // ============================================================================
@@ -49,7 +48,7 @@ struct TORCH_API RawTensorMetadataBase {
   StorageImplData data_;
   c10::ScalarType dtype_{c10::ScalarType::Undefined};
   c10::Layout layout_{c10::Layout::Strided};
-  uint32_t dim_{0};
+  uint32_t size_dim_{0};
 };
 
 // Collected during profiling.
@@ -59,11 +58,12 @@ struct TORCH_API RawTensorMetadata : RawTensorMetadataBase {
   RawTensorMetadata(RawTensorMetadata&&) noexcept = default;
   RawTensorMetadata& operator=(const RawTensorMetadata&) = default;
   RawTensorMetadata& operator=(RawTensorMetadata&&) noexcept = default;
+  ~RawTensorMetadata() = default;
   explicit RawTensorMetadata(const at::Tensor& t);
 
-  // Wrap `weak_self_` in `c10::optional` and split device into components to
+  // Wrap `weak_self_` in `std::optional` and split device into components to
   // keep struct default constructable. (which the std::array initializer needs)
-  c10::optional<WeakTensor> weak_self_;
+  std::optional<WeakTensor> weak_self_;
   c10::DeviceType device_type_{c10::DeviceType::CPU};
   c10::DeviceIndex device_index_{-1};
 };
@@ -85,15 +85,33 @@ struct TORCH_API TensorMetadata : public RawTensorMetadataBase {
   std::vector<int64_t> strides_;
 
   // Set during `calculateUniqueTensorIDs`.
-  c10::optional<TensorID> id_;
-  c10::optional<AllocationID> allocation_id_;
+  std::optional<TensorID> id_;
+  std::optional<AllocationID> allocation_id_;
 };
 
 using op_input_t = std::variant<
     TensorMetadata,
     std::vector<TensorMetadata>,
     c10::IValue,
-    c10::nullopt_t>;
+    std::nullopt_t>;
+
+struct DecodedInputs {
+  std::vector<op_input_t> shapes;
+  std::vector<op_input_t> concrete;
+};
+
+// Parsed op-argument metadata (shapes, dtypes, concrete inputs). Shared by the
+// KinetoEvent constructor and the Kineto metadata producers.
+struct OpArgData {
+  bool hasData;
+  std::vector<shape> shapes;
+  std::vector<std::string> dtypes;
+  std::vector<c10::IValue> concreteInputs;
+  std::vector<std::vector<int64_t>> shapesForKinetoEvent;
+  std::vector<shape> strides;
+};
+
+TORCH_API OpArgData parseArgData(const DecodedInputs& inputs);
 
 // ============================================================================
 // == ExtraFields =============================================================
@@ -109,6 +127,7 @@ struct TorchOpBasicFields {
   uint64_t record_function_id_{0};
   int64_t debug_handle_{0};
   std::string name_;
+  std::string overload_name_;
 
   // Set in the exit callback.
   uint64_t end_tid_{0};
@@ -118,6 +137,16 @@ using jit_stack_t = std::vector<std::string>;
 using jit_modules_t = std::vector<std::string>;
 using extra_args_t = std::unordered_map<std::string, c10::IValue>;
 using extra_meta_t = std::unordered_map<std::string, std::string>;
+using typed_metadata_t = std::unordered_map<std::string, c10::IValue>;
+using kwinputs_t = std::unordered_map<std::string, c10::IValue>;
+
+// Mirrors `libkineto::GenericTraceActivity::Flow`. Used during post processing
+// to embed Kineto events into the broader profiler tree structure.
+struct Flow {
+  uint32_t id{0};
+  uint32_t type{0};
+  uint32_t start{0};
+};
 
 struct FallbackPair {
   ProfilerVoidEventStub device_event_start_ = nullptr;
@@ -130,12 +159,12 @@ struct ExtraFields<EventType::TorchOp> : TorchOpBasicFields {
       TorchOpBasicFields&& f,
       uint64_t correlation_id,
       c10::time_t end_time_ns,
-      std::vector<op_input_t>&& inputs,
-      std::vector<op_input_t>&& concrete_inputs,
+      DecodedInputs&& inputs,
       jit_stack_t&& jit_stack,
       jit_modules_t&& jit_modules,
       extra_args_t&& extra_args,
-      extra_meta_t&& extra_meta,
+      collective_meta_t&& collective_meta,
+      kwinputs_t&& kwinputs,
       FallbackPair&& device_fallback,
       bool allow_tf32_cublas,
       std::unique_ptr<perf_counters_t>&& perf_event_counters)
@@ -143,25 +172,27 @@ struct ExtraFields<EventType::TorchOp> : TorchOpBasicFields {
         correlation_id_{correlation_id},
         end_time_ns_{end_time_ns},
         inputs_{std::move(inputs)},
-        concrete_inputs_{std::move(concrete_inputs)},
         jit_stack_{std::move(jit_stack)},
         jit_modules_{std::move(jit_modules)},
         extra_args_{std::move(extra_args)},
-        extra_meta_{std::move(extra_meta)},
+        collective_meta_{std::move(collective_meta)},
+        kwinputs_{std::move(kwinputs)},
         device_fallback_{std::move(device_fallback)},
         allow_tf32_cublas_{allow_tf32_cublas},
         perf_event_counters_{std::move(perf_event_counters)} {}
   uint64_t correlation_id_;
   c10::time_t end_time_ns_;
-  std::vector<op_input_t> inputs_;
-  std::vector<op_input_t> concrete_inputs_;
+  DecodedInputs inputs_;
   jit_stack_t jit_stack_;
   jit_modules_t jit_modules_;
   extra_args_t extra_args_;
-  extra_meta_t extra_meta_;
+  collective_meta_t collective_meta_;
+  kwinputs_t kwinputs_;
   FallbackPair device_fallback_;
   bool allow_tf32_cublas_;
   std::unique_ptr<perf_counters_t> perf_event_counters_;
+  std::string metadata_json_;
+  Flow flow;
 };
 
 template <>
@@ -174,6 +205,12 @@ struct ExtraFields<EventType::Backend> {
   std::string backend_;
   jit_stack_t jit_stack_;
   jit_modules_t jit_modules_;
+};
+
+template <>
+struct ExtraFields<EventType::PythonGC> {
+  std::string phase;
+  int64_t duration_ns_;
 };
 
 template <>
@@ -197,7 +234,9 @@ struct RawAllocation {
 };
 
 // For performance.
-static_assert(c10::is_pod_v<RawAllocation>, "Non-POD member of RawAllocation.");
+static_assert(
+    std::is_trivial_v<RawAllocation>,
+    "Non-Trivial member of RawAllocation.");
 
 template <>
 struct ExtraFields<EventType::Allocation> : RawAllocation {
@@ -207,8 +246,8 @@ struct ExtraFields<EventType::Allocation> : RawAllocation {
     return {device_type_, device_index_};
   }
 
-  c10::optional<TensorID> id_;
-  c10::optional<AllocationID> allocation_id_;
+  std::optional<TensorID> id_;
+  std::optional<AllocationID> allocation_id_;
 };
 
 template <>
@@ -223,8 +262,8 @@ struct ExtraFields<EventType::OutOfMemory> {
 
 // For performance.
 static_assert(
-    c10::is_pod_v<ExtraFields<EventType::OutOfMemory>>,
-    "Non-POD member of ExtraFields<EventType::OutOfMemory>.");
+    std::is_trivial_v<ExtraFields<EventType::OutOfMemory>>,
+    "Non-Trivial member of ExtraFields<EventType::OutOfMemory>.");
 
 struct PyFrameState {
   int line_no_;
@@ -246,7 +285,7 @@ struct NNModuleInfo {
   struct ParameterInfo {
     std::string name_;
     TensorMetadata metadata_;
-    c10::optional<TensorMetadata> grad_metadata_;
+    std::optional<TensorMetadata> grad_metadata_;
   };
 
   PyModuleSelf self_;
@@ -261,7 +300,7 @@ struct NNModuleInfo {
 struct OptimizerInfo {
   struct ParameterInfo {
     TensorMetadata metadata_;
-    c10::optional<TensorMetadata> grad_metadata_;
+    std::optional<TensorMetadata> grad_metadata_;
     std::vector<std::pair<std::string, TensorMetadata>> state_;
   };
 
@@ -293,8 +332,8 @@ template <>
 struct ExtraFields<EventType::PyCall> : public PyExtraFieldsBase {
   struct args_t {
     PyFrameState frame_state_;
-    c10::optional<NNModuleInfo> module_info_;
-    c10::optional<OptimizerInfo> optimizer_info_;
+    std::optional<NNModuleInfo> module_info_;
+    std::optional<OptimizerInfo> optimizer_info_;
   };
 
   ExtraFields(
@@ -308,8 +347,8 @@ struct ExtraFields<EventType::PyCall> : public PyExtraFieldsBase {
         optimizer_{std::move(args.optimizer_info_)} {}
 
   PyFrameState callsite_;
-  c10::optional<NNModuleInfo> module_;
-  c10::optional<OptimizerInfo> optimizer_;
+  std::optional<NNModuleInfo> module_;
+  std::optional<OptimizerInfo> optimizer_;
 };
 
 template <>
@@ -329,57 +368,48 @@ struct ExtraFields<EventType::PyCCall> : public PyExtraFieldsBase {
 
 template <>
 struct ExtraFields<EventType::Kineto> {
-  // Mirrors `libkineto::GenericTraceActivity::Flow`. This information is used
-  // during post processing to properly embed Kineto events into the broader
-  // profiler tree structure. End users are not generally expected to use these
-  // fields directly, but they are available for debugging.
-  struct Flow {
-    uint32_t id{0};
-    uint32_t type{0};
-    uint32_t start{0};
-  };
-
   std::string name_;
   int64_t duration_ns_{0};
   uint64_t correlation_id_{0};
   libkineto::ActivityType activity_type_;
   Flow flow;
-  std::weak_ptr<Result> linked_activity_{};
+  std::weak_ptr<Result> linked_activity_;
+  std::string metadata_json_;
+  extra_meta_t extra_meta_;
+  typed_metadata_t typed_metadata_;
 };
 
 struct TORCH_API Result : public std::enable_shared_from_this<Result> {
   template <typename... Args>
-  [[nodiscard]] static std::shared_ptr<Result> create(Args... args) {
+  [[nodiscard]] static std::shared_ptr<Result> create(Args&&... args) {
     return std::shared_ptr<Result>(new Result(std::forward<Args>(args)...));
   }
 
   template <typename T>
-  decltype(auto) visit(T&& visitor) {
+  auto visit(T&& visitor) {
     return std::visit(std::forward<T>(visitor), extra_fields_);
   }
 
   template <typename T>
-  decltype(auto) visit(T&& visitor) const {
+  auto visit(T&& visitor) const {
     return std::visit(std::forward<T>(visitor), extra_fields_);
   }
 
   template <typename T, typename Fn>
-  void visit_if_base(Fn&& fn) const {
-    visit([&](const auto& extra_fields) {
-      using extra_fields_t = typename std::remove_cv_t<
-          typename std::remove_reference_t<decltype(extra_fields)>>;
-
-      if constexpr (std::is_base_of_v<T, extra_fields_t>) {
+  void visit_if_base(const Fn& fn) const {
+    visit([&]<typename EF>(const EF& extra_fields) {
+      if constexpr (std::is_base_of_v<T, EF>) {
         fn(extra_fields);
       }
     });
   }
 
   EventType tag() const {
-    return visit([](const auto& i) { return deduceTag(i); });
+    return visit([]<EventType E>(const ExtraFields<E>&) { return E; });
   }
 
   std::string name() const;
+  std::string overload_name() const;
   libkineto::ActivityType kinetoType() const;
   uint64_t correlationID() const;
   int64_t endTimeNS() const;
@@ -397,13 +427,14 @@ struct TORCH_API Result : public std::enable_shared_from_this<Result> {
       ExtraFields<EventType::OutOfMemory>,
       ExtraFields<EventType::PyCall>,
       ExtraFields<EventType::PyCCall>,
-      ExtraFields<EventType::Kineto>>
+      ExtraFields<EventType::Kineto>,
+      ExtraFields<EventType::PythonGC>>
       extra_fields_;
 
   std::weak_ptr<Result> parent_;
   std::vector<std::shared_ptr<Result>> children_;
   bool finished_{false};
-
+  bool hidden_{false};
   const torch::profiler::impl::kineto::activity_t* kineto_activity_{nullptr};
 
  private:
@@ -412,16 +443,11 @@ struct TORCH_API Result : public std::enable_shared_from_this<Result> {
       int64_t start_time_ns,
       uint64_t start_tid,
       kineto::DeviceAndResource kineto_info,
-      ExtraFields<E>&& extra_fields)
+      ExtraFields<E> extra_fields)
       : start_time_ns_{start_time_ns},
         start_tid_{start_tid},
         kineto_info_{kineto_info},
         extra_fields_{std::move(extra_fields)} {}
-
-  template <EventType E>
-  static EventType deduceTag(const ExtraFields<E>&) {
-    return E;
-  }
 };
 
 struct KinetoObserverContext : public at::ObserverContext {
@@ -435,12 +461,27 @@ struct KinetoObserverContext : public at::ObserverContext {
 
     bool allow_tf32_cublas_;
     std::unique_ptr<perf_counters_t> counters_;
+    collective_meta_t* collective_meta_{};
   };
 
   explicit KinetoObserverContext(Event* event) : event_{event} {}
 
   Event* event_;
   FallbackPair* fallback_{nullptr};
+
+  // Generation of the global session this op entered under, snapshotted from
+  // global_callback_session at enter time. That counter bumps per new global
+  // session (not on the mid-session toggle). At exit, a match means event_ is
+  // still live so the exit finalizes it; a mismatch means the session was torn
+  // down and event_ freed, so the exit drops without touching event_.
+  uint64_t session_generation_{0};
+
+  // True if begin_op pushed an external correlation id for this op. The
+  // matching pop must run on every exit path (including teardown /
+  // stale-session early exits), or the id leaks onto the device profiling
+  // backend's per-thread correlation stack, which is not reset across profiler
+  // sessions.
+  bool pushed_correlation_id_{false};
 };
 
 constexpr int IO_ENCODER_DEFAULT_BLOCK_SIZE = 1024;
@@ -452,20 +493,16 @@ constexpr int SCALAR_LIST_LENGTH_LIMIT = 30;
 // contiguous AppendOnlyList so that we no longer create vectors for shapes
 // and dtypes on every op. Those vectors can be created during
 // post-processing.
-// It splits the data into two categories: input shapes and concrete inputs.
 class InputOutputEncoder final {
  public:
   void push(c10::ArrayRef<const c10::IValue> values);
 
   // Used during post-processing to unpack the encoded data.
-  // Each method returns a "supplier" lambda which takes no arguments;
-  // invoking the lambda once will return a list of args that represent
-  // the inputs for one op.
-  // The data is split into two streams: "input shapes" and "concrete inputs".
+  // Returns a decoder lambda which takes no arguments; invoking the lambda once
+  // returns the shape and concrete input views for one op.
   // Note: "auto" only works because these are only used in collection.cpp,
   // where they are implemented.
-  auto getInputShapeGenerator();
-  auto getConcreteInputGenerator();
+  auto getInputDecoder();
 
   bool isSupportedScalarList(const c10::IValue& list_candidate);
 
@@ -481,14 +518,8 @@ class InputOutputEncoder final {
     TERMINATOR
   };
 
-  enum class IOType { Shapes, ConcreteInputs, None };
-
  private:
   void push(const at::Tensor& t);
-
-  // Implementation detail for getInputShapeGenerator and
-  // getConcreteInputGenerator
-  auto getIValueGenerator(const IOType& io_type);
 
   AppendOnlyList<Tag, IO_ENCODER_DEFAULT_BLOCK_SIZE> tags_;
   AppendOnlyList<RawTensorMetadata, IO_ENCODER_DEFAULT_BLOCK_SIZE>
@@ -528,6 +559,11 @@ class TORCH_API ThreadLocalSubqueue {
   template <class... Args>
   void emplace_py_call(Args&&... args) {
     py_calls_.emplace_back(std::forward<Args>(args)...);
+  }
+
+  template <class... Args>
+  void emplace_gc_call(Args&&... args) {
+    pythongc_.emplace_back(std::forward<Args>(args)...);
   }
 
   uint64_t tid() const {
@@ -590,8 +626,11 @@ class TORCH_API ThreadLocalSubqueue {
     // with_flops
     AppendOnlyList<extra_args_t, BlockSize> extra_args_;
 
-    // report extra metadata, i.e. collective communication meta
-    AppendOnlyList<extra_meta_t, BlockSize> extra_meta_;
+    // report collective communication metadata
+    AppendOnlyList<collective_meta_t, BlockSize> collective_meta_;
+
+    // report kwinputs
+    AppendOnlyList<kwinputs_t, BlockSize> kwinputs_;
 
     // ProfilerState::KINETO_GPU_FALLBACK or
     // ProfilerState::KINETO_PRIVATEUSE1_FALLBACK
@@ -616,6 +655,9 @@ class TORCH_API ThreadLocalSubqueue {
       std::pair<python_tracer::TraceKey, c10::approx_time_t>,
       BlockSize>
       py_calls_;
+  // gc with_stack (Python)
+  AppendOnlyList<std::pair<std::string, c10::approx_time_t>, BlockSize>
+      pythongc_;
 };
 
 class TORCH_API RecordQueue {
@@ -623,8 +665,10 @@ class TORCH_API RecordQueue {
   RecordQueue(ProfilerConfig config, std::set<ActivityType> activities);
 
   bool tracePython() const;
+  bool getPythonGcEvents() const;
   ThreadLocalSubqueue* getSubqueue();
   void stop();
+  void restart();
 
   // NB: This is a destructive operation.
   std::pair<
@@ -646,17 +690,22 @@ class TORCH_API RecordQueue {
 };
 
 TORCH_API bool get_record_concrete_inputs_enabled();
-TORCH_API void set_record_concrete_inputs_enabled_fn(std::function<bool()>);
-TORCH_API void set_record_concrete_inputs_enabled_val(bool);
+TORCH_API void set_record_concrete_inputs_enabled_fn(
+    std::function<bool()> /*fn*/);
+TORCH_API void set_record_concrete_inputs_enabled_val(bool /*val*/);
 
 TORCH_API bool get_fwd_bwd_enabled();
-TORCH_API void set_fwd_bwd_enabled_fn(std::function<bool()>);
-TORCH_API void set_fwd_bwd_enabled_val(bool);
+TORCH_API void set_fwd_bwd_enabled_fn(std::function<bool()> /*fn*/);
+TORCH_API void set_fwd_bwd_enabled_val(bool /*val*/);
 
 TORCH_API bool get_cuda_sync_enabled();
-TORCH_API void set_cuda_sync_enabled_fn(std::function<bool()>);
-TORCH_API void set_cuda_sync_enabled_val(bool);
+TORCH_API void set_cuda_sync_enabled_fn(std::function<bool()> /*fn*/);
+TORCH_API void set_cuda_sync_enabled_val(bool /*val*/);
 
-} // namespace impl
-} // namespace profiler
-} // namespace torch
+// Comms related RecordFunctions will record information about tensor storage
+// locations.
+TORCH_API bool get_record_tensor_addrs_enabled();
+TORCH_API void set_record_tensor_addrs_enabled_fn(std::function<bool()> /*fn*/);
+TORCH_API void set_record_tensor_addrs_enabled_val(bool /*val*/);
+
+} // namespace torch::profiler::impl

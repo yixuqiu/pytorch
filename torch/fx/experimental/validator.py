@@ -1,22 +1,30 @@
+import builtins
 import functools
 import logging
 import math
 import operator
-import sympy
-import builtins
-
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Any, overload, TYPE_CHECKING, TypeVar
+
+import sympy
 
 import torch
 import torch.fx
 import torch.fx.traceback as fx_traceback
-
 from torch._dynamo.exc import TorchDynamoException
+from torch._dynamo.utils import dynamo_timed
 from torch.fx.node import Argument, Target
 from torch.utils._sympy.interp import sympy_interp
 
+
+if TYPE_CHECKING:
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv, TrackedFake
+
+
 log = logging.getLogger(__name__)
+
+_R = TypeVar("_R")
 
 try:
     import z3  # type: ignore[import]
@@ -43,7 +51,6 @@ try:
     # and the FX nodes (see [Note: PopulateValidator]) that go through
     # 'ShapeEnv.evaluate_expr' function. Finally, we run the validation.
     # (see [Note: TranslationValidator])
-
     # Better Z3 to string implementation (for a small fraction of Z3).
     #
     # Here are the things we clean before showing the Z3 expression:
@@ -57,15 +64,15 @@ try:
     #
     #   - Collect a chain of the same operations into one
     def z3str(e: z3.ExprRef) -> str:
-        assert z3.is_expr(e), f"unsupported expression type: {e}"
+        if not z3.is_expr(e):
+            raise AssertionError(f"unsupported expression type: {e}")
 
-        def get_args_str(e: z3.ExprRef) -> List[str]:
+        def get_args_str(e: z3.ExprRef) -> list[str]:
             return [z3str(e.arg(i)) for i in range(e.num_args())]
 
         # First, we simplify the given expression.
         # This is done using rewriting rules, so shouldn't take long.
         e = z3.simplify(e)
-
 
         # Only support function applications.
         # Even Z3 "variables" are, in fact, function applications.
@@ -87,7 +94,7 @@ try:
             # Collect the arguments of chains of ADD and MUL.
             # This is safe, since they are associative.
 
-            def collect_str_args(e):
+            def collect_str_args(e: z3.ExprRef) -> list[str]:
                 if not (z3.is_app(e) and e.decl().kind() == kind):
                     return [z3str(e)]
                 else:
@@ -105,10 +112,12 @@ try:
             #   - a < b ==> (Not (<= b a)) ==> (> b a)
             #   - a > b ==> (Not (<= a b)) ==> (> a b)
 
-            assert e.num_args() == 1
+            if e.num_args() != 1:
+                raise AssertionError(f"Expected 1 arg, got {e.num_args()}")
             arg = e.arg(0)
 
-            assert z3.is_app(arg)
+            if not z3.is_app(arg):
+                raise AssertionError("Expected z3 app")
             argkind = arg.decl().kind()
 
             logic_inverse = {
@@ -122,7 +131,8 @@ try:
                 args = get_args_str(arg)
 
         elif kind in (z3.Z3_OP_TO_INT, z3.Z3_OP_TO_REAL):
-            assert e.num_args() == 1
+            if e.num_args() != 1:
+                raise AssertionError(f"Expected 1 arg, got {e.num_args()}")
             argstr = z3str(e.arg(0))
 
             # Check if it's the floor division pattern.
@@ -133,15 +143,34 @@ try:
             return argstr
 
         elif kind == z3.Z3_OP_UNINTERPRETED:
-            assert e.num_args() == 0
+            if e.num_args() != 0:
+                raise AssertionError(f"Expected 0 args, got {e.num_args()}")
             return str(decl)
 
         string = op + " " + " ".join(args)
         return f"({string.rstrip()})"
 
+    # We need to convert to/from BitVec in order to use z3 bitwise ops.
+    # We assume that integers are 64 bit.
+    # If all args are boolean, then use the boolean bitwise op implementation instead, if provided.
+    def _bitwise_op(
+        bitwise_func: Callable[..., Any], bool_func: Callable[..., Any] | None
+    ) -> Callable[..., Any]:
+        @functools.wraps(bitwise_func)
+        def wrapper(self: "_Z3Ops", *args: z3.ExprRef) -> Any:
+            if bool_func is not None and all(
+                isinstance(arg, z3.BoolRef) for arg in args
+            ):
+                return bool_func(*args)
+
+            wrapped_args = tuple(z3.Int2BV(a, 64) for a in args)
+            return z3.BV2Int(bitwise_func(*wrapped_args))
+
+        return wrapper
+
     # Implementation of Python semantics as Z3 expressions.
     #
-    # Z3 Real-Int theory has operators with semantics that differ that of
+    # Z3 Real-Int theory has operators with semantics that differ from that of
     # Python. Therefore, in order to get it right, we need to implement
     # the (Python) semantics we are relying on in Z3.
     @dataclass
@@ -163,6 +192,9 @@ try:
         def to_int(x: z3.ArithRef) -> z3.ArithRef:
             return x if x.is_int() else z3.ToInt(x)
 
+        def sym_sum(self, args: z3.ArithRef) -> z3.ArithRef:
+            return sum(args)  # pyrefly: ignore [no-matching-overload]
+
         # Implements Python division semantics.
         def div(self, numerator: z3.ArithRef, denominator: z3.ArithRef) -> z3.ArithRef:
             self.validator.add_assertion(denominator != 0)  # type: ignore[arg-type]
@@ -174,7 +206,9 @@ try:
 
         # Python semantics for 'FloorDiv' states that before applying the floor
         # function, the operands are converted to their common type.
-        def floordiv(self, numerator: z3.ArithRef, denominator: z3.ArithRef) -> z3.ArithRef:
+        def floordiv(
+            self, numerator: z3.ArithRef, denominator: z3.ArithRef
+        ) -> z3.ArithRef:
             cast_result_to_real = numerator.is_real() or denominator.is_real()
             result = _Z3Ops.to_int(self.div(numerator, denominator))
             # Since the 'result' is already an integer, we just have to check
@@ -182,11 +216,10 @@ try:
             return _Z3Ops.to_real(result) if cast_result_to_real else result
 
         def ceil(self, number: z3.ArithRef) -> z3.ArithRef:
-            return z3.If(
-                self.floor(number) < number,
-                self.floor(number + 1),
-                number
-            )  # type: ignore[return-value]
+            return z3.If(self.floor(number) < number, self.floor(number + 1), number)  # type: ignore[return-value]
+
+        def trunc(self, number: z3.ArithRef) -> z3.ArithRef:
+            return z3.If(number >= 0, self.floor(number), self.ceil(number))  # type: ignore[return-value]
 
         def max(self, a: z3.ArithRef, b: z3.ArithRef) -> z3.ArithRef:
             return z3.If(a > b, a, b)  # type: ignore[return-value]
@@ -202,7 +235,7 @@ try:
         def pow(self, base: z3.ArithRef, exp: z3.ArithRef) -> z3.ArithRef:
             # Z3 can't handle complex numbers very well.
             self.validator.add_assertion(z3.Or(base != 0, exp > 0))  # type: ignore[arg-type]
-            return base ** exp
+            return base**exp
 
         def sqrt(self, number: z3.ArithRef) -> z3.ArithRef:
             # Square-root:
@@ -211,16 +244,13 @@ try:
             # 2. The number should be positive or zero.
             #    Otherwise, Z3 returns 'unknown'.
             self.validator.add_assertion(number >= 0)
-            return number ** 0.5
+            return number**0.5
 
         def abs(self, number: z3.ArithRef) -> z3.ArithRef:
             return z3.Abs(number)
 
-        def round(self, number: z3.ArithRef, ndigits: Optional[z3.ArithRef] = None) -> z3.ArithRef:
-            if ndigits is not None:
-                raise ValueError("round(..., ndigits=) is currently not supported by shape validations.")
-
-            # Pythons builtin 'round' implements the 'round half to even' strategy
+        def round_to_int(self, number: z3.ArithRef) -> z3.ArithRef:
+            # Python's builtin 'round' implements the 'round half to even' strategy
             # See https://en.wikipedia.org/wiki/Rounding#Rounding_half_to_even
             # z3 has an equivalent z3.fpRoundToIntegral(z3.RoundNearestTiesToEven(), ...), but this only applies to
             # floating point numbers, which is different from real numbers that we are dealing with here.
@@ -234,6 +264,11 @@ try:
                 self.floor(number + 0.5),
             )
 
+        bitwise_and = _bitwise_op(operator.and_, z3.And)
+        bitwise_or = _bitwise_op(operator.or_, z3.Or)
+        lshift = _bitwise_op(operator.lshift, None)
+        rshift = _bitwise_op(operator.rshift, None)
+
     # Lifts a callable to be used in Z3.
     #
     # This function replaces the given 'op' by a function that:
@@ -242,17 +277,19 @@ try:
     #
     #   2. Calls an operation that corresponds to 'op', but works with Z3
     #      inhabitants (left as is if it works as is)
-    def z3op(op: Callable, validator: "TranslationValidator") -> Callable:
+    def z3op(
+        op: Callable[..., Any], validator: "TranslationValidator"
+    ) -> Callable[..., Any]:
         # Operations that have booleans as their argument.
         # This is needed because the argument of some FX nodes were
         # literal integers, instead of booleans. So, whenever this flag
         # is set, we also convert ints to booleans.
-        boolean_ops = {operator.not_, operator.and_, operator.or_}
+        boolean_ops = {operator.not_, torch.sym_not}
         as_bool = op in boolean_ops
 
         # Lifts the function into 'z3.ExprRef' domain.
-        def lift(func):
-            def wrap(a) -> z3.ExprRef:
+        def lift(func: Callable[..., _R]) -> Callable[..., _R]:
+            def wrap(a: object) -> z3.ExprRef:
                 if isinstance(a, (z3.ArithRef, z3.BoolRef)):
                     return a
                 # Convert it into a Z3 value, if it is some of the supported
@@ -266,9 +303,12 @@ try:
                 raise ValueError(f"can't lift type: {type(a)}")
 
             @functools.wraps(func)
-            def wrapper(*args):
+            def wrapper(*args: object) -> Any:
                 # Lifts the arguments into a list of Z3 inhabitants.
-                wrapped_args = (wrap(a) for a in args)
+                if len(args) == 1 and isinstance(args[0], (list, tuple)):
+                    wrapped_args = (tuple(wrap(a) for a in args[0]),)
+                else:
+                    wrapped_args = tuple(wrap(a) for a in args)
                 # Run the function on the Z3 expressions.
                 return func(*wrapped_args)
 
@@ -278,23 +318,27 @@ try:
         replacement_map = {
             # Operator module.
             operator.not_: lift(z3.Not),
-            operator.and_: lift(z3.And),
-            operator.or_: lift(z3.Or),
+            torch.sym_not: lift(z3.Not),
+            operator.and_: lift(ops.bitwise_and),
+            operator.or_: lift(ops.bitwise_or),
+            operator.lshift: lift(ops.lshift),
+            operator.rshift: lift(ops.rshift),
             operator.floordiv: lift(ops.floordiv),
             operator.truediv: lift(ops.div),
             operator.mod: lift(ops.mod),
             operator.abs: lift(ops.abs),
-            builtins.round: lift(ops.round),
-
+            builtins.round: lift(ops.round_to_int),
             # Math module.
             math.ceil: lift(ops.ceil),
             math.floor: lift(ops.floor),
-
+            math.trunc: lift(ops.trunc),
             # Torch module.
             torch.sym_float: lift(ops.to_real),
             torch.sym_max: lift(ops.max),
             torch.sym_min: lift(ops.min),
-            torch.sym_ite: lift(lambda b, t, f: t if b else f),
+            torch.sym_not: lift(z3.Not),
+            torch.sym_sum: lift(ops.sym_sum),
+            torch.sym_ite: lift(lambda b, t, f: z3.If(b, t, f)),
             torch._sym_sqrt: lift(ops.sqrt),  # type: ignore[attr-defined]
             # Not lifted because we only use this function as a
             # marker for adding the expression as validator input.
@@ -312,7 +356,9 @@ try:
     # it adds the Z3 expression corresponding to the argument as validator
     # input.
     class PopulateValidator(torch.fx.Interpreter):
-        def __init__(self, graph: torch.fx.Graph, validator: "TranslationValidator"):
+        def __init__(
+            self, graph: torch.fx.Graph, validator: "TranslationValidator"
+        ) -> None:
             # Reference to the translation validator.
             self.validator = validator
 
@@ -320,17 +366,24 @@ try:
             module = torch.fx.GraphModule(root={}, graph=graph)
             super().__init__(module, garbage_collect_values=True)
 
-        def placeholder(self, target: Target, args: Tuple[Argument, ...], kwargs: Dict[str, Any]) -> Any:
+        def placeholder(
+            self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
+        ) -> Any:
             symbol = fx_traceback.get_current_meta()["symbol"]
             return self.validator.z3var(symbol)
 
-        def call_function(self, target: Target, args: Tuple[Argument, ...], kwargs: Dict[str, Any]) -> Any:
-            if target != torch._assert:
+        def call_function(
+            self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
+        ) -> Any:
+            if target is not torch._assert:
                 # Lift and runs the node target function
                 return super().call_function(z3op(target, self.validator), args, kwargs)  # type: ignore[arg-type]
             # Adds the Z3 expression corresponding to the first argument
             # as a validator input.
-            assert len(args) == 1, f"expected 1 argument on assertion. Got: {len(args)} "
+            if len(args) != 1:
+                raise AssertionError(
+                    f"expected 1 argument on assertion. Got: {len(args)} "
+                )
             self.validator.add_source_expr(args[0])  # type: ignore[arg-type]
 
     # Translates SymPy expressions into Z3 expressions.
@@ -343,13 +396,14 @@ try:
         OPERATOR_HANDLES = {"add", "mul", "eq", "ne", "lt", "gt", "le", "ge"}
 
         def __init__(
-                self,
-                validator: "TranslationValidator",
+            self,
+            validator: "TranslationValidator",
         ) -> None:
             self._validator = validator
             self._ops = _Z3Ops(self._validator)
 
-        def constant(self, value: Any, dtype: torch.dtype) -> z3.ExprRef:
+        def constant(self, value: int | float | bool, dtype: torch.dtype) -> z3.ExprRef:
+            # TODO: Probably OK to relax this and allow lower precision
             if dtype is torch.int64:
                 return z3.IntVal(int(value))
             if dtype is torch.double:
@@ -358,10 +412,30 @@ try:
                 return z3.BoolVal(bool(value))
             raise ValueError(f"unsupported dtype (SympyToZ3): {dtype}")
 
-        def truediv(self, numerator: z3.ArithRef, denominator: z3.ArithRef) -> z3.ArithRef:
+        def to_dtype(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            if dtype == torch.float64:
+                return z3.ToReal(x)
+            raise NotImplementedError(f"to_dtype {dtype} NYI")
+
+        def trunc_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            return z3.ToInt(x)
+
+        def round_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            return self._ops.round_to_int(x)
+
+        def int_truediv(
+            self, numerator: z3.ArithRef, denominator: z3.ArithRef
+        ) -> z3.ArithRef:
             return self._ops.div(numerator, denominator)
 
-        def floordiv(self, numerator: z3.ArithRef, denominator: z3.ArithRef) -> z3.ArithRef:
+        def truediv(
+            self, numerator: z3.ArithRef, denominator: z3.ArithRef
+        ) -> z3.ArithRef:
+            return self._ops.div(numerator, denominator)
+
+        def floordiv(
+            self, numerator: z3.ArithRef, denominator: z3.ArithRef
+        ) -> z3.ArithRef:
             return self._ops.floordiv(numerator, denominator)
 
         def div(self, numerator: z3.ArithRef, denominator: z3.ArithRef) -> z3.ArithRef:
@@ -370,17 +444,30 @@ try:
         def pow(self, base: z3.ArithRef, exp: z3.ArithRef) -> z3.ArithRef:
             return self._ops.pow(base, exp)
 
+        def pow_by_natural(self, base: z3.ArithRef, exp: z3.ArithRef) -> z3.ArithRef:
+            return self._ops.pow(base, exp)
+
         def mod(self, p: z3.ArithRef, q: z3.ArithRef) -> z3.ArithRef:
             return self._ops.mod(p, q)
 
-        def round(self, number: z3.ArithRef, ndigits: Optional[z3.ArithRef] = None) -> z3.ArithRef:
-            return self._ops.round(number, ndigits)
+        def python_mod(self, p: z3.ArithRef, q: z3.ArithRef) -> z3.ArithRef:
+            return self._ops.mod(p, q)
+
+        def ceil_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            return self._ops.ceil(x)
+
+        def floor_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            return self._ops.floor(x)
 
         def __getattr__(self, name: str) -> Any:
             REPLACEMENT = {
                 "and_": z3.And,
                 "or_": z3.Or,
                 "not_": z3.Not,
+                "bitwise_and": self._ops.bitwise_and,
+                "bitwise_or": self._ops.bitwise_or,
+                "lshift": self._ops.lshift,
+                "rshift": self._ops.rshift,
                 "floor": self._ops.floor,
                 "ceil": self._ops.ceil,
                 "minimum": self._ops.min,
@@ -415,29 +502,30 @@ try:
             log.debug("new instance")
 
             # Mapping of SymPy symbols to Z3 variables.
-            self.symbols: Dict[sympy.Symbol, z3.ExprRef] = {}
+            self.symbols: dict[sympy.Symbol, z3.ExprRef] = {}
 
             # Set of source Z3 expressions.
             # They represent the generated guards without any kind of
             # simplification or transformation.
-            self._source_exprs: Set[z3.BoolRef] = set()
+            self._source_exprs: set[z3.BoolRef] = set()
 
             # Set of target Z3 expressions.
             # They represent the actual checked guards at runtime. They might
             # be simplified or transformed versions of the source guards.
-            self._target_exprs: Set[z3.BoolRef] = set()
+            self._target_exprs: set[z3.BoolRef] = set()
 
             # Set of Z3 expressions representing assertions over both the
             # source and target expressions.
-            self._assertions: Set[z3.BoolRef] = set()
+            self._assertions: set[z3.BoolRef] = set()
 
         # Retrieves the corresponding Z3 variable.
         def z3var(self, symbol: sympy.Symbol) -> z3.ExprRef:
-            assert symbol in self.symbols, f"Z3 variable not found for: {symbol}"
+            if symbol not in self.symbols:
+                raise AssertionError(f"Z3 variable not found for: {symbol}")
             return self.symbols[symbol]
 
-        # Create a variable in Z3 of 'type' for 'symbol', if it doesn't already exists.
-        def add_var(self, symbol: sympy.Symbol, type: Type) -> z3.ExprRef:
+        # Create a variable in Z3 of 'type' for 'symbol', if it doesn't already exist.
+        def add_var(self, symbol: sympy.Symbol, type: type) -> z3.ExprRef:
             if symbol in self.symbols:
                 return self.symbols[symbol]
 
@@ -463,15 +551,16 @@ try:
         # Checks whether all symbols were already added.
         def _check_freesymbols(self, e: sympy.Basic) -> None:
             for s in e.free_symbols:
-                assert isinstance(s, sympy.Symbol)
+                if not isinstance(s, sympy.Symbol):
+                    raise AssertionError(f"Expected sympy.Symbol, got {type(s)}")
                 # Call 'z3var' just to check whether there's already a
                 # Z3 variable corresponding to 's'.
                 self.z3var(s)
 
-
         def to_z3_boolean_expr(self, e: sympy.Basic) -> z3.BoolRef:
             z3expr = SympyToZ3(self).run(e)
-            assert isinstance(z3expr, z3.BoolRef), f"expected boolean expression. Got: {z3expr}"
+            if not isinstance(z3expr, z3.BoolRef):
+                raise AssertionError(f"expected boolean expression. Got: {z3expr}")
             return z3expr
 
         def add_source_expr(self, e: z3.BoolRef) -> None:
@@ -479,27 +568,30 @@ try:
                 log.debug("add source guard: %s", z3str(e))
             self._source_exprs.add(e)
 
-        def add_target_expr(self, e: sympy.Expr) -> None:
+        def add_target_expr(self, e: "sympy.logic.boolalg.Boolean") -> None:
             self._check_freesymbols(e)
             z3expr = self.to_z3_boolean_expr(e)
             if e not in self._target_exprs:
                 log.debug("add target guard: %s", z3str(z3expr))
             self._target_exprs.add(z3expr)
 
-        def add_assertion(self, e: Union[z3.BoolRef, sympy.Basic]) -> None:
+        def add_assertion(self, e: z3.BoolRef | sympy.Basic) -> None:
             if isinstance(e, sympy.Basic):
                 self._check_freesymbols(e)
                 ref = self.to_z3_boolean_expr(e)
             else:
                 ref = e
-            assert isinstance(ref, z3.BoolRef)
+            if not isinstance(ref, z3.BoolRef):
+                raise AssertionError(f"Expected z3.BoolRef, got {type(ref)}")
             if ref not in self._assertions:
                 log.debug("add assertion: %s", z3str(ref))
             self._assertions.add(ref)
 
         def validate(self) -> None:
-            from torch._dynamo.utils import dynamo_timed
+            with dynamo_timed("TranslationValidator.validate"):
+                return self._validate()
 
+        def _validate(self) -> None:
             if len(self._source_exprs) == 0 or len(self._target_exprs) == 0:
                 # If there are no source/target expressions, there's nothing we really
                 # wish to prove. So, we just return.
@@ -529,49 +621,63 @@ try:
             solver.add(*self._target_exprs)
 
             log.debug("translation validation: start")
-            r = dynamo_timed()(solver.check)()
+            r = solver.check()
             if r == z3.sat:
                 # Target expressions are unsound.
                 # Log the found model and the source expressions that failed.
                 model = solver.model()
                 raise ValidationException(
-                    model, self._assertions, self._target_exprs,
+                    model,
+                    self._assertions,
+                    self._target_exprs,
                     failed_source_exprs=[
                         inp for inp in self._source_exprs if not model.evaluate(inp)
-                    ]
+                    ],
                 )
             else:
                 if r == z3.unknown:
                     # Could not find a solution. It didn't fail, but it also
                     # didn't succeed. Canceling the validation execution (keyboard
                     # interrupt) also gets to this branch.
-                    log.warning("translation validation: could not validate: got z3.unknown")
+                    log.warning(
+                        "translation validation: could not validate: got z3.unknown"
+                    )
                 else:
                     # Target expressions are sound.
-                    assert r == z3.unsat
+                    if r != z3.unsat:
+                        raise AssertionError(f"Expected z3.unsat, got {r}")
                     log.debug("translation validation: success")
 
 except ImportError:
     _HAS_Z3 = False
 
     __all__ = [
-        "translation_validation_enabled", "translation_validation_timeout",
-        "ValidationException", "BisectValidationException",
+        "translation_validation_enabled",
+        "translation_validation_timeout",
+        "ValidationException",
+        "BisectValidationException",
     ]
 
 else:
     _HAS_Z3 = True
 
     __all__ = [
-        "z3str", "z3op", "PopulateValidator", "SympyToZ3", "TranslationValidator",
-        "translation_validation_enabled", "translation_validation_timeout",
-        "ValidationException", "BisectValidationException",
+        "z3str",
+        "z3op",
+        "PopulateValidator",
+        "SympyToZ3",
+        "TranslationValidator",
+        "translation_validation_enabled",
+        "translation_validation_timeout",
+        "ValidationException",
+        "BisectValidationException",
     ]
 
 from torch.fx.experimental import _config as config
 
+
 def translation_validation_enabled() -> bool:
-    # Checks everytime this function is called, in case the Dynamo
+    # Checks every time this function is called, in case the Dynamo
     # option is set, but Z3 is not installed.
     _assert_z3_installed_if_tv_set()
     return _HAS_Z3 and config.translation_validation
@@ -581,21 +687,25 @@ def translation_validation_timeout() -> int:
     return config.translation_validation_timeout
 
 
-def _assert_z3_installed_if_tv_set():
-    assert _HAS_Z3 or not config.translation_validation, (
-        "translation validation requires Z3 package. Please, either install "
-        "z3-solver or disable translation validation."
-    )
+def _assert_z3_installed_if_tv_set() -> None:
+    if not (_HAS_Z3 or not config.translation_validation):
+        raise AssertionError(
+            "translation validation requires Z3 package. Please, either install "
+            "z3-solver or disable translation validation."
+        )
 
 
 class ValidationException(TorchDynamoException):
-    def __init__(self, model, assertions, target_exprs, failed_source_exprs):
-        assert _HAS_Z3
+    def __init__(
+        self, model: Any, assertions: Any, target_exprs: Any, failed_source_exprs: Any
+    ) -> None:
+        if not _HAS_Z3:
+            raise AssertionError("Z3 is required")
 
-        def symbolstr(sym) -> str:
+        def symbolstr(sym: Any) -> str:
             return f"{sym}: {model[sym]}"
 
-        def joinlines(xs) -> str:
+        def joinlines(xs: Any) -> str:
             return "\n".join(f"  ==> {x}" for x in xs)
 
         model_str = joinlines(sorted(map(symbolstr, model)))
@@ -617,12 +727,18 @@ Target Expressions:
 Failed Source Expressions:
 {failed_source_exprs_str}"""
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.msg}\n\n{self.details}"
 
 
 class BisectValidationException(TorchDynamoException):
-    def __init__(self, validation_exc, expr, failed_action, traced_node):
+    def __init__(
+        self,
+        validation_exc: ValidationException,
+        expr: sympy.Basic,
+        failed_action: str,
+        traced_node: torch.fx.Node,
+    ) -> None:
         self.msg = f"translation validation failed when {failed_action}: {expr}"
         self.details = f"""\
 Failure occurred while running node:
@@ -630,11 +746,13 @@ Failure occurred while running node:
 
 {validation_exc.details}"""
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.msg}\n\n{self.details}"
+
 
 # Checks when this module is loaded.
 _assert_z3_installed_if_tv_set()
+
 
 # Translation validation bisection.
 #
@@ -644,15 +762,24 @@ _assert_z3_installed_if_tv_set()
 # As guards are added by ShapeEnv.evaluate_expr calls, some simplification errors
 # might be silently happening. This function tries to nail down exactly at which
 # point things went wrong from a validation perspective.
-def bisect(shape_env):
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv, SHAPEENV_EVENT_KEY, CURRENT_NODE_KEY
-    from torch.fx.experimental.recording import FakeTensorMeta, ShapeEnvEvent, replay_shape_env_events
+def bisect(shape_env: "ShapeEnv") -> None:
+    from torch.fx.experimental.recording import (
+        FakeTensorMeta,
+        replay_shape_env_events,
+        ShapeEnvEvent,
+    )
+    from torch.fx.experimental.symbolic_shapes import (
+        CURRENT_NODE_KEY,
+        ShapeEnv,
+        SHAPEENV_EVENT_KEY,
+    )
 
     events = shape_env.events
 
     # Retrieves the ShapeEnvEvent associated with node.
     def get_node_event(node: torch.fx.Node) -> ShapeEnvEvent:
-        assert SHAPEENV_EVENT_KEY in node.meta
+        if SHAPEENV_EVENT_KEY not in node.meta:
+            raise AssertionError("SHAPEENV_EVENT_KEY not in node.meta")
         return events[node.meta[SHAPEENV_EVENT_KEY]]
 
     # Creates a new instance of fake, but updating every symbolic value's ShapeEnv
@@ -660,12 +787,33 @@ def bisect(shape_env):
     #
     # This is needed so as not to simplify a symbolic expression using a ShapeEnv
     # "from the future", where it may have a different set of replacements.
-    def new_with_shape_env(shape_env: ShapeEnv, fake) -> Any:
+    @overload
+    def new_with_shape_env(shape_env: ShapeEnv, fake: int) -> int: ...
+
+    @overload
+    def new_with_shape_env(shape_env: ShapeEnv, fake: torch.SymInt) -> torch.SymInt: ...
+
+    @overload
+    def new_with_shape_env(
+        shape_env: ShapeEnv, fake: torch.SymFloat
+    ) -> torch.SymFloat: ...
+
+    @overload
+    def new_with_shape_env(
+        shape_env: ShapeEnv, fake: FakeTensorMeta
+    ) -> FakeTensorMeta: ...
+
+    def new_with_shape_env(
+        shape_env: ShapeEnv, fake: int | torch.SymInt | torch.SymFloat | FakeTensorMeta
+    ) -> int | torch.SymInt | torch.SymFloat | FakeTensorMeta:
         if isinstance(fake, int):
             return fake
         if isinstance(fake, torch.SymInt):
             return torch.SymInt(fake.node.with_shape_env(shape_env))
-        assert isinstance(fake, FakeTensorMeta)
+        if isinstance(fake, torch.SymFloat):
+            return torch.SymFloat(fake.node.with_shape_env(shape_env))
+        if not isinstance(fake, FakeTensorMeta):
+            raise AssertionError(f"Expected FakeTensorMeta, got {type(fake)}")
         return FakeTensorMeta(
             tuple(new_with_shape_env(shape_env, s) for s in fake.size()),
             tuple(new_with_shape_env(shape_env, s) for s in fake.stride()),
@@ -674,13 +822,17 @@ def bisect(shape_env):
         )
 
     # Checks whether the given shape_env fails when produce_guards is called.
-    def check_shapeenv_fails(shape_env: ShapeEnv, tracked_fakes: Optional[List[Any]]) -> Optional[ValidationException]:
-        assert tracked_fakes is not None
+    def check_shapeenv_fails(
+        shape_env: ShapeEnv, tracked_fakes: list["TrackedFake"] | None
+    ) -> ValidationException | None:
+        if tracked_fakes is None:
+            raise AssertionError("tracked_fakes is None")
         try:
             # This produce_guards call is a best-effort replication, since we
             # don't populate EqualityConstraint list. Reason: we would also have
             # to save OutputGraph.tracked_fakes_id_to_source.
             shape_env.produce_guards(
+                # pyrefly: ignore [no-matching-overload]  # TrackedFake.fake includes FakeTensor
                 [new_with_shape_env(shape_env, a.fake) for a in tracked_fakes],
                 [a.source for a in tracked_fakes],
                 input_contexts=[a.symbolic_context for a in tracked_fakes],
@@ -691,14 +843,16 @@ def bisect(shape_env):
 
     # Checks whether the ShapeEnv reconstructed by replaying the events until
     # node is created fails when produce_guards is called.
-    def check_node_fails(node: torch.fx.Node) -> Optional[ValidationException]:
+    def check_node_fails(node: torch.fx.Node) -> ValidationException | None:
         number = node.meta[SHAPEENV_EVENT_KEY]
         # Reconstruct shape_env until the event at event_number.
-        shape_env = replay_shape_env_events(events[:number + 1])
+        shape_env = replay_shape_env_events(events[: number + 1])
         shape_env.graph.lint()
         return check_shapeenv_fails(shape_env, events[number].tracked_fakes)
 
-    last_exception = check_shapeenv_fails(shape_env, shape_env._snapshot_tracked_fakes())
+    last_exception = check_shapeenv_fails(
+        shape_env, shape_env._snapshot_tracked_fakes()
+    )
 
     if not last_exception:
         # We don't actually fail due to a produce_guards call.
@@ -716,10 +870,18 @@ def bisect(shape_env):
 
     # Bisection happens on the assertion nodes of the recorded FX graph for
     # dynamic shapes.
-    assert_nodes = [node for node in shape_env.graph.nodes if node.target == torch._assert]
+    assert_nodes = [
+        node for node in shape_env.graph.nodes if node.target is torch._assert
+    ]
 
     # Preparing the indices for binary search.
+    # The overall invariants are
+    # - for all i < left, assert_node[i] doesn't fail
+    # - for all i >= right, assert_node[i] fails
+    # - `right in exception` always holds
+    # - `left <= right` always holds
     left, mid, right = 0, 0, len(assert_nodes) - 1
+    exception[right] = check_node_fails(assert_nodes[right])
 
     while left < right:
         mid = (left + right) // 2
@@ -735,7 +897,9 @@ def bisect(shape_env):
         else:
             left = mid + 1
 
-    assert left in exception and isinstance(exception[left], ValidationException)
+    if not (left in exception and isinstance(exception[left], ValidationException)):
+        raise AssertionError("Expected ValidationException at bisect result")
+    left_exception: ValidationException = exception[left]  # type: ignore[assignment]
 
     node = assert_nodes[left]
     event = get_node_event(node)
@@ -743,22 +907,26 @@ def bisect(shape_env):
     if event.is_evaluate_expr():
         failed_action = "evaluating"
     else:
-        assert event.is_defer_runtime_assert(), f"unexpected event type: {event}"
+        if not event.is_defer_runtime_assert():
+            raise AssertionError(f"unexpected event type: {event}")
         failed_action = "adding runtime assert"
 
     args = event.args
-    assert args is not None
-    assert len(args) >= 2, (
-        f"bisecting expects {event.name} to have at least 2 positional arguments. "
-        f"Got: {len(args)}"
-    )
-    assert isinstance(args[1], sympy.Basic), (
-        f"bisecting expects {event.name} to have a SymPy expression as its second argument. "
-        f"Got: {type(args[1])}"
-    )
+    if args is None:
+        raise AssertionError("event.args is None")
+    if len(args) < 2:
+        raise AssertionError(
+            f"bisecting expects {event.name} to have at least 2 positional arguments. "
+            f"Got: {len(args)}"
+        )
+    if not isinstance(args[1], sympy.Basic):
+        raise AssertionError(
+            f"bisecting expects {event.name} to have a SymPy expression as its second "
+            f"argument. Got: {type(args[1])}"
+        )
 
     raise BisectValidationException(
-        exception[left],
+        left_exception,
         expr=args[1],
         failed_action=failed_action,
         traced_node=node.meta[CURRENT_NODE_KEY],

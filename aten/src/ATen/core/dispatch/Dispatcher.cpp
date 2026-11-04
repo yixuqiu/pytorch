@@ -1,9 +1,9 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/core/PythonOpRegistrationTrampoline.h>
-#include <chrono>
 #include <list>
-#include <sstream>
 #include <utility>
+#include <c10/util/env.h>
+#include <c10/util/irange.h>
 
 #ifdef FBCODE_CAFFE2
 #include <c10/util/static_tracepoint.h>
@@ -17,8 +17,22 @@ TORCH_SDT_DEFINE_SEMAPHORE(operator_end)
 #endif
 
 bool show_dispatch_trace() {
-    static char const* temp = getenv("TORCH_SHOW_DISPATCH_TRACE");
-    return temp != nullptr;
+  static auto envar = c10::utils::get_env("TORCH_SHOW_DISPATCH_TRACE");
+
+  if (envar.has_value()) {
+    if (envar == "0") {
+      return false;
+    }
+    if (envar == "1") {
+      return true;
+    }
+    TORCH_WARN(
+        "ignoring invalid value for TORCH_SHOW_DISPATCH_TRACE: ",
+        envar,
+        " valid values are 0 or 1.");
+  }
+
+  return false;
 }
 
 static thread_local int64_t dispatch_trace_nesting_value_;
@@ -53,17 +67,17 @@ public:
 private:
   std::list<std::unique_ptr<OpRegistrationListener>> listeners_;
 };
+
+void _print_dispatch_trace(const std::string& label, const std::string& op_name, const DispatchKeySet& dispatchKeySet) {
+  auto nesting_value = dispatch_trace_nesting_value();
+  for ([[maybe_unused]] const auto _ : c10::irange(nesting_value)) std::cerr << ' ';
+  std::cerr << label << " op=[" << op_name << "], key=[" << toString(dispatchKeySet.highestPriorityTypeId()) << ']' << std::endl;
 }
+} // namespace detail
 
 OpRegistrationListener::~OpRegistrationListener()= default;
 
-Dispatcher::Dispatcher()
-: operators_()
-, operatorLookupTable_()
-, backendFallbackKernels_()
-, listeners_(std::make_unique<detail::RegistrationListenerList>())
-, cond_var_()
-, guard_(std::make_shared<Guard>())
+Dispatcher::Dispatcher(): backendFallbackKernels_(), listeners_(std::make_unique<detail::RegistrationListenerList>()), guard_(std::make_shared<Guard>())
 {}
 
 Dispatcher::~Dispatcher() {
@@ -76,11 +90,11 @@ C10_EXPORT Dispatcher& Dispatcher::realSingleton() {
   return _singleton;
 }
 
-c10::optional<OperatorHandle> Dispatcher::findOp(const OperatorName& overload_name) {
-  return operatorLookupTable_.read([&] (const ska::flat_hash_map<OperatorName, OperatorHandle>& operatorLookupTable) -> c10::optional<OperatorHandle> {
+std::optional<OperatorHandle> Dispatcher::findOp(const OperatorName& overload_name) {
+  return operatorLookupTable_.read([&] (const ska::flat_hash_map<OperatorName, OperatorHandle>& operatorLookupTable) -> std::optional<OperatorHandle> {
     auto found = operatorLookupTable.find(overload_name);
     if (found == operatorLookupTable.end()) {
-      return c10::nullopt;
+      return std::nullopt;
     }
     return found->second;
   });
@@ -93,17 +107,17 @@ void Dispatcher::waitForDef(const FunctionSchema& schema) {
   using namespace std::chrono_literals;
   std::unique_lock<std::mutex> lock(guard_->mutex);
   bool r = cond_var_.wait_for(lock, 2s, [&]{
-    return findOp(schema.operator_name()) != c10::nullopt;
+    return findOp(schema.operator_name()).has_value();
   });
   TORCH_INTERNAL_ASSERT(r,
     "Expected main interpreter to define ", schema.operator_name(),
     ", but this didn't happen within timeout.  Are you trying to load "
-    "different models in the same torchdeploy/multipy instance?  You "
+    "different models in the same torchdeploy/multipy instance?  You " // codespell:ignore
     "must warmup each interpreter identically, e.g., import all "
     "the same dependencies.");
 }
 
-void Dispatcher::waitForImpl(const OperatorName& op_name, c10::optional<c10::DispatchKey> maybe_dk) {
+void Dispatcher::waitForImpl(const OperatorName& op_name, std::optional<c10::DispatchKey> maybe_dk) {
   using namespace std::chrono_literals;
   std::unique_lock<std::mutex> lock(guard_->mutex);
   auto dk = maybe_dk.value_or(DispatchKey::CompositeImplicitAutograd);
@@ -116,18 +130,18 @@ void Dispatcher::waitForImpl(const OperatorName& op_name, c10::optional<c10::Dis
   TORCH_INTERNAL_ASSERT(r,
     "Expected main interpreter to implement ", dk, " for ", op_name,
     ", but this didn't happen within timeout.  Are you trying to load "
-    "different models in the same torchdeploy/multipy instance?  You "
+    "different models in the same torchdeploy/multipy instance?  You " // codespell:ignore
     "must warmup each interpreter identically, e.g., import all "
     "the same dependencies.");
 }
 
-c10::optional<OperatorHandle> Dispatcher::findSchema(const OperatorName& overload_name) {
+std::optional<OperatorHandle> Dispatcher::findSchema(const OperatorName& overload_name) {
   auto it = findOp(overload_name);
   if (it.has_value()) {
     if (it->hasSchema()) {
       return it;
     } else {
-      return c10::nullopt;
+      return std::nullopt;
     }
   } else {
     return it;
@@ -160,11 +174,23 @@ const std::vector<OperatorName> Dispatcher::getAllOpNames() {
   });
 }
 
+const std::vector<OperatorName> Dispatcher::getAllOpNamesForDispatchKey(DispatchKey k) {
+  return operatorLookupTable_.read([&] (const ska::flat_hash_map<OperatorName, OperatorHandle>& operatorLookupTable) -> std::vector<OperatorName> {
+    std::vector<OperatorName> allOpNames;
+    for (const auto& op : operatorLookupTable) {
+      if (op.second.hasKernelForDispatchKey(k)) {
+        allOpNames.push_back(op.first);
+      }
+    }
+    return allOpNames;
+  });
+}
+
 // Postcondition: caller is responsible for disposing of registration when they
 // are done
 OperatorHandle Dispatcher::findOrRegisterName_(const OperatorName& op_name) {
   const auto found = findOp(op_name);
-  if (found != c10::nullopt) {
+  if (found.has_value()) {
     return *found;
   }
 
@@ -275,11 +301,11 @@ PythonModuleMapType& pythonModulesSingleton() {
 
 }
 
-c10::optional<std::pair<const char*, const char*>> Dispatcher::getPyStub(OperatorName op_name) {
+std::optional<std::pair<const char*, const char*>> Dispatcher::getPyStub(OperatorName op_name) {
   std::lock_guard<std::mutex> lock(guard_->mutex);
   auto found = pythonModulesSingleton().find(op_name);
   if (found == pythonModulesSingleton().end()) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   return found->second;
 }
@@ -332,9 +358,9 @@ void Dispatcher::throwIfHasPythonModule(OperatorName op_name) {
 
 RegistrationHandleRAII Dispatcher::registerImpl(
   OperatorName op_name,
-  c10::optional<DispatchKey> dispatch_key,
+  std::optional<DispatchKey> dispatch_key,
   KernelFunction kernel,
-  c10::optional<impl::CppSignature> cpp_signature,
+  std::optional<impl::CppSignature> cpp_signature,
   std::unique_ptr<FunctionSchema> inferred_function_schema,
   std::string debug
 ) {
@@ -364,7 +390,7 @@ RegistrationHandleRAII Dispatcher::registerImpl(
   });
 }
 
-void Dispatcher::deregisterImpl_(const OperatorHandle& op, const OperatorName& op_name, c10::optional<DispatchKey> dispatch_key, impl::OperatorEntry::AnnotatedKernelContainerIterator handle) {
+void Dispatcher::deregisterImpl_(const OperatorHandle& op, const OperatorName& op_name, std::optional<DispatchKey> dispatch_key, impl::OperatorEntry::AnnotatedKernelContainerIterator handle) {
   op.operatorDef_->op.deregisterKernel_(*this, dispatch_key, handle);
 
   TORCH_INTERNAL_ASSERT(op.operator_name() == op_name);
@@ -417,11 +443,17 @@ RegistrationHandleRAII Dispatcher::registerFallback(DispatchKey dispatchKey, Ker
 
   auto idx = getDispatchTableIndexForDispatchKey(dispatchKey);
   TORCH_CHECK(idx >= 0 && static_cast<uint64_t>(idx) < backendFallbackKernels_.size(), "idx=", idx);
+  // NB: Preserve BC for registering fallback for AutogradPrivateUse1 multiple time,
+  // refer to https://github.com/pytorch/pytorch/issues/163979 for more information.
   TORCH_CHECK(
-    !backendFallbackKernels_[idx].kernel.isValid(),
-    "Tried to register multiple backend fallbacks for the same dispatch key ", dispatchKey, "; previous registration ",
-    backendFallbackKernels_[idx].debug, ", new registration ", debug
-  );
+      dispatchKey == DispatchKey::AutogradPrivateUse1 ||
+          !backendFallbackKernels_[idx].kernel.isValid(),
+      "Tried to register multiple backend fallbacks for the same dispatch key ",
+      dispatchKey,
+      "; previous registration ",
+      backendFallbackKernels_[idx].debug,
+      ", new registration ",
+      debug);
   // NB: inferred function schema is always nullptr for fallbacks, as fallbacks
   // cannot be unboxed
   backendFallbackKernels_[idx] = impl::AnnotatedKernel(std::move(kernel), nullptr, std::move(debug));
@@ -486,7 +518,7 @@ std::vector<OperatorHandle> Dispatcher::findDanglingImpls() const {
   });
 }
 
-std::vector<OperatorName> Dispatcher::getRegistrationsForDispatchKey(c10::optional<DispatchKey> k) const {
+std::vector<OperatorName> Dispatcher::getRegistrationsForDispatchKey(std::optional<DispatchKey> k) const {
   return operatorLookupTable_.read([&] (const ska::flat_hash_map<OperatorName, OperatorHandle>& operatorLookupTable) -> std::vector<OperatorName> {
     std::vector<OperatorName> op_names;
     for (const auto& op : operatorLookupTable) {
@@ -506,7 +538,7 @@ int64_t Dispatcher::sequenceNumberForRunningRecordFunction(DispatchKey dispatchK
 
   // Note: this records a sequence number for both Autograd keys, and for
   // non-Autograd keys where the dispatchKeySet still contains an autograd key.
-  // This means that we might collect the same sequence nubmer two different
+  // This means that we might collect the same sequence number two different
   // events if they all occurred above Autograd and still had the Autograd
   // dispatch key in the dispatch key set.
   // However, this usually doesn't happen: normally the first call will
@@ -537,9 +569,9 @@ bool Dispatcher::profilingOperatorEvents() {
   return TORCH_SDT_IS_ENABLED(operator_start) || TORCH_SDT_IS_ENABLED(operator_end);
 }
 
-C10_NOINLINE void Dispatcher::fireOpStartUSDT(at::RecordFunction::schema_ref_t schema_ref) {
+C10_NOINLINE void Dispatcher::fireOpStartUSDT(at::RecordFunction::schema_ref_t schema_ref, std::vector<void*>& argsAddresses, std::vector<const char*>& argsTypes) {
   if (TORCH_SDT_IS_ENABLED(operator_start)) {
-    TORCH_SDT_WITH_SEMAPHORE(operator_start, schema_ref.get().name().c_str());
+    TORCH_SDT_WITH_SEMAPHORE(operator_start, schema_ref.get().name().c_str(), argsAddresses.size(), argsAddresses.data(), argsTypes.data());
   }
 }
 

@@ -44,8 +44,7 @@
 
 // clang-format on
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 #if AT_MKLDNN_ENABLED()
 
@@ -86,7 +85,7 @@ void merge_sets(
 }
 
 // no uses of tensors in container types
-void assertNonTensorTypeDoesNotContainTensors(TypePtr type) {
+void assertNonTensorTypeDoesNotContainTensors(const TypePtr& type) {
   if (type->cast<TensorType>()) {
     return;
   }
@@ -95,11 +94,11 @@ void assertNonTensorTypeDoesNotContainTensors(TypePtr type) {
   }
 }
 
-void InplaceMKLDNNSubgraph(std::shared_ptr<Graph> graph) {
+void InplaceMKLDNNSubgraph(const std::shared_ptr<Graph>& graph) {
   // This function first calculates aliasing sets,
   // then calculates the last node each aliasing set is alive for.
   // Then we go through each node, if it's a node which has an equivalent
-  // inplace node and the aliasing set for its input is dead afer this node, we
+  // inplace node and the aliasing set for its input is dead after this node, we
   // inplace it. Then we merge the aliasing sets for the input and output of the
   // node and extend the liveness of the set. To inplace a node you need to
   // prove device and dtype of the input and output are the same, which we've
@@ -235,7 +234,7 @@ void InplaceMKLDNNSubgraph(std::shared_ptr<Graph> graph) {
 // innermost dimension is padded with 0s. The precondition, `aten_op(0) == 0`
 // allows us to avoid any special casing of padded elements.
 Operation createUnaryOp(
-    std::function<void(at::Tensor output, at::Tensor input)> aten_op,
+    const std::function<void(at::Tensor output, at::Tensor input)>& aten_op,
     bool inplace = false) {
   return [aten_op, inplace](Stack& stack) {
     auto a = pop(stack).toTensor();
@@ -273,8 +272,7 @@ Operation createUnaryOp(
     TORCH_INTERNAL_ASSERT(
         a_it.get_desc().get_size() % elementSize(a.scalar_type()) == 0);
 
-    auto out_aten = at::from_blob(
-        out_raw_data, {static_cast<int64_t>(nelem)}, a_options_with_strided);
+    auto out_aten = at::from_blob(out_raw_data, nelem, a_options_with_strided);
     aten_op(out_aten, in_aten);
     push(stack, out);
   };
@@ -304,7 +302,7 @@ void MKLDNNLayerNormOp(Stack& stack, bool inplace) {
       at::native::mkldnn_layer_norm_last_index_weight_bias_f32(
           input, shape, weight, bias, eps, inplace);
   push(stack, dst);
-};
+}
 
 Operation BroadOp(const Node* node) {
   return [](Stack& stack) {
@@ -396,7 +394,7 @@ static std::function<void(at::Tensor output, at::Tensor input)> hardtanh_helper(
     const Node* n) {
   auto min_val = n->f(attr::min_val);
   auto max_val = n->f(attr::max_val);
-  return [min_val, max_val](at::Tensor output, at::Tensor input) {
+  return [min_val, max_val](at::Tensor output, const at::Tensor& input) {
     at::cpu::hardtanh_out(output, input, min_val, max_val);
   };
 }
@@ -405,7 +403,7 @@ static std::function<void(at::Tensor output, at::Tensor input)> clamp_helper(
     const Node* n) {
   auto min_val = n->f(attr::min_val);
   auto max_val = n->f(attr::max_val);
-  return [min_val, max_val](at::Tensor output, at::Tensor input) {
+  return [min_val, max_val](at::Tensor output, const at::Tensor& input) {
     at::cpu::clamp_out(output, input, min_val, max_val);
   };
 }
@@ -416,7 +414,7 @@ const RegisterOperators MKLDNNHardSwishOpReg({
     torch::jit::Operator(
         "prim::MKLDNNHardSwish_(Tensor(a!) self) -> Tensor(a!)",
         createUnaryOp(
-            [](at::Tensor output, at::Tensor input) {
+            [](at::Tensor output, const at::Tensor& input) {
               at::cpu::hardswish_out(output, input);
             },
             true),
@@ -424,7 +422,7 @@ const RegisterOperators MKLDNNHardSwishOpReg({
     torch::jit::Operator(
         "prim::MKLDNNHardSigmoid_(Tensor(a!) self) -> Tensor(a!)",
         createUnaryOp(
-            [](at::Tensor output, at::Tensor input) {
+            [](at::Tensor output, const at::Tensor& input) {
               at::cpu::hardsigmoid_out(output, input);
             },
             true),
@@ -444,7 +442,7 @@ const RegisterOperators MKLDNNHardSwishOpReg({
     torch::jit::Operator(
         "prim::MKLDNNHardSwish(Tensor a) -> Tensor",
         createUnaryOp(
-            [](at::Tensor output, at::Tensor input) {
+            [](at::Tensor output, const at::Tensor& input) {
               at::cpu::hardswish_out(output, input);
             },
             false),
@@ -452,7 +450,7 @@ const RegisterOperators MKLDNNHardSwishOpReg({
     torch::jit::Operator(
         "prim::MKLDNNHardSigmoid(Tensor a) -> Tensor",
         createUnaryOp(
-            [](at::Tensor output, at::Tensor input) {
+            [](at::Tensor output, const at::Tensor& input) {
               at::cpu::hardsigmoid_out(output, input);
             },
             false),
@@ -813,7 +811,7 @@ void ComputeSubgraphInMKLDNN(Node* subgraph_node) {
 
     if (body_node->kind() == aten::conv2d ||
         body_node->kind() == aten::conv3d) {
-      // this node doesnt handle string padding yet...
+      // this node doesn't handle string padding yet...
       if (!body_node->namedInput("padding")->type()->cast<StringType>()) {
         body_node->replaceWithNewSymbol(Symbol::prim("mkldnn_convolution"));
         body_node->destroy();
@@ -895,7 +893,7 @@ class MKLDNNSubgraphSlicer {
     // subgraphs and then unmerge them into the graph
     buildupSubgraphs();
     computeSubgraphsInMKLDNN();
-    // Run CSE globally onceto eliminate duplicates that may have occurred
+    // Run CSE globally once to eliminate duplicates that may have occurred
     // while inlining subgraphs.
     EliminateCommonSubexpression(graph_);
   }
@@ -985,7 +983,7 @@ class MKLDNNSubgraphSlicer {
       return norm_shape.has_value() && norm_shape->size() == 1;
     }
 
-    // unary ops we dont need to prove anything else than
+    // unary ops we don't need to prove anything else than
     // the input is mkldnn supported
     switch (n->kind()) {
       case aten::relu:
@@ -1099,13 +1097,13 @@ class MKLDNNSubgraphSlicer {
 
   // Try to merge `consumer` into `producer`. If successful, this destroys
   // `consumer` and returns the `producer` group.
-  c10::optional<Node*> tryMerge(Node* producer, Node* consumer) {
+  std::optional<Node*> tryMerge(Node* producer, Node* consumer) {
     AT_ASSERT(producer->kind() == prim::MKLDNNGroup);
     bool canMerge = shouldConsiderForMerge(consumer) &&
         aliasDb_.moveAfterTopologicallyValid(consumer, producer);
 
     if (!canMerge) {
-      return c10::nullopt;
+      return std::nullopt;
     }
 
     SubgraphUtils::mergeNodeIntoSubgraphAndUpdateAliasing(
@@ -1179,5 +1177,4 @@ void ConvertFrozenOpsToMKLDNN(std::shared_ptr<Graph>& graph) {
 
 #endif
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

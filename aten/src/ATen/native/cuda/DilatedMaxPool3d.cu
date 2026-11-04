@@ -3,16 +3,16 @@
 #include <ATen/AccumulateType.h>
 #include <ATen/ceil_div.h>
 #include <ATen/Dispatch.h>
-#include <ATen/NamedTensorUtils.h>
 #include <ATen/NumericUtils.h>
 #include <ATen/native/Pool.h>
-#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/cuda/detail/TensorInfo.cuh>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/cuda/detail/KernelUtils.h>
+#include <ATen/native/cuda/KernelUtils.cuh>
 #include <c10/macros/Macros.h>
+#include <c10/util/safe_conv.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -45,9 +45,9 @@ __global__ static void max_pool3d_with_indices_single_out_frame(
   int offsetZ,
   bool channels_last)
 {
-  int oColumn = blockIdx.x * blockDim.x + threadIdx.x;
-  int oRow = blockIdx.y * blockDim.y + threadIdx.y;
-  int oFrame = 0;
+  int64_t oColumn = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t oRow = blockIdx.y * blockDim.y + threadIdx.y;
+  int64_t oFrame = 0;
   // used only for channels-first indexing
   int64_t slice = 0;
   // used only for channels-last indexing
@@ -83,10 +83,10 @@ __global__ static void max_pool3d_with_indices_single_out_frame(
       wStart += dilationW;
 
     // maxIndex remains in "channels-first"/contiguous
-    int64_t maxIndex = tStart * iheight * iwidth + hStart * iwidth + wStart;
+    int64_t maxIndex = (int64_t(tStart) * iheight + hStart) * iwidth + wStart;
 
     if (!channels_last) {
-        inputData += (int64_t) slice * itime * iheight * iwidth;
+        inputData += slice * itime * iheight * iwidth;
     } else {
         inputData += ((int64_t) batch * itime * iheight * iwidth * features) + channel;
     }
@@ -100,7 +100,7 @@ __global__ static void max_pool3d_with_indices_single_out_frame(
         for (int w = wStart; w < wEnd; w += dilationW)
         {
           scalar_t val;
-          int index = t * iheight * iwidth + h * iwidth + w;
+          int64_t index = (int64_t(t) * iheight + h) * iwidth + w;
           if (!channels_last) {
             val = inputData[index];
           } else {
@@ -119,7 +119,7 @@ __global__ static void max_pool3d_with_indices_single_out_frame(
 
     int64_t out_index;
     if (!channels_last) {
-      out_index = (int64_t) slice*otime*oheight*owidth + oFrame*oheight*owidth + oRow*owidth + oColumn;
+      out_index = slice*otime*oheight*owidth + oFrame*oheight*owidth + oRow*owidth + oColumn;
     } else {
       out_index = ((int64_t) batch*otime*oheight*owidth + oFrame*oheight*owidth + oRow*owidth + oColumn)*features + channel;
     }
@@ -193,10 +193,12 @@ __global__ static void max_pool3d_with_indices_backward_single_out_frame(
   int offsetZ,
   bool channels_last)
 {
-  int oColumn = blockIdx.x * blockDim.x + threadIdx.x;
-  int oRow = blockIdx.y * blockDim.y + threadIdx.y;
+  const int64_t gradInput_numel =
+      static_cast<int64_t>(obatch) * features * itime * iheight * iwidth;
+  int64_t oColumn = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t oRow = blockIdx.y * blockDim.y + threadIdx.y;
 
-  int oFrame = 0;
+  int64_t oFrame = 0;
   // used only for channels-first indexing
   int64_t slice = 0;
   // used only for channels-last indexing
@@ -218,19 +220,24 @@ __global__ static void max_pool3d_with_indices_backward_single_out_frame(
   {
     int64_t out_index;
     if (!channels_last) {
-      out_index = (int64_t) slice*otime*oheight*owidth + oFrame*oheight*owidth + oRow*owidth + oColumn;
+      out_index = slice*otime*oheight*owidth + oFrame*oheight*owidth + oRow*owidth + oColumn;
     } else {
       out_index = ((int64_t) batch*otime*oheight*owidth + oFrame*oheight*owidth + oRow*owidth + oColumn)*features + channel;
     }
     int64_t maxIndex = indicesData[out_index];
     if (maxIndex != -1) {
+      int64_t gradInputIndex;
       if (!channels_last) {
-        gpuAtomicAddNoReturn(&gradInputData[(int64_t) slice * itime  * iheight * iwidth + maxIndex],
-          gradOutputData[out_index]);
+        gradInputIndex = slice * itime * iheight * iwidth + maxIndex;
       } else {
-        gpuAtomicAddNoReturn(&gradInputData[((int64_t) batch * itime * iheight * iwidth + maxIndex) * features + channel],
-          gradOutputData[out_index]);
+        gradInputIndex = ((int64_t) batch * itime * iheight * iwidth + maxIndex) * features + channel;
       }
+      fastAtomicAdd(
+        gradInputData,
+        gradInputIndex,
+        gradInput_numel,
+        gradOutputData[out_index],
+        true);
     }
   }
 }
@@ -300,29 +307,29 @@ void max_pool3d_with_indices_out_cuda_template(
   // #20866, #22032: Guarantee this for the official C++ API?
   TORCH_CHECK(kernel_size.size() == 1 || kernel_size.size() == 3,
     "max_pool3d: kernel_size must either be a single int, or a tuple of three ints")
-  const int kT = safe_downcast<int, int64_t>(kernel_size[0]);
-  const int kH = kernel_size.size() == 1 ? kT : safe_downcast<int, int64_t>(kernel_size[1]);
-  const int kW = kernel_size.size() == 1 ? kT : safe_downcast<int, int64_t>(kernel_size[2]);
+  const int kT = c10::safe_conv<int>(kernel_size[0], "kernel_size");
+  const int kH = kernel_size.size() == 1 ? kT : c10::safe_conv<int>(kernel_size[1], "kernel_size");
+  const int kW = kernel_size.size() == 1 ? kT : c10::safe_conv<int>(kernel_size[2], "kernel_size");
 
-  TORCH_CHECK(stride.size() == 0 || stride.size() == 1 || stride.size() == 3,
+  TORCH_CHECK(stride.empty() || stride.size() == 1 || stride.size() == 3,
     "max_pool3d: stride must either be omitted, a single int, or a tuple of three ints")
-  const int dT = stride.empty() ? kT : safe_downcast<int, int64_t>(stride[0]);
+  const int dT = stride.empty() ? kT : c10::safe_conv<int>(stride[0], "stride");
   const int dH = stride.empty() ? kH :
-                 stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[1]);
+                 stride.size() == 1 ? dT : c10::safe_conv<int>(stride[1], "stride");
   const int dW = stride.empty() ? kW :
-                 stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[2]);
+                 stride.size() == 1 ? dT : c10::safe_conv<int>(stride[2], "stride");
 
   TORCH_CHECK(padding.size() == 1 || padding.size() == 3,
     "max_pool3d: padding must either be a single int, or a tuple of three ints");
-  const int pT = safe_downcast<int, int64_t>(padding[0]);
-  const int pH = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[1]);
-  const int pW = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[2]);
+  const int pT = c10::safe_conv<int>(padding[0], "padding");
+  const int pH = padding.size() == 1 ? pT : c10::safe_conv<int>(padding[1], "padding");
+  const int pW = padding.size() == 1 ? pT : c10::safe_conv<int>(padding[2], "padding");
 
   TORCH_CHECK(dilation.size() == 1 || dilation.size() == 3,
     "max_pool3d: dilation must be either a single int, or a tuple of three ints");
-  const int dilationT = safe_downcast<int, int64_t>(dilation[0]);
-  const int dilationH = dilation.size() == 1 ? dilationT : safe_downcast<int, int64_t>(dilation[1]);
-  const int dilationW = dilation.size() == 1 ? dilationT : safe_downcast<int, int64_t>(dilation[2]);
+  const int dilationT = c10::safe_conv<int>(dilation[0], "dilation");
+  const int dilationH = dilation.size() == 1 ? dilationT : c10::safe_conv<int>(dilation[1], "dilation");
+  const int dilationW = dilation.size() == 1 ? dilationT : c10::safe_conv<int>(dilation[2], "dilation");
 
   const int64_t nbatch = input.ndimension() == 5 ? input.size(-5) : 1;
   const int64_t nslices = input.size(-4);
@@ -430,29 +437,29 @@ void max_pool3d_with_indices_backward_out_cuda_template(
   // #20866, #22032: Guarantee this for the official C++ API?
   TORCH_CHECK(kernel_size.size() == 1 || kernel_size.size() == 3,
     "max_pool3d: kernel_size must either be a single int, or a tuple of three ints")
-  const int kT = safe_downcast<int, int64_t>(kernel_size[0]);
-  const int kH = kernel_size.size() == 1 ? kT : safe_downcast<int, int64_t>(kernel_size[1]);
-  const int kW = kernel_size.size() == 1 ? kT : safe_downcast<int, int64_t>(kernel_size[2]);
+  const int kT = c10::safe_conv<int>(kernel_size[0], "kernel_size");
+  const int kH = kernel_size.size() == 1 ? kT : c10::safe_conv<int>(kernel_size[1], "kernel_size");
+  const int kW = kernel_size.size() == 1 ? kT : c10::safe_conv<int>(kernel_size[2], "kernel_size");
 
-  TORCH_CHECK(stride.size() == 0 || stride.size() == 1 || stride.size() == 3,
+  TORCH_CHECK(stride.empty() || stride.size() == 1 || stride.size() == 3,
     "max_pool3d: stride must either be omitted, a single int, or a tuple of three ints")
-  const int dT = stride.empty() ? kT : safe_downcast<int, int64_t>(stride[0]);
+  const int dT = stride.empty() ? kT : c10::safe_conv<int>(stride[0], "stride");
   const int dH = stride.empty() ? kH :
-                 stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[1]);
+                 stride.size() == 1 ? dT : c10::safe_conv<int>(stride[1], "stride");
   const int dW = stride.empty() ? kW :
-                 stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[2]);
+                 stride.size() == 1 ? dT : c10::safe_conv<int>(stride[2], "stride");
 
   TORCH_CHECK(padding.size() == 1 || padding.size() == 3,
     "max_pool3d: padding must either be a single int, or a tuple of three ints");
-  const int pT = safe_downcast<int, int64_t>(padding[0]);
-  const int pH = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[1]);
-  const int pW = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[2]);
+  const int pT = c10::safe_conv<int>(padding[0], "padding");
+  const int pH = padding.size() == 1 ? pT : c10::safe_conv<int>(padding[1], "padding");
+  const int pW = padding.size() == 1 ? pT : c10::safe_conv<int>(padding[2], "padding");
 
   TORCH_CHECK(dilation.size() == 1 || dilation.size() == 3,
     "max_pool3d: dilation must be either a single int, or a tuple of three ints");
-  const int dilationT = safe_downcast<int, int64_t>(dilation[0]);
-  const int dilationH = dilation.size() == 1 ? dilationT : safe_downcast<int, int64_t>(dilation[1]);
-  const int dilationW = dilation.size() == 1 ? dilationT : safe_downcast<int, int64_t>(dilation[2]);
+  const int dilationT = c10::safe_conv<int>(dilation[0], "dilation");
+  const int dilationH = dilation.size() == 1 ? dilationT : c10::safe_conv<int>(dilation[1], "dilation");
+  const int dilationW = dilation.size() == 1 ? dilationT : c10::safe_conv<int>(dilation[2], "dilation");
 
   TORCH_CHECK((input.ndimension() == 4 || input.ndimension() == 5),
     "max_pool2d_with_indices_backward_out_cuda_template(): ",
@@ -494,7 +501,7 @@ void max_pool3d_with_indices_backward_out_cuda_template(
   const int64_t iheight = gradInput.size(-2);
   const int64_t iwidth = gradInput.size(-1);
 
-  max_pool3d_backward_shape_check(
+  pool3d_backward_shape_check(
     input,
     gradOutput,
     indices,
@@ -575,7 +582,6 @@ std::tuple<Tensor, Tensor> max_pool3d_with_indices_cuda(
   IntArrayRef dilation,
   bool ceil_mode)
 {
-  NoNamesGuard guard;
 
   Tensor output = at::empty({0}, input.options());
   Tensor indices = at::empty({0}, input.options().dtype(kLong));
@@ -588,10 +594,6 @@ std::tuple<Tensor, Tensor> max_pool3d_with_indices_cuda(
     padding,
     dilation,
     ceil_mode);
-
-  guard.reset();
-  namedinference::propagate_names(output, input);
-  namedinference::propagate_names(indices, input);
 
   return std::tuple<Tensor, Tensor>(output, indices);
 }

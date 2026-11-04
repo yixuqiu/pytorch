@@ -1,3 +1,4 @@
+#include <c10/core/ScalarType.h>
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/AccumulateType.h>
 #include <ATen/Dispatch.h>
@@ -12,6 +13,7 @@
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
+#include <ATen/ops/aminmax.h>
 #include <ATen/ops/bincount_native.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/histc_native.h>
@@ -37,7 +39,7 @@ __device__ static IndexType getBin(
     at::acc_type<input_t, /*is_cuda=*/true> minvalue,
     at::acc_type<input_t, /*is_cuda=*/true> maxvalue,
     int64_t nbins) {
-  IndexType bin = (int)(((bVal - minvalue)) * nbins / (maxvalue - minvalue));
+  IndexType bin = static_cast<IndexType>((bVal - minvalue) * nbins / (maxvalue - minvalue));
   // (only applicable for histc)
   // while each bin is inclusive at the lower end and exclusive at the higher,
   // i.e. [start, end) the last bin is inclusive at both, i.e. [start, end], in
@@ -251,29 +253,31 @@ Tensor _bincount_cuda_template(
     const Tensor& weights,
     int64_t minlength) {
   if (minlength < 0) {
-    AT_ERROR("minlength should be >= 0");
+    TORCH_CHECK(false, "minlength should be >= 0");
   }
   if (self.dim() == 1 && self.numel() == 0) {
     return at::zeros(
         {minlength},
         kLong,
-        c10::nullopt /* layout */,
+        std::nullopt /* layout */,
         kCUDA,
-        c10::nullopt /* pin_memory */);
+        std::nullopt /* pin_memory */);
   }
-  if (self.dim() != 1 ||
-      (!std::is_same<input_t, uint8_t>::value &&
-       *self.min().cpu().const_data_ptr<input_t>() < 0)) {
-    AT_ERROR("bincount only supports 1-d non-negative integral inputs.");
-  }
+  TORCH_CHECK(self.dim() == 1, "bincount only supports 1-d non-negative integral inputs.");
 
   bool has_weights = weights.defined();
   if (has_weights && (weights.dim() != 1 || weights.size(0) != self.size(0))) {
-    AT_ERROR("weights should be 1-d and have the same length as input");
+    TORCH_CHECK(false, "weights should be 1-d and have the same length as input");
+  }
+
+  auto [self_min, self_max] = at::aminmax(self);
+  if constexpr (!std::is_same_v<input_t, uint8_t>) {
+    TORCH_CHECK(*self_min.cpu().const_data_ptr<input_t>() >= 0,
+                "bincount only supports 1-d non-negative integral inputs.");
   }
 
   const int64_t nbins =
-      std::max(self.max().item<input_t>() + (int64_t)1, minlength);
+      std::max(self_max.item<input_t>() + (int64_t)1, minlength);
 
   // we are using acc_type for the bounds, in particular int64_t for integers
   // in order to avoid overflows (e.g. using 256 bins for dtype uint8)
@@ -295,9 +299,9 @@ Tensor _bincount_cuda_template(
     output = at::zeros(
         {nbins},
         kLong,
-        c10::nullopt /* layout */,
+        std::nullopt /* layout */,
         DeviceType::CUDA,
-        c10::nullopt /* pin_memory */);
+        std::nullopt /* pin_memory */);
     cuda::CUDA_tensor_histogram<int64_t, input_t, false>(
         output, self, weights, nbins, minvalue, maxvalue);
   }
@@ -312,24 +316,37 @@ Tensor _histc_cuda_template(
     at::acc_type<input_t, /*is_cuda=*/true> min,
     at::acc_type<input_t, /*is_cuda=*/true> max) {
   if (nbins <= 0) {
-    AT_ERROR("bins must be > 0");
+    TORCH_CHECK(false, "bins must be > 0");
   }
   Tensor output = at::zeros(
       {nbins},
       self.scalar_type(),
-      c10::nullopt /* layout */,
+      std::nullopt /* layout */,
       DeviceType::CUDA,
-      c10::nullopt /* pin_memory */);
-  input_t minvalue = min;
-  input_t maxvalue = max;
+      std::nullopt /* pin_memory */);
+  using bounds_t = at::acc_type<input_t, /*is_cuda=*/true>;
+  bounds_t minvalue = min;
+  bounds_t maxvalue = max;
+
   if (min == max && self.numel() > 0) {
-    minvalue = *self.min().cpu().const_data_ptr<input_t>();
-    maxvalue = *self.max().cpu().const_data_ptr<input_t>();
+    auto [min_tensor, max_tensor] = self.aminmax();
+    minvalue = min_tensor.item<input_t>();
+    maxvalue = max_tensor.item<input_t>();
   }
   if (minvalue == maxvalue) {
     minvalue = minvalue - 1;
     maxvalue = maxvalue + 1;
   }
+
+// Microsoft's STL has a problem with integer overloads of std::fpclassify used
+// by std::isnan and std::isinf, as described here:
+// https://stackoverflow.com/questions/61646166/how-to-resolve-fpclassify-ambiguous-call-to-overloaded-function
+// This macro provides a workaround for this problem.
+#if defined(USE_ROCM) && defined(_MSC_VER)
+#define STL_CAST_BUG(value) static_cast<double>(value)
+#else
+#define STL_CAST_BUG(value) value
+#endif
 
 #if !defined(USE_ROCM)
   TORCH_CHECK(
@@ -342,8 +359,10 @@ Tensor _histc_cuda_template(
       "] is not finite");
 #else
   TORCH_CHECK(
-      !(std::isinf(minvalue) || std::isinf(maxvalue) || std::isnan(minvalue) ||
-        std::isnan(maxvalue)),
+      !(std::isinf(STL_CAST_BUG(minvalue)) ||
+        std::isinf(STL_CAST_BUG(maxvalue)) ||
+        std::isnan(STL_CAST_BUG(minvalue)) ||
+        std::isnan(STL_CAST_BUG(maxvalue))),
       "range of [",
       minvalue,
       ", ",
@@ -360,7 +379,7 @@ Tensor _histc_cuda_template(
 
 namespace native {
 Tensor _bincount_cuda(
-    const Tensor& self, const c10::optional<Tensor>& weights_opt,
+    const Tensor& self, const std::optional<Tensor>& weights_opt,
     int64_t minlength) {
   // See [Note: hacky wrapper removal for optional tensor]
   c10::MaybeOwned<Tensor> weights_maybe_owned = at::borrow_from_optional_tensor(weights_opt);
@@ -387,11 +406,13 @@ Tensor _histc_cuda(
     const Scalar& min,
     const Scalar& max) {
   if (self.scalar_type() == ScalarType::Half) {
-    AT_ERROR("HalfTensor is not supported");
+    TORCH_CHECK(false, "HalfTensor is not supported");
   }
   // See Note [Writing Nondeterministic Operations]
-  // Nondeterministic because of atomicAdd usage
-  globalContext().alertNotDeterministic("_histc_cuda");
+  // Nondeterministic for floating types because of atomicAdd usage
+  if (at::isFloatingType(self.scalar_type())){
+    globalContext().alertNotDeterministic("_histc_cuda with floating point input");
+  }
   return AT_DISPATCH_ALL_TYPES(self.scalar_type(), "histc", [&] {
     using bounds_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
     return _histc_cuda_template<scalar_t>(
@@ -400,6 +421,9 @@ Tensor _histc_cuda(
 }
 
 Tensor& _histc_out_cuda(const Tensor& self, int64_t bins, const Scalar& min, const Scalar& max, Tensor& result) {
+  // Keep message in sync with histogramdd_prepare_out (Histogram.cpp:132).
+  TORCH_CHECK(self.dtype() == result.dtype(), "torch.histogram: input tensor and hist tensor should",
+      " have the same dtype, but got input ", self.dtype(), " and hist ", result.dtype());
   auto ret = _histc_cuda(self, bins, min, max);
   resize_output(result, ret.sizes());
   result.copy_(ret);

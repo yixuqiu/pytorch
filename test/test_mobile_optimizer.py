@@ -12,6 +12,9 @@ from torch.utils.mobile_optimizer import (LintCode,
                                           MobileOptimizerType)
 from torch.nn import functional as F
 from torch.testing._internal.common_quantized import override_quantized_engine
+from torch.testing._internal.common_utils import (
+    IS_MACOS,
+)
 
 try:
     import torchvision
@@ -37,7 +40,6 @@ class TestOptimizer(TestCase):
         dilation = 1
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
-        kernels = (kernel_h, kernel_w)
         strides = (stride_h, stride_w)
         paddings = (pad_h, pad_w)
         dilations = (dilation, dilation)
@@ -53,7 +55,7 @@ class TestOptimizer(TestCase):
         linear_weight_shape = (weight_output_dim, linear_input_shape)
 
         class MyTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv_weight = torch.nn.Parameter(torch.rand(conv_weight_shape))
                 self.conv_bias = torch.nn.Parameter(torch.rand(conv_bias_shape))
@@ -85,7 +87,7 @@ class TestOptimizer(TestCase):
 
 
         class BNTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 20, 5, 1)
                 self.bn = torch.nn.BatchNorm2d(num_features=20)
@@ -149,7 +151,7 @@ class TestOptimizer(TestCase):
         bn_scripted_module.eval()
 
         self.assertEqual(len(torch.jit.export_opnames(bn_scripted_module)), 11)
-        FileCheck().check_count("prim::CallMethod[name=\"forward\"]", 2, exactly=True) \
+        FileCheck().check_count('prim::CallMethod[name="forward"]', 2, exactly=True) \
                    .run(str(get_forward(bn_scripted_module._c).graph))
 
         optimization_blocklist_no_prepack = {MobileOptimizerType.INSERT_FOLD_PREPACK_OPS}
@@ -166,7 +168,7 @@ class TestOptimizer(TestCase):
         torch.testing.assert_close(bn_scripted_module(bn_input), no_bn_fold_scripted_module(bn_input), rtol=1e-2, atol=1e-3)
 
         class MyMobileOptimizedTagTest(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear_weight = torch.nn.Parameter(torch.rand(linear_weight_shape))
                 self.linear_bias = torch.nn.Parameter(torch.rand(weight_output_dim))
@@ -183,7 +185,7 @@ class TestOptimizer(TestCase):
         self.assertTrue(tag)
 
         class MyPreserveMethodsTest(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear_weight = torch.nn.Parameter(torch.rand(linear_weight_shape))
                 self.linear_bias = torch.nn.Parameter(torch.rand(weight_output_dim))
@@ -207,7 +209,7 @@ class TestOptimizer(TestCase):
         self.assertNotEqual(preserveThis, None)
 
         class OptimizeNoForwardTest(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.l = nn.Linear(10, 100)
                 self.l2 = nn.Linear(100, 1)
@@ -233,7 +235,7 @@ class TestOptimizer(TestCase):
         torch.testing.assert_close(initial_result, optimized_result, rtol=1e-2, atol=1e-3)
 
         class BNTestNoForwardModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 20, 5, 1)
                 self.bn = torch.nn.BatchNorm2d(num_features=20)
@@ -250,7 +252,7 @@ class TestOptimizer(TestCase):
         bn_no_forward_scripted_module.eval()
 
         self.assertEqual(len(torch.jit.export_opnames(bn_no_forward_scripted_module)), 11)
-        FileCheck().check_count("prim::CallMethod[name=\"forward\"]", 2, exactly=True) \
+        FileCheck().check_count('prim::CallMethod[name="forward"]', 2, exactly=True) \
                    .run(bn_no_forward_scripted_module.foo.graph)
 
         bn_fold_no_forward_scripted_module = optimize_for_mobile(bn_no_forward_scripted_module, preserved_methods=['foo'])
@@ -262,6 +264,7 @@ class TestOptimizer(TestCase):
             rtol=1e-2,
             atol=1e-3)
 
+    @unittest.skipIf(IS_MACOS, "https://github.com/pytorch/pytorch/issues/157254")
     @skipIfNoXNNPACK
     def test_quantized_conv_no_asan_failures(self):
         # There were ASAN failures when fold_conv_bn was run on
@@ -272,7 +275,7 @@ class TestOptimizer(TestCase):
             return
 
         class Child(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv2 = nn.Conv2d(1, 1, 1)
 
@@ -281,7 +284,7 @@ class TestOptimizer(TestCase):
                 return x
 
         class Parent(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.quant = torch.ao.quantization.QuantStub()
                 self.conv1 = nn.Conv2d(1, 1, 1)
@@ -303,11 +306,11 @@ class TestOptimizer(TestCase):
             torch.ao.quantization.convert(model, inplace=True)
             model = torch.jit.script(model)
             # this line should not have ASAN failures
-            model_optim = optimize_for_mobile(model)
+            optimize_for_mobile(model)
 
     def test_generate_mobile_module_lints(self):
         class MyTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.fc = torch.nn.Linear(4, 4)
                 self.dropout = torch.nn.Dropout(p=0.5)
@@ -318,7 +321,7 @@ class TestOptimizer(TestCase):
                 return out
 
         class MyBNModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.bn = torch.nn.BatchNorm2d(4, affine=True)
 
@@ -402,6 +405,7 @@ class TestOptimizer(TestCase):
         incomplete_bi_module_optim = optimize_for_mobile(incomplete_bi_module, preserved_methods=['get_all_bundled_inputs'])
         self.assertTrue(hasattr(incomplete_bi_module_optim, 'get_all_bundled_inputs'))
 
+    @unittest.skipIf(IS_MACOS, "https://github.com/pytorch/pytorch/issues/157247")
     @skipIfNoXNNPACK
     def test_hoist_conv_packed_params(self):
 
@@ -409,7 +413,7 @@ class TestOptimizer(TestCase):
             return
 
         class Standalone(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.quant = torch.ao.quantization.QuantStub()
                 self.conv1 = nn.Conv2d(1, 1, 1)
@@ -427,10 +431,9 @@ class TestOptimizer(TestCase):
 
             def fuse_model(self):
                 torch.ao.quantization.fuse_modules(self, [['conv2', 'relu']], inplace=True)
-                pass
 
         class Child(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 1, 1)
 
@@ -439,7 +442,7 @@ class TestOptimizer(TestCase):
                 return x
 
         class Parent(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.quant = torch.ao.quantization.QuantStub()
                 self.conv1 = nn.Conv2d(1, 1, 1)
@@ -471,7 +474,7 @@ class TestOptimizer(TestCase):
             # basic case
 
             m, m_optim = _quant_script_and_optimize(Standalone())
-            FileCheck().check_not("Conv2d = prim::GetAttr[name=\"conv1\"]") \
+            FileCheck().check_not('Conv2d = prim::GetAttr[name="conv1"]') \
                        .check_count("__torch__.torch.classes.quantized.Conv2dPackedParamsBase = prim::Constant", 2, exactly=True) \
                        .run(m_optim.graph)
             self.assertFalse(hasattr(m_optim, "conv1"))
@@ -485,7 +488,7 @@ class TestOptimizer(TestCase):
             # generic case
 
             m, m_optim = _quant_script_and_optimize(Parent())
-            FileCheck().check_not("Conv2d = prim::GetAttr[name=\"conv1\"]") \
+            FileCheck().check_not('Conv2d = prim::GetAttr[name="conv1"]') \
                        .check_count("__torch__.torch.classes.quantized.Conv2dPackedParamsBase = prim::Constant", 2, exactly=True) \
                        .run(m_optim.graph)
             self.assertFalse(hasattr(m_optim, "conv1"))
@@ -511,7 +514,7 @@ class TestOptimizer(TestCase):
 
     def test_clone_module_with_class(self):
         class MyInnerTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.pqr = torch.Tensor([10., 20., 30.])
 
@@ -523,7 +526,7 @@ class TestOptimizer(TestCase):
                 return 20
 
         class MyTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.abc = 23
                 self.pqr = torch.Tensor([1., 2., 3.])
@@ -581,8 +584,10 @@ class TestOptimizer(TestCase):
         # Check that the cloned class has a classname that starts with __torch__.
         self.assertTrue(
             cloned.qualified_name.startswith('__torch__.'),
-            ("Expected the cloned module's name to start with the string "
-             f"'__torch__.', but got: {cloned.qualified_name}"),
+            lambda msg: (
+                f"{msg}\nExpected the cloned module's name to start with the string "
+                f"'__torch__.', but got: {cloned.qualified_name}"
+            ),
         )
 
 

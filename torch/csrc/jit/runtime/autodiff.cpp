@@ -1,6 +1,5 @@
 #include <torch/csrc/jit/runtime/autodiff.h>
 
-#include <ATen/core/functional.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/jit_log.h>
@@ -128,17 +127,17 @@ bool isDifferentiable(Graph& g) {
 // will be cleaned up later using EliminateDeadCode(block). TupleUnPack node in
 // backward graph will be removed in eliminateDeadcode(ReverseDetails) defined
 // in this file.
-static c10::optional<std::vector<Value*>> build_script_grad(
+static std::optional<std::vector<Value*>> build_script_grad(
     Node* node,
     const ArrayRef<Value*>& grads) {
   auto graph = node->owningGraph();
   auto maybe_schema = node->maybeSchema();
   if (!maybe_schema) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   auto compiled_graphs = gradientInfoForSchema(*maybe_schema);
   if (!compiled_graphs) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   // Use forward graph to replace node in grad_desc.f
   value_list new_outputs;
@@ -167,7 +166,7 @@ static c10::optional<std::vector<Value*>> build_script_grad(
   auto grad_inputs = insertGraph(*graph, *bw_graph, grad);
   grad_inputs = unpackOutputs(grad_inputs);
   return grad_inputs;
-};
+}
 
 namespace {
 class GradientHelper {
@@ -175,11 +174,11 @@ class GradientHelper {
   GradientHelper(Node* n) : node(n) {}
 
   std::vector<Value*> gradient(ArrayRef<Value*> grad_values) {
-    if (!isDifferentiable(node)) {
-      throw std::runtime_error(
-          std::string("differentiation of ") + node->kind().toDisplayString() +
-          " is not supported, or it is missing necessary type information");
-    }
+    TORCH_CHECK(
+        isDifferentiable(node),
+        "differentiation of ",
+        node->kind().toDisplayString(),
+        " is not supported, or it is missing necessary type information");
     // If AD is defined using torchscript, use it instead of symbolic
     auto script_grads = build_script_grad(node, grad_values);
     if (script_grads)
@@ -206,8 +205,7 @@ class GradientHelper {
     } else if (node->kind() == prim::ConstantChunk) {
       auto* g = node->owningGraph();
 
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-      Value* input_list;
+      Value* input_list = nullptr;
       if (grad_values.size() == 1 &&
           grad_values[0]->type()->isSubtypeOf(*ListType::ofTensors())) {
         input_list = grad_values[0];
@@ -285,9 +283,11 @@ class GradientHelper {
           nullptr};
     }
 
-    throw std::runtime_error(
-        std::string("failed to differentiate `") +
-        node->kind().toDisplayString() + "`");
+    TORCH_CHECK(
+        false,
+        "failed to differentiate `",
+        node->kind().toDisplayString(),
+        "`");
   }
 };
 } // namespace
@@ -301,7 +301,7 @@ class GradientHelper {
 // are linear and can use this property to do more aggressive optimizations
 // later. It is ok to replace any backward function with known-zero inputs with
 // something that produces known-zero outputs. This function encloses each
-// know-linear backward function in a 'GradOf' sub-block so that we can perform
+// known-linear backward function in a 'GradOf' sub-block so that we can perform
 // optimizations using this information. In particular, specializeAutogradZero
 // will observe if all the inputs to the linear block are AutogradZeroTensor,
 // which the autograd uses to represent zeros, and then propagate the zeros to
@@ -321,7 +321,7 @@ static std::vector<Value*> linearGradientForNode(
   auto block = linear->addBlock();
   WithInsertPoint guard(block);
   auto results = GradientHelper(node).gradient(grad_values);
-  return fmap(results, [block, linear](Value* grad) -> Value* {
+  return fmap(std::move(results), [block, linear](Value* grad) -> Value* {
     if (!grad || grad->mustBeNone())
       return nullptr;
     block->registerOutput(grad);
@@ -352,7 +352,7 @@ bool outputRequiresGrad(Value* output) {
   if (output->type()->castRaw<TensorType>() == nullptr) {
     return output->requires_grad();
   }
-  c10::optional<bool> requiresGrad =
+  std::optional<bool> requiresGrad =
       output->type()->expectRef<TensorType>().requiresGrad();
   if (requiresGrad.has_value()) {
     return *requiresGrad;
@@ -458,7 +458,7 @@ static ReverseDetails addReverseInline(Gradient& grad_desc) {
     // only in non-differentiable contexts (e.g. as second input to
     // aten::type_as). In that case we simply ignore it as an output, because it
     // won't ever produce any meaningful values.
-    if (grad_map.count(input) == 0)
+    if (!grad_map.contains(input))
       continue;
     reverse_block->registerOutput(get_grad(input));
     grad_desc.df_output_vjps.push_back(i);
@@ -516,7 +516,7 @@ static bool inBlock(Node* node, Block* container) {
 
 static void liftConstants(Node* node, Block* move_to_this_block) {
   static const auto err = [](Value*) -> Value* {
-    throw std::runtime_error("unexpected input");
+    TORCH_CHECK(false, "unexpected input");
   };
   auto& graph = *node->owningGraph();
   for (Value* input : node->inputs()) {
@@ -575,8 +575,7 @@ static void foldSizeIfNotEqual(Node* node) {
     // insert in front of _grad_sum_to_size
     WithInsertPoint guard(node);
     IValue ival{};
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    Value* size;
+    Value* size = nullptr;
     if (input_size != output_size) {
       size = node->owningGraph()->insertConstant(*input_size);
     } else {
@@ -618,7 +617,7 @@ static void deduplicateSizeCaptures(
     if (!node->matches("aten::size(Tensor self) -> int[]")) {
       continue;
     }
-    if (usedOnlyInReverse(capture) && capture_set.count(node->input())) {
+    if (usedOnlyInReverse(capture) && capture_set.contains(node->input())) {
       WithInsertPoint insert_guard{*rev_info.reverse_block->nodes().begin()};
       auto* size =
           node->input()->owningGraph()->insert(aten::size, {node->input()});
@@ -646,7 +645,7 @@ static void eliminateDeadCode(ReverseDetails& rev_info) {
       [&](const std::unordered_set<const Value*>& live_values) {
         std::vector<Value*> to_erase;
         for (auto& entry : rev_info.grad_map) {
-          if (!live_values.count(entry.second)) {
+          if (!live_values.contains(entry.second)) {
             to_erase.push_back(entry.first);
           }
         }
@@ -731,14 +730,14 @@ static void lambdaLiftReverse(Gradient& grad_desc, ReverseDetails& rev_info) {
   for (Value* capture_val : reverse_captures) {
     // If it's already an output we don't have to add anything,
     // but register the fact that it needs to be captured.
-    if (orig_primal_outputs_idx.count(capture_val) > 0) {
-      grad_desc.df_input_captured_outputs.push_back(
-          orig_primal_outputs_idx[capture_val]);
+    if (auto it = orig_primal_outputs_idx.find(capture_val);
+        it != orig_primal_outputs_idx.end()) {
+      grad_desc.df_input_captured_outputs.push_back(it->second);
       // If it's an input, we could add it as an output but in fact it's
       // more efficient to use a special kind of capture.
-    } else if (orig_primal_inputs_idx.count(capture_val) > 0) {
-      grad_desc.df_input_captured_inputs.push_back(
-          orig_primal_inputs_idx.at(capture_val));
+    } else if (auto it = orig_primal_inputs_idx.find(capture_val);
+               it != orig_primal_inputs_idx.end()) {
+      grad_desc.df_input_captured_inputs.push_back(it->second);
       // Otherwise it's just a regular intermediate value that we need to add as
       // an output
     } else {
@@ -770,11 +769,12 @@ static void lambdaLiftReverse(Gradient& grad_desc, ReverseDetails& rev_info) {
     // false positives), while the gradients we will emit for this value can get
     // DCE-d in the optimization pass (because it has no influence on the real
     // f's outputs that we differentiate).
-    if (rev_info.grad_map.count(tmp) == 0)
+    auto it = rev_info.grad_map.find(tmp);
+    if (it == rev_info.grad_map.end())
       continue;
 
     Value* tmp_vjp_in = reverse_block->addInput()->setType(tmp->type());
-    Value* tmp_vjp_prev = rev_info.grad_map.at(tmp);
+    Value* tmp_vjp_prev = it->second;
     // This is quite weird because we can't first make a sum and then replace
     // all uses of tmp_vjp_prev (that would replace its use in the sum too!), so
     // we create an incorrect sum that doesn't use prev vjp, replace uses, and
@@ -840,7 +840,7 @@ Gradient differentiate(std::shared_ptr<Graph>& graph) {
   TORCH_CHECK(
       graph.use_count() == 1,
       "differentiate will mutate and destroy the graph, so it requires "
-      "graph.use_count() == 1, but found %d",
+      "graph.use_count() == 1, but found ",
       graph.use_count());
   std::swap(graph, grad_desc.f);
   // XXX: Take care when handling outputs - they can be duplicated!

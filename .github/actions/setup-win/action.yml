@@ -6,6 +6,12 @@ inputs:
   cuda-version:
     description: which cuda version to install, 'cpu' for none
     required: true
+  python-version:
+    required: false
+    type: string
+    default: "3.11"
+    description: |
+      The python version to be used. Will be 3.11 by default
 
 runs:
   using: composite
@@ -18,7 +24,7 @@ runs:
           # Pulled from instance metadata endpoint for EC2
           # see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html
           category=$1
-          curl -fsSL "http://169.254.169.254/latest/meta-data/${category}"
+          curl -H "X-aws-ec2-metadata-token: $(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 30")" -fsSL "http://169.254.169.254/latest/meta-data/${category}"
         }
         echo "ami-id: $(get_ec2_metadata ami-id)"
         echo "instance-id: $(get_ec2_metadata instance-id)"
@@ -38,18 +44,25 @@ runs:
         CONDA="C:\Jenkins\Miniconda3\condabin\conda.bat"
 
         {
+          echo "CONDA=${CONDA}";
           echo "CONDA_RUN=${CONDA} run --no-capture-output";
           echo "CONDA_BUILD=${CONDA} run conda-build";
           echo "CONDA_INSTALL=${CONDA} install";
         } >> "${GITHUB_ENV}"
 
     - name: Setup Python3
+      env:
+          PYTHON_VERSION: ${{ inputs.python-version }}
       shell: bash
       run: |
         set +e
         set -x
 
-        PYTHON3=$(${CONDA_RUN} which python3)
+        # Create new py_tmp env with python-version
+        # Pin openssl=3.5.6: 3.5.7 breaks Windows cert-store parsing (ASN1: NOT_ENOUGH_DATA)
+        ${CONDA} create -y -n py_tmp python=${PYTHON_VERSION} intel-openmp libuv "openssl=3.5.6"
+
+        PYTHON3=$(${CONDA_RUN} -n py_tmp which python3)
         EXIT_CODE=$?
 
         if [[ "${EXIT_CODE}" == "0" ]]; then
@@ -62,7 +75,7 @@ runs:
           # installation, which is Python 3 based. Its Python is default to Python 3. Further, there
           # is also the Miniconda installation that is Python 2 based, and both can be installed if
           # needed. In both cases, Python binary is just called python
-          PYTHON=$(${CONDA_RUN} which python)
+          PYTHON=$(${CONDA_RUN} -n py_tmp which python)
           EXIT_CODE=$?
 
           if [[ "${EXIT_CODE}" == "0" ]]; then

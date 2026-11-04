@@ -1,14 +1,26 @@
+# mypy: allow-untyped-defs
+
 import torch
+from torch import Tensor
+
 from . import _functional as F
-from .optimizer import _maximize_doc, Optimizer
+from .optimizer import _maximize_doc, _params_doc, _to_scalar, Optimizer, ParamsT
+
 
 __all__ = ["SparseAdam"]
 
 
 class SparseAdam(Optimizer):
     def __init__(
-        self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, maximize: bool = False
-    ):
+        self,
+        params: ParamsT,
+        lr: float | Tensor = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        maximize: bool = False,
+    ) -> None:
+        if isinstance(lr, Tensor) and lr.numel() != 1:
+            raise ValueError("Tensor lr must be 1-element")
         if not 0.0 < lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 < eps:
@@ -18,15 +30,21 @@ class SparseAdam(Optimizer):
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
 
-        defaults = dict(lr=lr, betas=betas, eps=eps, maximize=maximize)
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "maximize": maximize,
+        }
         super().__init__(params, defaults)
 
         sparse_params = []
         complex_params = []
         for index, param_group in enumerate(self.param_groups):
-            assert isinstance(
-                param_group, dict
-            ), f"param_groups must be a list of dicts, but got {type(param_group)}"
+            if not isinstance(param_group, dict):
+                raise AssertionError(
+                    f"param_groups must be a list of dicts, but got {type(param_group)}"
+                )
             # given param group, convert given params to a list first before iterating
             for d_index, d_param in enumerate(param_group["params"]):
                 if d_param.is_sparse:
@@ -56,13 +74,11 @@ class SparseAdam(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            state_steps = []
-            eps = group["eps"]
-            lr = group["lr"]
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            exp_avgs: list[Tensor] = []
+            exp_avg_sqs: list[Tensor] = []
+            state_steps: list[int] = []
             beta1, beta2 = group["betas"]
             maximize = group.get("maximize", False)
 
@@ -103,10 +119,10 @@ class SparseAdam(Optimizer):
                 exp_avgs,
                 exp_avg_sqs,
                 state_steps,
+                eps=group["eps"],
                 beta1=beta1,
                 beta2=beta2,
-                lr=group["lr"],
-                eps=group["eps"],
+                lr=_to_scalar(group["lr"]),
                 maximize=maximize,
             )
 
@@ -141,7 +157,7 @@ SparseAdam.__doc__ = rf"""SparseAdam implements a masked version of the Adam alg
     It is important to not conflate a semantically sparse tensor (a tensor where many
     of its values are zeros) with a sparse layout tensor (a tensor where ``.is_sparse``
     returns ``True``). The SparseAdam approximation is intended for `semantically` sparse
-    tensors and the sparse layout is only a implementation detail. A clearer implementation
+    tensors and the sparse layout is only an implementation detail. A clearer implementation
     would be to use MaskedTensors, but those are experimental.
 
 
@@ -159,9 +175,8 @@ SparseAdam.__doc__ = rf"""SparseAdam implements a masked version of the Adam alg
 
 
     Args:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): learning rate (default: 1e-3)
+        {_params_doc}
+        lr (float, Tensor, optional): learning rate (default: 1e-3)
         betas (Tuple[float, float], optional): coefficients used for computing
             running averages of gradient and its square (default: (0.9, 0.999))
         eps (float, optional): term added to the denominator to improve

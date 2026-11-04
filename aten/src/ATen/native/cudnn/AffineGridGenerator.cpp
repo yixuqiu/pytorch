@@ -1,5 +1,4 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
-#include <ATen/Config.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/CUDAConfig.h>
 
@@ -25,7 +24,8 @@ Tensor cudnn_affine_grid_generator_forward(
     int64_t C,
     int64_t H,
     int64_t W) {
-  AT_ERROR(
+  TORCH_CHECK(
+      false,
       "cudnn_affine_grid_generator_forward: ATen not compiled with cuDNN support");
 }
 
@@ -35,7 +35,8 @@ Tensor cudnn_affine_grid_generator_backward(
     int64_t C,
     int64_t H,
     int64_t W) {
-  AT_ERROR(
+  TORCH_CHECK(
+      false,
       "cudnn_affine_grid_generator_backward: ATen not compiled with cuDNN support");
 }
 
@@ -48,13 +49,10 @@ Tensor cudnn_affine_grid_generator_backward(
 #include <ATen/cudnn/Descriptors.h>
 #include <ATen/cudnn/Handle.h>
 #include <ATen/cudnn/Types.h>
-#include <ATen/cudnn/Utils.h>
-#include <ATen/cudnn/cudnn-wrapper.h>
 
 #include <ATen/TensorUtils.h>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 namespace {
 
@@ -120,7 +118,6 @@ Tensor cudnn_affine_grid_generator_backward(
   return grad_theta_t;
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native
 
 #endif // AT_CUDNN_ENABLED()

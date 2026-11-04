@@ -6,16 +6,22 @@ from torch._export.serde.schema_check import (
     SchemaUpdateError,
     update_schema,
 )
-
-from torch.testing._internal.common_utils import IS_FBCODE, run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    IS_FBCODE,
+    run_tests,
+    TestCase,
+)
 
 
 class TestSchema(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_schema_compatibility(self):
         msg = """
 Detected an invalidated change to export schema. Please run the following script to update the schema:
 Example(s):
-    python scripts/export/update_schema.py --prefix <path_to_torch_development_diretory>
+    python scripts/export/update_schema.py --prefix <path_to_torch_development_directory>
         """
 
         if IS_FBCODE:
@@ -27,7 +33,27 @@ Example(s):
         except SchemaUpdateError as e:
             self.fail(f"Failed to update schema: {e}\n{msg}")
 
-        self.assertEqual(commit.checksum_base, commit.checksum_result, msg)
+        self.assertEqual(commit.checksum_head, commit.checksum_next, msg)
+
+    def test_thrift_schema_unchanged(self):
+        msg = """
+Detected an unexpected change to schema.thrift. Please update schema.py instead and run the following script:
+Example(s):
+    python scripts/export/update_schema.py --prefix <path_to_torch_development_directory>
+        """
+
+        if IS_FBCODE:
+            msg += """or
+    buck run caffe2:export_update_schema -- --prefix /data/users/$USER/fbsource/fbcode/caffe2/
+            """
+
+        try:
+            commit = update_schema()
+        except SchemaUpdateError as e:
+            self.fail(f"Failed to update schema: {e}\n{msg}")
+
+        self.assertEqual(commit.thrift_checksum_head, commit.thrift_checksum_real, msg)
+        self.assertEqual(commit.thrift_checksum_head, commit.thrift_checksum_next, msg)
 
     def test_schema_diff(self):
         additions, subtractions = _diff_schema(
@@ -106,12 +132,21 @@ Example(s):
 
         commit = _Commit(
             result=src,
-            checksum_result="",
-            path="",
+            checksum_next="",
+            yaml_path="",
             additions=additions,
             subtractions=subtractions,
             base=dst,
-            checksum_base="",
+            checksum_head="",
+            cpp_header="",
+            cpp_header_path="",
+            thrift_checksum_head="",
+            thrift_checksum_real="",
+            thrift_checksum_next="",
+            thrift_schema="",
+            thrift_schema_path="",
+            enum_converter_header="",
+            enum_converter_header_path="",
         )
         next_version, _ = check(commit)
         self.assertEqual(next_version, [4, 1])
@@ -138,12 +173,21 @@ Example(s):
 
         commit = _Commit(
             result=src,
-            checksum_result="",
-            path="",
+            checksum_next="",
+            yaml_path="",
             additions=additions,
             subtractions=subtractions,
             base=dst,
-            checksum_base="",
+            checksum_head="",
+            cpp_header="",
+            cpp_header_path="",
+            thrift_checksum_head="",
+            thrift_checksum_real="",
+            thrift_checksum_next="",
+            thrift_schema="",
+            thrift_schema_path="",
+            enum_converter_header="",
+            enum_converter_header_path="",
         )
         next_version, _ = check(commit)
         self.assertEqual(next_version, [4, 1])
@@ -173,12 +217,21 @@ Example(s):
 
         commit = _Commit(
             result=src,
-            checksum_result="",
-            path="",
+            checksum_next="",
+            yaml_path="",
             additions=additions,
             subtractions=subtractions,
             base=dst,
-            checksum_base="",
+            checksum_head="",
+            cpp_header="",
+            cpp_header_path="",
+            thrift_checksum_head="",
+            thrift_checksum_real="",
+            thrift_checksum_next="",
+            thrift_schema="",
+            thrift_schema_path="",
+            enum_converter_header="",
+            enum_converter_header_path="",
         )
         next_version, _ = check(commit)
         self.assertEqual(next_version, [3, 3])
@@ -231,12 +284,21 @@ Example(s):
 
         commit = _Commit(
             result=src,
-            checksum_result="",
-            path="",
+            checksum_next="",
+            yaml_path="",
             additions=additions,
             subtractions=subtractions,
             base=dst,
-            checksum_base="",
+            checksum_head="",
+            cpp_header="",
+            cpp_header_path="",
+            thrift_checksum_head="",
+            thrift_checksum_real="",
+            thrift_checksum_next="",
+            thrift_schema="",
+            thrift_schema_path="",
+            enum_converter_header="",
+            enum_converter_header_path="",
         )
         next_version, _ = check(commit)
         self.assertEqual(next_version, [3, 3])
@@ -259,12 +321,21 @@ Example(s):
 
         commit = _Commit(
             result=src,
-            checksum_result="",
-            path="",
+            checksum_next="",
+            yaml_path="",
             additions=additions,
             subtractions=subtractions,
             base=dst,
-            checksum_base="",
+            checksum_head="",
+            cpp_header="",
+            cpp_header_path="",
+            thrift_checksum_head="",
+            thrift_checksum_real="",
+            thrift_checksum_next="",
+            thrift_schema="",
+            thrift_schema_path="",
+            enum_converter_header="",
+            enum_converter_header_path="",
         )
         next_version, _ = check(commit)
         self.assertEqual(next_version, [3, 3])
@@ -294,12 +365,21 @@ Example(s):
 
         commit = _Commit(
             result=src,
-            checksum_result="",
-            path="",
+            checksum_next="",
+            yaml_path="",
             additions=additions,
             subtractions=subtractions,
             base=dst,
-            checksum_base="",
+            checksum_head="",
+            cpp_header="",
+            cpp_header_path="",
+            thrift_checksum_head="",
+            thrift_checksum_real="",
+            thrift_checksum_next="",
+            thrift_schema="",
+            thrift_schema_path="",
+            enum_converter_header="",
+            enum_converter_header_path="",
         )
         next_version, _ = check(commit)
         self.assertEqual(next_version, [3, 3])
@@ -326,15 +406,80 @@ Example(s):
 
         commit = _Commit(
             result=src,
-            checksum_result="",
-            path="",
+            checksum_next="",
+            yaml_path="",
             additions=additions,
             subtractions=subtractions,
             base=dst,
-            checksum_base="",
+            checksum_head="",
+            cpp_header="",
+            cpp_header_path="",
+            thrift_checksum_head="",
+            thrift_checksum_real="",
+            thrift_checksum_next="",
+            thrift_schema="",
+            thrift_schema_path="",
+            enum_converter_header="",
+            enum_converter_header_path="",
         )
         next_version, _ = check(commit)
         self.assertEqual(next_version, [4, 1])
+
+    def test_schema_comparison(self):
+        import torch._export.serde.schema as schema
+
+        sig = schema.ModuleCallSignature(
+            inputs=[
+                schema.Argument.create(as_none=True),
+                schema.Argument.create(
+                    as_sym_int=schema.SymIntArgument.create(as_name="s0")
+                ),
+            ],
+            outputs=[
+                schema.Argument.create(
+                    as_sym_int=schema.SymIntArgument.create(as_name="s1")
+                )
+            ],
+            in_spec="foo",
+            out_spec="bar",
+            forward_arg_names=["None", "symint"],
+        )
+        # same content as sig
+        sig_same = schema.ModuleCallSignature(
+            inputs=[
+                schema.Argument.create(as_none=True),
+                schema.Argument.create(
+                    as_sym_int=schema.SymIntArgument.create(as_name="s0")
+                ),
+            ],
+            outputs=[
+                schema.Argument.create(
+                    as_sym_int=schema.SymIntArgument.create(as_name="s1")
+                )
+            ],
+            in_spec="foo",
+            out_spec="bar",
+            forward_arg_names=["None", "symint"],
+        )
+        # as_name of symint is different
+        sig_diff = schema.ModuleCallSignature(
+            inputs=[
+                schema.Argument.create(as_none=True),
+                schema.Argument.create(
+                    as_sym_int=schema.SymIntArgument.create(as_name="s0")
+                ),
+            ],
+            outputs=[
+                schema.Argument.create(
+                    as_sym_int=schema.SymIntArgument.create(as_name="s2")
+                )
+            ],
+            in_spec="foo",
+            out_spec="bar",
+            forward_arg_names=["None", "symint"],
+        )
+        self.assertEqual(sig, sig_same)
+        self.assertNotEqual(sig, sig_diff)
 
 
 if __name__ == "__main__":

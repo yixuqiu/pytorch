@@ -1,19 +1,13 @@
+# mypy: allow-untyped-defs
 import torch
 
-from torch._export.db.case import export_case, SupportLevel
 
-
-@export_case(
-    example_inputs=(torch.randn(3, 2),),
-    tags={"python.object-model"},
-    support_level=SupportLevel.NOT_SUPPORTED_YET,
-)
 class ModelAttrMutation(torch.nn.Module):
     """
-    Attribute mutation is not supported.
+    Attribute mutation raises a warning. Covered in the test_export.py test_detect_leak_strict test.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.attr_list = [torch.randn(3, 2), torch.randn(3, 2)]
 
@@ -23,3 +17,8 @@ class ModelAttrMutation(torch.nn.Module):
     def forward(self, x):
         self.attr_list = self.recreate_list()
         return x.sum() + self.attr_list[0].sum()
+
+
+example_args = (torch.randn(3, 2),)
+tags = {"python.object-model"}
+model = ModelAttrMutation()

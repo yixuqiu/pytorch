@@ -10,6 +10,7 @@ set(TORCH_API_TEST_SOURCES
   ${TORCH_API_TEST_DIR}/functional.cpp
   ${TORCH_API_TEST_DIR}/init.cpp
   ${TORCH_API_TEST_DIR}/integration.cpp
+  ${TORCH_API_TEST_DIR}/ivalue.cpp
   ${TORCH_API_TEST_DIR}/jit.cpp
   ${TORCH_API_TEST_DIR}/memory.cpp
   ${TORCH_API_TEST_DIR}/meta_tensor.cpp
@@ -49,10 +50,7 @@ endif()
 
 add_executable(test_api ${TORCH_API_TEST_SOURCES})
 target_include_directories(test_api PRIVATE ${ATen_CPU_INCLUDE})
-target_link_libraries(test_api PRIVATE torch gtest)
-if(NOT MSVC)
-  target_compile_options_if_supported(test_api -Wno-unused-variable)
-endif()
+target_link_libraries(test_api PRIVATE torch gtest_main gmock)
 
 if(USE_CUDA)
   target_compile_definitions(test_api PRIVATE "USE_CUDA")
@@ -67,9 +65,22 @@ if(NOT MSVC)
   target_compile_options_if_supported(test_api "-Wno-maybe-uninitialized")
   # gcc gives nonsensical warnings about variadic.h
   target_compile_options_if_supported(test_api "-Wno-unused-but-set-parameter")
+
+  # Add -Wno-error=nonnull for GCC 12+
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+    target_compile_options_if_supported(test_api "-Wno-error=nonnull")
+  endif()
+
+  # Add -Wno-error=array-bounds for GCC 13+
+  # See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113239
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+    target_compile_options_if_supported(test_api "-Wno-error=array-bounds")
+  endif()
+
 endif()
 
 if(INSTALL_TEST)
+  set_target_properties(test_api PROPERTIES INSTALL_RPATH "${CMAKE_INSTALL_RPATH}:${_rpath_portable_origin}/../lib")
   install(TARGETS test_api DESTINATION bin)
   # Install PDB files for MSVC builds
   if(MSVC AND BUILD_SHARED_LIBS)

@@ -1,15 +1,9 @@
 # Owner(s): ["oncall: jit"]
-# flake8: noqa
 
-import sys
-import unittest
-from enum import Enum
-from typing import List, Optional
 
 import torch
-from torch.testing._internal.jit_utils import JitTestCase
-
 from jit.myfunction_a import my_function_a
+from torch.testing._internal.jit_utils import JitTestCase
 
 
 class TestDecorator(JitTestCase):
@@ -25,3 +19,10 @@ class TestDecorator(JitTestCase):
         fn = my_function_a
         fx = torch.jit.script(fn)
         self.assertEqual(fn(1.0), fx(1.0))
+
+
+if __name__ == "__main__":
+    raise RuntimeError(
+        "This test is not currently used and should be "
+        "enabled in discover_tests.py if required."
+    )

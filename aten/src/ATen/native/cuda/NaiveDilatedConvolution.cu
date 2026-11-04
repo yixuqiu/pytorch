@@ -399,7 +399,7 @@ void slow_conv_dilated_all_cuda_template(
 Tensor slow_conv_dilated2d_cuda(
     const Tensor& input,
     const Tensor& weight,
-    IntArrayRef kernel_size, const c10::optional<Tensor>& bias_opt,
+    IntArrayRef kernel_size, const std::optional<Tensor>& bias_opt,
     IntArrayRef stride_size,
     IntArrayRef pad_size,
     IntArrayRef dilation_size) {
@@ -492,7 +492,7 @@ std::tuple<Tensor, Tensor, Tensor> slow_conv_dilated2d_backward_cuda(
       weight_,
       undefined,
       grad_output_,
-      grad_input,
+      grad_input_,
       grad_weight,
       grad_bias,
       kernel_size,
@@ -505,7 +505,7 @@ std::tuple<Tensor, Tensor, Tensor> slow_conv_dilated2d_backward_cuda(
 Tensor slow_conv_dilated3d_cuda(
     const Tensor& input,
     const Tensor& weight,
-    IntArrayRef kernel_size, const c10::optional<Tensor>& bias_opt,
+    IntArrayRef kernel_size, const std::optional<Tensor>& bias_opt,
     IntArrayRef stride_size,
     IntArrayRef pad_size,
     IntArrayRef dilation_size) {
@@ -538,7 +538,7 @@ Tensor slow_conv_dilated3d_cuda(
   Tensor output_ = (is_batch ? output : output.unsqueeze(0));
 
   slow_conv_dilated_all_cuda_template<3>(
-      output,
+      output_,
       input_,
       weight_,
       bias_,
@@ -598,7 +598,7 @@ std::tuple<Tensor, Tensor, Tensor> slow_conv_dilated3d_backward_cuda(
       weight_,
       undefined,
       grad_output_,
-      grad_input,
+      grad_input_,
       grad_weight,
       grad_bias,
       kernel_size,
@@ -608,7 +608,7 @@ std::tuple<Tensor, Tensor, Tensor> slow_conv_dilated3d_backward_cuda(
   return std::tie(grad_input, grad_weight, grad_bias);
 }
 
-REGISTER_CUDA_DISPATCH(slow_conv_dilated2d_backward_stub, &slow_conv_dilated2d_backward_cuda);
-REGISTER_CUDA_DISPATCH(slow_conv_dilated3d_backward_stub, &slow_conv_dilated3d_backward_cuda);
+REGISTER_CUDA_DISPATCH(slow_conv_dilated2d_backward_stub, &slow_conv_dilated2d_backward_cuda)
+REGISTER_CUDA_DISPATCH(slow_conv_dilated3d_backward_stub, &slow_conv_dilated3d_backward_cuda)
 
 } // namespace at::native

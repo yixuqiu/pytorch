@@ -4,28 +4,21 @@ from typing import NamedTuple, Tuple
 
 import torch
 from torch.testing import FileCheck
+from torch.testing._internal.common_utils import raise_on_run_directly
 from torch.testing._internal.jit_utils import JitTestCase
-
-
-if __name__ == "__main__":
-    raise RuntimeError(
-        "This test file is not meant to be run directly, use:\n\n"
-        "\tpython test/test_jit.py TESTNAME\n\n"
-        "instead."
-    )
 
 
 class TestGetDefaultAttr(JitTestCase):
     def test_getattr_with_default(self):
         class A(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.init_attr_val = 1.0
 
             def forward(self, x):
                 y = getattr(self, "init_attr_val")  # noqa: B009
                 w: list[float] = [1.0]
-                z = getattr(self, "missing", w)  # noqa: B009
+                z = getattr(self, "missing", w)
                 z.append(y)
                 return z
 
@@ -66,3 +59,7 @@ class TestGetDefaultAttr(JitTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "but got a normal Tuple"):
             torch.jit.script(fn)
+
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_jit.py")

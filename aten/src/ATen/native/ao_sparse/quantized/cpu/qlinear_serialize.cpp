@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <c10/util/irange.h>
 
 #ifdef USE_FBGEMM
 #include <ATen/native/ao_sparse/quantized/cpu/fbgemm_utils.h>
@@ -9,8 +10,7 @@
 #include <utility>
 #endif
 
-namespace ao {
-namespace sparse {
+namespace ao::sparse {
 
 namespace {
 /**
@@ -48,13 +48,13 @@ ao::sparse::BCSR pack_bcsr(
   rowBPtr.push_back(0);
   int64_t nnzb = 0;
   int64_t rowBlocks = (R + RB - 1) / RB;
-  for (int64_t i = 0; i < rowBlocks; ++i) {
+  for (const auto i : c10::irange(rowBlocks)) {
     int64_t curCols = C;
     int64_t curColBlocks = (curCols + CB - 1) / CB;
-    for (int64_t j = 0; j < curColBlocks; ++j) {
+    for (const auto j : c10::irange(curColBlocks)) {
       // is the whole block zero?
       bool isCurrentBlockNonZero = false;
-      for (int64_t ib = 0; ib < RB; ++ib) {
+      for (const auto ib : c10::irange(RB)) {
         // break if already found a non-zero element or
         // out of bounds
         if (isCurrentBlockNonZero || (i * RB + ib) >= R) {
@@ -63,7 +63,7 @@ ao::sparse::BCSR pack_bcsr(
         const int64_t curr_row = i * RB + ib;
         const int8_t curr_row_zero_point =
             qscheme_per_tensor ? zero_points[0] : zero_points[curr_row];
-        for (int64_t jb = 0; jb < CB; ++jb) {
+        for (const auto jb : c10::irange(CB)) {
           // within bound?
           if ((j * CB + jb) >= C) {
             continue;
@@ -76,8 +76,8 @@ ao::sparse::BCSR pack_bcsr(
         }
       }
       if (isCurrentBlockNonZero) {
-        for (int64_t ib = 0; ib < RB; ++ib) {
-          for (int64_t jb = 0; jb < CB; ++jb) {
+        for (const auto ib : c10::irange(RB)) {
+          for (const auto jb : c10::irange(CB)) {
             if ((i * RB + ib) >= R || (j * CB + jb) >= C) {
               // zero fill
               values.push_back(0);
@@ -116,7 +116,7 @@ BCSRSerializationType PackedLinearWeight::serialize() {
       w->C,
       w->RB,
       w->CB,
-      zero_points.data_ptr<int8_t>(),
+      zero_points.const_data_ptr<int8_t>(),
       qscheme_per_tensor);
 
   std::vector<int8_t>& packed_weight_values = std::get<0>(untiled_bcsr);
@@ -236,8 +236,8 @@ BCSRSerializationType PackedLinearWeightQnnp::serialize() {
       std::move(w_scales_compact),
       std::move(w_zero_points_compact),
       (q_scheme_ == c10::kPerTensorAffine),
-      wrapped_row_values,
-      wrapped_col_indices,
+      std::move(wrapped_row_values),
+      std::move(wrapped_col_indices),
       wrap_vector<uint8_t>(bcsr_matrix_->values, c10::kByte),
       output_channels_,
       input_channels_);
@@ -245,5 +245,4 @@ BCSRSerializationType PackedLinearWeightQnnp::serialize() {
 
 #endif // USE_PYTORCH_QNNPACK
 
-} // namespace sparse
 } // namespace ao

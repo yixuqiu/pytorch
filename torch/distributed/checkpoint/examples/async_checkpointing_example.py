@@ -1,8 +1,10 @@
+# mypy: allow-untyped-defs
 # Owner(s): ["oncall: distributed"]
 
 import os
 import shutil
 import traceback
+from concurrent.futures import Future
 
 import torch
 import torch.distributed as dist
@@ -10,12 +12,12 @@ import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed._tensor.device_mesh import init_device_mesh
 from torch.distributed.checkpoint.state_dict import (
     _patch_model_state_dict,
     _patch_optimizer_state_dict,
 )
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.tensor.device_mesh import init_device_mesh
 
 
 DEVICE = "cuda"
@@ -30,7 +32,7 @@ class InjectedException(Exception):
 
 
 class Model(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.net1 = nn.Linear(8, 32)
         self.net2 = nn.Linear(32, 128)
@@ -58,6 +60,7 @@ def _init_model(rank, world_size):
     optim = torch.optim.Adam(model.parameters(), lr=0.0001)
 
     _patch_model_state_dict(model)
+    # pyrefly: ignore [bad-argument-type]
     _patch_optimizer_state_dict(model, optimizers=optim)
 
     return model, optim
@@ -90,6 +93,7 @@ def run(rank, world_size):
     loss_calc = torch.nn.BCELoss()
 
     f = None
+    # pyrefly: ignore [bad-assignment]
     for epoch in range(NUM_EPOCHS):
         try:
             torch.manual_seed(epoch)
@@ -105,6 +109,8 @@ def run(rank, world_size):
 
             if epoch % SAVE_PERIOD == 0:
                 if f is not None:
+                    if not isinstance(f, Future):
+                        raise AssertionError("f should be a Future instance")
                     f.result()
                 f = dcp.state_dict_saver.async_save(
                     state_dict, checkpoint_id=CHECKPOINT_DIR
@@ -121,6 +127,8 @@ def run(rank, world_size):
 
             _print("Reloading model from last checkpoint!")
             if f is not None:
+                if not isinstance(f, Future):
+                    raise AssertionError("f should be a Future instance") from None
                 f.result()
             dcp.load(state_dict)
 

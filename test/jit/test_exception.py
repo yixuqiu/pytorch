@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from torch.testing._internal.common_utils import TestCase
 
+
 r"""
 Test TorchScript exception handling.
 """
@@ -11,7 +12,7 @@ Test TorchScript exception handling.
 class TestException(TestCase):
     def test_pyop_exception_message(self):
         class Foo(torch.jit.ScriptModule):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv = nn.Conv2d(1, 10, kernel_size=5)
 
@@ -35,7 +36,7 @@ class TestException(TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "This op may not exist or may not be currently " "supported in TorchScript",
+            "This op may not exist or may not be currently supported in TorchScript",
         ):
 
             @torch.jit.script
@@ -140,7 +141,7 @@ class TestException(TestCase):
 
         @torch.jit.script
         def foo(cond):
-            assert bool(cond), "hi"
+            assert bool(cond), "hi"  # noqa: S101
 
         foo(torch.tensor(1))
         # we don't currently validate the name of the exception
@@ -196,3 +197,10 @@ class TestException(TestCase):
             "jit.myexception.MyKeyError: This is a user defined key error",
         ):
             fn()
+
+
+if __name__ == "__main__":
+    raise RuntimeError(
+        "This test is not currently used and should be "
+        "enabled in discover_tests.py if required."
+    )

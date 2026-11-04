@@ -1,5 +1,9 @@
+#include <c10/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/macros/Macros.h>
+#include <c10/util/WaitCounter.h>
 
 #include <limits>
 
@@ -22,7 +26,7 @@ int device_count_impl(bool fail_if_no_driver) {
   // Clear out the error state, so we don't spuriously trigger someone else.
   // (This shouldn't really matter, since we won't be running very much CUDA
   // code in this regime.)
-  cudaError_t last_err C10_UNUSED = cudaGetLastError();
+  [[maybe_unused]] cudaError_t last_err = cudaGetLastError();
   switch (err) {
     case cudaErrorNoDevice:
       // Zero devices is ok here
@@ -52,13 +56,12 @@ int device_count_impl(bool fail_if_no_driver) {
             "https://pytorch.org to install a PyTorch version that has been "
             "compiled with your version of the CUDA driver.");
       }
-    } break;
+    }
     case cudaErrorInitializationError:
       TORCH_CHECK(
           false,
           "CUDA driver initialization failed, you might not "
           "have a CUDA gpu.");
-      break;
     case cudaErrorUnknown:
       TORCH_CHECK(
           false,
@@ -66,7 +69,6 @@ int device_count_impl(bool fail_if_no_driver) {
           "incorrectly set up environment, e.g. changing env "
           "variable CUDA_VISIBLE_DEVICES after program start. "
           "Setting the available devices to be zero.");
-      break;
 #if C10_ASAN_ENABLED
     case cudaErrorMemoryAllocation:
       // In ASAN mode, we know that a cudaErrorMemoryAllocation error will
@@ -77,8 +79,19 @@ int device_count_impl(bool fail_if_no_driver) {
           "CUDA with nvcc does not work well with ASAN and it's probably "
           "the reason. We will simply shut down CUDA support. If you "
           "would like to use GPUs, turn off ASAN.");
-      break;
 #endif // C10_ASAN_ENABLED
+#if defined(_WIN32) && CUDA_VERSION >= 13000
+    // Workaround for CUDA-13.0 error handling on Windows, see
+    // https://github.com/pytorch/pytorch/issues/162333#issuecomment-3267929585
+    case cudaErrorNotSupported:
+      if (!fail_if_no_driver) {
+        TORCH_WARN(
+            "cudaGetDeviceCount() returned cudaErrorNotSupported, "
+            "likely using older driver or on CPU machine");
+        count = 0;
+        break;
+      }
+#endif
     default:
       TORCH_CHECK(
           false,
@@ -129,8 +142,8 @@ DeviceIndex current_device() {
   return cur_device;
 }
 
-void set_device(DeviceIndex device) {
-  C10_CUDA_CHECK(c10::cuda::SetDevice(device));
+void set_device(DeviceIndex device, const bool force) {
+  C10_CUDA_CHECK(c10::cuda::SetDevice(device, force));
 }
 
 void device_synchronize() {
@@ -138,7 +151,29 @@ void device_synchronize() {
   if (C10_UNLIKELY(interp)) {
     (*interp)->trace_gpu_device_synchronization(c10::kCUDA);
   }
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.cuda_device_synchronize);
   C10_CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void stream_wait_stream(CUDAStream waiter, CUDAStream source) {
+  TORCH_CHECK(waiter.device() == source.device());
+  if (waiter.stream() == source.stream()) {
+    return;
+  }
+  CUDAGuard guard(source.device());
+  const auto source_info = captureInfoMayInitCtx(source);
+  const auto waiter_info = captureInfoMayInitCtx(waiter);
+  TORCH_CHECK(
+      source_info.status == waiter_info.status &&
+          source_info.status != CaptureStatus::Invalidated &&
+          (source_info.status == CaptureStatus::None ||
+           (source_info.id == waiter_info.id &&
+            source_info.graph == waiter_info.graph)),
+      "Cannot establish a stream dependency across CUDA graph capture "
+      "boundaries; order the operation outside capture first");
+  CUDAEvent event;
+  event.record(source);
+  event.block(waiter);
 }
 
 // this function has to be called from callers performing cuda synchronizing
@@ -151,7 +186,7 @@ void warn_or_error_on_sync() {
   }
 }
 
-c10::optional<DeviceIndex> getDeviceIndexWithPrimaryContext() {
+std::optional<DeviceIndex> getDeviceIndexWithPrimaryContext() {
   // check current device first
   auto current_device_index = current_device();
   if (current_device_index >= 0) {
@@ -166,16 +201,17 @@ c10::optional<DeviceIndex> getDeviceIndexWithPrimaryContext() {
       return device_index;
     }
   }
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 namespace _internal {
-bool dummyHasPrimaryContext(C10_UNUSED DeviceIndex device_index) {
+static bool dummyHasPrimaryContext([[maybe_unused]] DeviceIndex device_index) {
   TORCH_CHECK(false, "Should never been called");
 }
-bool (*hasPrimaryContext)(DeviceIndex) = dummyHasPrimaryContext;
+static bool (*hasPrimaryContext)(DeviceIndex) = dummyHasPrimaryContext;
 
 // Private api to be called from CUDAHooks.cpp
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 C10_CUDA_API void setHasPrimaryContext(bool (*func)(DeviceIndex)) {
   hasPrimaryContext = func ? func : dummyHasPrimaryContext;
 }
@@ -208,7 +244,7 @@ cudaError_t GetDeviceCount(int* dev_count) {
 // call y = torch.empty(1, device=“cuda”) # CUDA context is created on cuda:0
 // ```
 #if CUDA_VERSION >= 12000
-thread_local DeviceIndex targetDeviceIndex = -1;
+thread_local static DeviceIndex targetDeviceIndex = -1;
 
 cudaError_t GetDevice(DeviceIndex* device) {
   if (targetDeviceIndex >= 0) {
@@ -228,9 +264,13 @@ cudaError_t GetDevice(DeviceIndex* device) {
   return err;
 }
 
-cudaError_t SetDevice(DeviceIndex device) {
-  TORCH_CHECK(device >= 0, "device id must be positive!", device);
+cudaError_t SetDevice(DeviceIndex device, const bool force) {
+  TORCH_CHECK(
+      device >= 0, "device id must be non-negative!", static_cast<int>(device));
   targetDeviceIndex = -1;
+  if (force) {
+    return cudaSetDevice(device);
+  }
   int cur_device = -1;
   C10_CUDA_CHECK(cudaGetDevice(&cur_device));
   if (device == cur_device) {
@@ -306,8 +346,12 @@ cudaError_t GetDevice(DeviceIndex* device) {
   return err;
 }
 
-cudaError_t SetDevice(DeviceIndex device) {
-  TORCH_CHECK(device >= 0, "device id must be positive!", device);
+cudaError_t SetDevice(DeviceIndex device, const bool force) {
+  TORCH_CHECK(
+      device >= 0, "device id must be non-negative!", static_cast<int>(device));
+  if (force) {
+    return cudaSetDevice(device);
+  }
   int cur_device = -1;
   C10_CUDA_CHECK(cudaGetDevice(&cur_device));
   if (device == cur_device) {

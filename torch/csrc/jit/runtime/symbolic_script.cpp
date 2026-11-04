@@ -936,8 +936,8 @@ const std::vector<std::string> functions = {
         def hardswish(self):
             result = torch.hardswish(self)
             def backward(grad_output):
-                m = (self > 3.).type_as(result)
-                m = torch.where((self >= -3.) & (self <= 3.),  self / 3. + .5, m)
+                m = (self >= 3.).type_as(result)
+                m = torch.where((self > -3.) & (self < 3.),  self / 3. + .5, m)
                 return grad_output * m
             return result, backward
 
@@ -1541,7 +1541,7 @@ static std::string overloadedSchemaString(const FunctionSchema& schema) {
 
 static bool isHelperFunction(const std::string& method_name) {
   std::string helper_prefix = "AD_";
-  return method_name.compare(0, helper_prefix.length(), helper_prefix) == 0;
+  return method_name.starts_with(helper_prefix);
 }
 
 static void loadModule(const CompilationUnit& module) {
@@ -1556,12 +1556,12 @@ static void loadModule(const CompilationUnit& module) {
     Node* forward_tuple = pair.forward->outputs().at(0)->node();
 
     if (forward_tuple->kind() != prim::TupleConstruct) {
-      throw ErrorReport(forward_tuple->sourceRange())
-          << "gradient must return literal a tuple";
+      throw(
+          ErrorReport(forward_tuple->sourceRange())
+          << "gradient must return literal a tuple");
     }
 
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    Value* context;
+    Value* context = nullptr;
     std::tie(pair.backward, context) =
         extractClosure(forward_tuple->inputs().back());
 
@@ -1609,12 +1609,12 @@ static void loadModule(const CompilationUnit& module) {
 
 static void loadFunctions() {
   for (const std::string& str : functions) {
-    compilation_unit.define(c10::nullopt, str, nativeResolver(), nullptr);
+    compilation_unit.define(std::nullopt, str, nativeResolver(), nullptr);
   }
   loadModule(compilation_unit);
 }
 
-c10::optional<GradientPair> gradientInfoForSchema(
+std::optional<GradientPair> gradientInfoForSchema(
     const FunctionSchema& schema) {
   std::lock_guard<std::mutex> guard(lock);
   if (schema_to_graphs.empty()) {
@@ -1635,7 +1635,7 @@ c10::optional<GradientPair> gradientInfoForSchema(
       return sym_script_it->second;
     }
   }
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 bool hasGradientInfoForSchema(const FunctionSchema& schema) {

@@ -10,10 +10,12 @@ bool get_thread_isolation_mode();
 
 C10_EXPORT void register_process_group(
     const std::string& group_name,
-    c10::intrusive_ptr<c10d::ProcessGroup> group);
+    const c10::intrusive_ptr<c10d::ProcessGroup>& group);
 
 C10_EXPORT c10::intrusive_ptr<c10d::ProcessGroup> resolve_process_group(
     const std::string& group_name);
+
+C10_EXPORT bool is_process_group_registered(const std::string& group_name);
 
 C10_EXPORT void unregister_process_group(const std::string& group_name);
 

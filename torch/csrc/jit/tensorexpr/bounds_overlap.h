@@ -3,14 +3,10 @@
 #include <torch/csrc/jit/tensorexpr/expr.h>
 #include <torch/csrc/jit/tensorexpr/ir.h>
 
-#include <deque>
 #include <utility>
 #include <vector>
 
-namespace torch {
-namespace jit {
-namespace tensorexpr {
-namespace analysis {
+namespace torch::jit::tensorexpr::analysis {
 
 // A simple class containing the start and end of a range in a single dimension.
 struct TORCH_API Bound {
@@ -39,7 +35,7 @@ struct TORCH_API Bound {
   bool operator>(const Bound& other) const;
   bool operator>=(const Bound& other) const;
 
-  void swap() {
+  void swap() noexcept {
     std::swap(start, end);
     swapped = !swapped;
   }
@@ -55,7 +51,7 @@ struct BoundHash {
 // previous conditions hold.
 //     ContainedOrEqual: All elements in the Bound A are in the Bound B (this
 //                       includes the case where the bounds are equal).
-//     Contains: All elements in the Bound B are in the Bound B.
+//     Contains: All elements in the Bound B are in the Bound A.
 //     PartialOverlap: Any elements in the Bound B are in the Bound A.
 //     NoOverlap: No elements in the Bound A are in the bound B.
 enum class OverlapKind {
@@ -73,9 +69,9 @@ enum class OverlapKind {
 //     some elements not
 enum class CmpEvalResult { True, False, NotDetermined };
 
-// Returns the kind of overlap between Bound A and Bound A in a single
+// Returns the kind of overlap between Bound A and Bound B in a single
 // dimension.
-OverlapKind TORCH_API boundOverlap(Bound A, Bound B);
+OverlapKind TORCH_API boundOverlap(const Bound& A, const Bound& B);
 
 // The comparison is conservative and the compare result is deterministic.
 // It means that every element of the Bound to be compared needs to satisfy
@@ -98,7 +94,7 @@ Bound TORCH_API flattenBounds(const IndexBounds& a);
 // Determines the kind of overlap in X dimensions.
 OverlapKind TORCH_API overlaps(const IndexBounds& a, const IndexBounds& b);
 
-// Returns the Bound slices created by subtracing bound B from bound A.
+// Returns the Bound slices created by subtracting bound B from bound A.
 // Multiple Bounds can be returned in the case where B slices A into two
 // distinct regions with no overlap.
 //
@@ -112,7 +108,7 @@ OverlapKind TORCH_API overlaps(const IndexBounds& a, const IndexBounds& b);
 //
 // Note: this doesn't use IndexBounds because the Bounds returned do not
 // represent multiple different dimensions.
-std::vector<Bound> TORCH_API subtractBound(Bound a, Bound b);
+std::vector<Bound> TORCH_API subtractBound(const Bound& a, const Bound& b);
 
 // Returns the bound slices created by subtracting the IndexBounds B from A.
 std::vector<IndexBounds> TORCH_API subtractIndicesBounds(
@@ -122,7 +118,4 @@ std::vector<IndexBounds> TORCH_API subtractIndicesBounds(
 std::vector<IndexBounds> TORCH_API
 subtractIndicesBounds(const IndexBounds& A, const IndexBounds& B);
 
-} // namespace analysis
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr::analysis

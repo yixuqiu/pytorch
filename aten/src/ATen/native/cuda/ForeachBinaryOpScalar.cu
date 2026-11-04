@@ -25,15 +25,14 @@ template <typename T, template <class> class Op>
 std::vector<Tensor> foreach_binary_op(
     TensorList tensors,
     const Scalar& scalar) {
-  std::vector<std::vector<at::Tensor>> tensor_lists;
   std::vector<at::Tensor> vec_res;
   vec_res.reserve(tensors.size());
   for (const auto& t : tensors) {
     vec_res.emplace_back(at::native::empty_like(t));
   }
 
-  tensor_lists.emplace_back(tensors.vec());
-  tensor_lists.emplace_back(std::move(vec_res));
+  auto tensor_lists =
+      c10::make_nested<Tensor>(tensors.vec(), std::move(vec_res));
 
   using opmath_t = at::opmath_type<T>;
   multi_tensor_apply<2>(
@@ -45,13 +44,12 @@ std::vector<Tensor> foreach_binary_op(
           /* res_arg_index */ 1>(),
       Op<opmath_t>(),
       scalar.to<opmath_t>());
-  return tensor_lists[1];
+  return std::move(tensor_lists[1]);
 }
 
 template <typename T, template <class> class Op>
 void foreach_binary_op_(TensorList tensors, const Scalar& scalar) {
-  std::vector<std::vector<at::Tensor>> tensor_lists;
-  tensor_lists.emplace_back(tensors.vec());
+  auto tensor_lists = c10::make_nested<Tensor>(tensors.vec());
 
   using opmath_t = at::opmath_type<T>;
   multi_tensor_apply<1>(
@@ -191,11 +189,47 @@ std::vector<Tensor> foreach_scalar_pow_list_kernel_cuda(
 // In the case of division, integer inputs will result in float.
 // Currently multi tensor apply can only return result of the same type as
 // input.
-FOREACH_BINARY_OP_SCALAR(
-    all_types_complex_bool_half_bfloat16,
-    div,
-    std::divides,
-    /*div_op*/ true);
+//
+// Implement via multiply with reciprocal as it's faster and makes it match
+// the behavior of regular Tensor div by scalar.  Loses one bit of
+// precision.
+Scalar scalar_reciprocal(const Scalar& scalar) {
+  if (scalar.isFloatingPoint()) {
+    return Scalar(1. / scalar.toDouble());
+  } else if (scalar.isIntegral(/*includeBool*/ true)) {
+    return Scalar(1. / static_cast<double>(scalar.toLong()));
+  } else if (scalar.isComplex()) {
+    return Scalar(1. / scalar.toComplexDouble());
+  }
+  TORCH_INTERNAL_ASSERT(
+      false, "division with ", scalar.type(), " not supported");
+}
+
+void foreach_tensor_div_scalar_kernel_cuda_(
+    TensorList tensors,
+    const Scalar& scalar) {
+  check_foreach_api_restrictions(tensors);
+  if (!can_use_fast_route(tensors, scalar, true)) {
+    return at::native::foreach_tensor_mul_scalar_kernel_slow_(
+        tensors, scalar_reciprocal(scalar));
+  }
+
+  all_types_complex_bool_half_bfloat16_<std::multiplies>(
+      tensors, scalar_reciprocal(scalar));
+}
+
+std::vector<Tensor> foreach_tensor_div_scalar_kernel_cuda(
+    TensorList tensors,
+    const Scalar& scalar) {
+  check_foreach_api_restrictions(tensors);
+  if (!can_use_fast_route(tensors, scalar, true)) {
+    return at::native::foreach_tensor_mul_scalar_kernel_slow(
+        tensors, scalar_reciprocal(scalar));
+  }
+
+  return all_types_complex_bool_half_bfloat16<std::multiplies>(
+      tensors, scalar_reciprocal(scalar));
+}
 
 // In the case of subtraction, we dont allow scalar to be boolean following the
 // torch.sub logic
@@ -239,7 +273,9 @@ std::vector<Tensor> foreach_tensor_sub_scalar_kernel_cuda(
       });
 }
 
-FOREACH_BINARY_OP_SCALAR(all_types_half_bfloat16, clamp_max, minimum, false);
-FOREACH_BINARY_OP_SCALAR(all_types_half_bfloat16, clamp_min, maximum, false);
+// NOTE(crcrpar): `all_types_half_bfloat16` does not cover bool, so temporarily
+// set `division_op` to true.
+FOREACH_BINARY_OP_SCALAR(all_types_half_bfloat16, clamp_max, minimum, true);
+FOREACH_BINARY_OP_SCALAR(all_types_half_bfloat16, clamp_min, maximum, true);
 
 } // namespace at::native

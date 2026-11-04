@@ -5,20 +5,23 @@
 
 #include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
 
+#include <c10/util/irange.h>
+
 namespace torch {
 
 ParamCommsDebugInfo::ParamCommsDebugInfo(
     std::tuple<std::string, std::string> pgName,
     int rank,
     std::string&& collName,
-    int inNelems,
-    int outNelems,
+    int64_t inNelems,
+    int64_t outNelems,
     at::ScalarType dType,
     std::vector<int64_t> inSplitSizes,
     std::vector<int64_t> outSplitSizes,
     int globalRankStart,
     int globalRankStride,
-    int worldSize)
+    int worldSize,
+    bool isAsynchronizedOp)
     : pgName_(std::move(pgName)),
       rank_(rank),
       worldSize_(worldSize),
@@ -29,9 +32,10 @@ ParamCommsDebugInfo::ParamCommsDebugInfo(
       inputSplitSizes_(std::move(inSplitSizes)),
       outputSplitSizes_(std::move(outSplitSizes)),
       globalRankStart_(globalRankStart),
-      globalRankStride_(globalRankStride) {
+      globalRankStride_(globalRankStride),
+      isAsynchronizedOp_(isAsynchronizedOp) {
   if (globalRankStride > 0) {
-    for (int i = 0; i < worldSize; i++) {
+    for (const auto i : c10::irange(worldSize)) {
       groupRanks_.push_back(globalRankStart + i * globalRankStride);
     }
   }

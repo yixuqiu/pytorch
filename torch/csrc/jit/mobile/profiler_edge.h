@@ -2,11 +2,9 @@
 #include <torch/csrc/autograd/profiler_kineto.h>
 #include <torch/csrc/jit/mobile/module.h>
 
-namespace torch {
-namespace jit {
-namespace mobile {
+namespace torch::jit::mobile {
 
-// If we dont have kineto available then edge profiler does not
+// If we don't have kineto available then edge profiler does not
 // work since it relies on Kineto
 #ifdef USE_KINETO
 class TORCH_API KinetoEdgeCPUProfiler {
@@ -16,7 +14,7 @@ class TORCH_API KinetoEdgeCPUProfiler {
   /*
    * @param m is the instance of mobile Module which is being profiled.
    *        Note that this implies that KinetoEdgeCPUProfiler can be used
-   *        to profile specific Module (see usage below), unliked ProfilerKineto
+   *        to profile specific Module (see usage below), unlike ProfilerKineto
    *        which can profile pytorch runtime in arbitrary scope.
    * @param fname is the name of the file to which chrome trace is written.
    * @param report_input_shapes: whether to record shapes of op's inputs.
@@ -40,7 +38,7 @@ class TORCH_API KinetoEdgeCPUProfiler {
    *
    * Thus, when KinetoEdgeCPUProfiler is used as RAII to do profiling
    * within certain scope. In that scope, the captured reference to
-   * Module will outlive KinetoEdgeCPUProfiler. This is gauranteed because
+   * Module will outlive KinetoEdgeCPUProfiler. This is guaranteed because
    * KinetoEdgeCPUProfiler must be constructed later than Module, on stack.
    *
    * An example of the anti-pattern and wrong usage is:
@@ -114,6 +112,4 @@ TORCH_API KinetoEdgeCPUProfiler* getCurrentEdgeProfiler();
 #define RECORD_BACKEND_MEMORY_EVENT_TO_EDGE_PROFILER( \
     ptr, alloc_size, total_allocated, total_reserved, device)
 #endif
-} // namespace mobile
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::mobile

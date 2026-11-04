@@ -1,5 +1,7 @@
 #include <ATen/native/vulkan/impl/Packing.h>
 #include <ATen/native/vulkan/ops/Common.h>
+#include <ATen/native/vulkan/ops/Utils.h>
+#include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -287,11 +289,11 @@ std::vector<int64_t> broadcast_size(const Tensor& t1, const Tensor& t2) {
 
   std::vector<int64_t> out;
   if (t1_size > t2_size) {
-    for (int64_t i = 0; i < t1_size; i++) {
+    for (const auto i : c10::irange(t1_size)) {
       out.push_back(t1.sizes()[i]);
     }
   } else {
-    for (int64_t i = 0; i < t2_size; i++) {
+    for (const auto i : c10::irange(t2_size)) {
       out.push_back(t2.sizes()[i]);
     }
   }
@@ -369,10 +371,10 @@ api::utils::vec4 extract_texel(const Tensor& input, const ivec3& pos) {
       params.buffer());
 
   vec4 rv = {
-      convert(v_outputs_x).cpu().data_ptr<float>()[0],
-      convert(v_outputs_y).cpu().data_ptr<float>()[0],
-      convert(v_outputs_z).cpu().data_ptr<float>()[0],
-      convert(v_outputs_w).cpu().data_ptr<float>()[0],
+      convert(v_outputs_x).cpu().const_data_ptr<float>()[0],
+      convert(v_outputs_y).cpu().const_data_ptr<float>()[0],
+      convert(v_outputs_z).cpu().const_data_ptr<float>()[0],
+      convert(v_outputs_w).cpu().const_data_ptr<float>()[0],
   };
 
   return rv;

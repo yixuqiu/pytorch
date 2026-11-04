@@ -12,8 +12,8 @@ using namespace api::utils;
 void _check_layer_norm_inputs(
     const at::Tensor& input,
     IntArrayRef normalized_shape,
-    const c10::optional<Tensor>& weight /* optional */,
-    const c10::optional<Tensor>& bias /* optional */) {
+    const std::optional<Tensor>& weight /* optional */,
+    const std::optional<Tensor>& bias /* optional */) {
   const auto normalized_ndim = normalized_shape.size();
   TORCH_CHECK(
       normalized_ndim >= 1,
@@ -48,15 +48,15 @@ void _check_layer_norm_inputs(
       ss << ", " << size;
     }
     ss << "], but got input of size" << input_shape;
-    AT_ERROR(ss.str());
+    TORCH_CHECK(false, std::move(ss).str());
   }
 }
 
 std::tuple<Tensor, Tensor, Tensor> native_layer_norm(
     const at::Tensor& input_arg,
     IntArrayRef normalized_shape,
-    const c10::optional<Tensor>& weight_opt /* optional */,
-    const c10::optional<Tensor>& bias_opt /* optional */,
+    const std::optional<Tensor>& weight_opt /* optional */,
+    const std::optional<Tensor>& bias_opt /* optional */,
     double eps) {
   _check_layer_norm_inputs(input_arg, normalized_shape, weight_opt, bias_opt);
 
@@ -76,6 +76,7 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm(
   const Tensor bias = bias_opt->is_vulkan() ? *bias_opt : bias_opt->vulkan();
 
   std::vector<int64_t> dims_to_reduce;
+  dims_to_reduce.reserve(normalized_shape.size());
   for (const auto i : c10::irange(normalized_shape.size())) {
     dims_to_reduce.push_back(input_arg.dim() - i - 1);
   }

@@ -57,7 +57,7 @@ inline int64_t target_index_checked(
 }
 
 template <typename scalar_t>
-static inline void multi_margin_loss_cpu_kernel(
+inline void multi_margin_loss_cpu_kernel(
     Tensor& output,
     const scalar_t* input_data,
     const int64_t* target_data,
@@ -82,7 +82,7 @@ static inline void multi_margin_loss_cpu_kernel(
     }
   } else {
     accscalar_t sum = 0;
-    auto output_acc = output.data_ptr<scalar_t>();
+    auto output_acc = output.mutable_data_ptr<scalar_t>();
     for (const auto t : c10::irange(nframe)) {
       const auto idx = target_index_checked(target_data, t, dim);
       sum += multi_margin_inner_sum_cpu(
@@ -102,10 +102,9 @@ void multi_margin_loss_out_cpu_template(
     const Tensor& target,
     int p,
     const Scalar& margin,
-    const c10::optional<Tensor>& weight,
+    const std::optional<Tensor>& weight,
     int64_t reduction) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  int64_t nframe, dim;
+  int64_t nframe = 0, dim = 0;
   const auto ndims = input.dim();
 
   TORCH_CHECK(p == 1 || p == 2, "only p == 1 and p == 2 supported");
@@ -149,7 +148,7 @@ void multi_margin_loss_out_cpu_template(
 }
 
 template <typename scalar_t>
-static void multi_margin_loss_backward_cpu_kernel(
+void multi_margin_loss_backward_cpu_kernel(
     scalar_t* grad_input_data,
     const Tensor& grad_output,
     const scalar_t* input_data,
@@ -194,7 +193,7 @@ static void multi_margin_loss_backward_cpu_kernel(
         reduction != Reduction::None || grad_output.dim() > 0 ||
         nframe == 1); // check 1d scalar fallback-case
     const auto d = *grad_output.const_data_ptr<scalar_t>();
-    for (int64_t t = 0; t < nframe * dim; t++) {
+    for (const auto t : c10::irange(nframe * dim)) {
       grad_input_data[t] *= d;
     }
   } else {
@@ -216,8 +215,7 @@ void multi_margin_loss_backward_out_cpu_template(
     const Scalar& margin,
     const Tensor& weight,
     int64_t reduction) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  int64_t nframe, dim;
+  int64_t nframe = 0, dim = 0;
   const auto ndims = input.dim();
 
   TORCH_CHECK(p == 1 || p == 2, "only p == 1 and p == 2 supported");
@@ -266,7 +264,7 @@ Tensor multi_margin_loss_cpu(
     const Tensor& target,
     const Scalar& p,
     const Scalar& margin,
-    const c10::optional<Tensor>& weight,
+    const std::optional<Tensor>& weight,
     int64_t reduction) {
   auto output = at::empty({0}, input.options());
   multi_margin_loss_out_cpu_template(
@@ -278,7 +276,7 @@ Tensor& multi_margin_loss_cpu_out(const Tensor& input,
     const Tensor& target,
     const Scalar& p,
     const Scalar& margin,
-    const c10::optional<Tensor>& weight,
+    const std::optional<Tensor>& weight,
     int64_t reduction,
     Tensor& output) {
   multi_margin_loss_out_cpu_template(
@@ -291,7 +289,7 @@ Tensor multi_margin_loss_cpu_backward(
     const Tensor& input,
     const Tensor& target,
     const Scalar& p,
-    const Scalar& margin, const c10::optional<Tensor>& weight_opt,
+    const Scalar& margin, const std::optional<Tensor>& weight_opt,
     int64_t reduction) {
   // See [Note: hacky wrapper removal for optional tensor]
   c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
@@ -314,7 +312,7 @@ Tensor& multi_margin_loss_cpu_backward_out(const Tensor& grad_output,
     const Tensor& input,
     const Tensor& target,
     const Scalar& p,
-    const Scalar& margin, const c10::optional<Tensor>& weight_opt,
+    const Scalar& margin, const std::optional<Tensor>& weight_opt,
     int64_t reduction,
     Tensor& grad_input) {
   // See [Note: hacky wrapper removal for optional tensor]

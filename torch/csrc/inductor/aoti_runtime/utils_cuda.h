@@ -9,6 +9,11 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#ifndef USE_ROCM
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#endif
 
 namespace torch::aot_inductor {
 
@@ -22,10 +27,16 @@ inline void delete_cuda_stream_guard(void* ptr) {
       reinterpret_cast<CUDAStreamGuardHandle>(ptr)));
 }
 
+inline void delete_cuda_tunableop_dynamic_dims_guard(void* ptr) {
+  AOTI_TORCH_ERROR_CODE_CHECK(
+      aoti_torch_delete_cuda_tunableop_dynamic_dims_guard(
+          reinterpret_cast<CUDATunableOpDynamicDimsGuardHandle>(ptr)));
+}
+
 class AOTICudaGuard {
  public:
   AOTICudaGuard(int32_t device_index) : guard_(nullptr, delete_cuda_guard) {
-    CUDAGuardHandle ptr;
+    CUDAGuardHandle ptr = nullptr;
     AOTI_TORCH_ERROR_CODE_CHECK(
         aoti_torch_create_cuda_guard(device_index, &ptr));
     guard_.reset(ptr);
@@ -44,7 +55,7 @@ class AOTICudaStreamGuard {
  public:
   AOTICudaStreamGuard(cudaStream_t stream, int32_t device_index)
       : guard_(nullptr, delete_cuda_stream_guard) {
-    CUDAStreamGuardHandle ptr;
+    CUDAStreamGuardHandle ptr = nullptr;
     AOTI_TORCH_ERROR_CODE_CHECK(
         aoti_torch_create_cuda_stream_guard(stream, device_index, &ptr));
     guard_.reset(ptr);
@@ -52,6 +63,21 @@ class AOTICudaStreamGuard {
 
  private:
   std::unique_ptr<CUDAStreamGuardOpaque, DeleterFnPtr> guard_;
+};
+
+class AOTICudaTunableOpDynamicDimsGuard {
+ public:
+  explicit AOTICudaTunableOpDynamicDimsGuard(uint8_t dynamic_dims_mask)
+      : guard_(nullptr, delete_cuda_tunableop_dynamic_dims_guard) {
+    CUDATunableOpDynamicDimsGuardHandle ptr = nullptr;
+    AOTI_TORCH_ERROR_CODE_CHECK(
+        aoti_torch_create_cuda_tunableop_dynamic_dims_guard(
+            dynamic_dims_mask, &ptr));
+    guard_.reset(ptr);
+  }
+
+ private:
+  std::unique_ptr<CUDATunableOpDynamicDimsGuardOpaque, DeleterFnPtr> guard_;
 };
 
 } // namespace torch::aot_inductor

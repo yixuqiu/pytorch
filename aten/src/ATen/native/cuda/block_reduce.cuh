@@ -1,20 +1,26 @@
 #pragma once
 
-#include <thrust/tuple.h>
-
 #include <ATen/native/SharedReduceOps.h>
 #include <ATen/cuda/DeviceUtils.cuh>
 
-namespace at {
-namespace native {
-namespace cuda_utils {
+namespace at::native::cuda_utils {
 
 constexpr int kCUDABlockReduceNumThreads = 512;
 // Algorithmic limitation: BlockReduce does two WarpReduce calls, each
 // of which reduces C10_WARP_SIZE elements. So, at most
 // C10_WARP_SIZE**2 elements can be reduced at a time.
 // NOTE: This is >= the max block size on current hardware anyway (1024).
-constexpr int kCUDABlockReduceMaxThreads = C10_WARP_SIZE * C10_WARP_SIZE;
+// ROCm NOTE: C10_WARP_SIZE should only be used inside device functions,
+// and kCUDABlockReduceMaxThreads is a host-side variable.
+#ifdef USE_ROCM
+static int kCUDABlockReduceMaxThreads() {
+    return at::cuda::warp_size() * at::cuda::warp_size();
+}
+#else
+constexpr int kCUDABlockReduceMaxThreads() {
+    return C10_WARP_SIZE * C10_WARP_SIZE;
+}
+#endif
 
 // Sums `val` across all threads in a warp.
 //
@@ -103,7 +109,7 @@ __inline__ __device__ T BlockReduceMax(T val, T* shared) {
     shared[wid] = val;
   }
   __syncthreads();
-  val = (tid < B::Warps()) ? shared[lid] : T(0);
+  val = (tid < B::Warps()) ? shared[lid] : T(std::numeric_limits<T>::lowest());
   if (wid == 0) {
     val = WarpReduceMax(val);
   }
@@ -138,6 +144,4 @@ BlockReduce(T val, const ReduceOp& op, const T& identity_element, T* shared) {
   return val;
 }
 
-} // namespace cuda_utils
-} // namespace native
-} // namespace at
+} // namespace at::native::cuda_utils

@@ -20,8 +20,10 @@ import subprocess
 import sys
 
 import cuda_memcheck_common as cmc
-import torch
 import tqdm
+
+import torch
+
 
 ALL_TESTS = []
 GPUS = torch.cuda.device_count()
@@ -135,7 +137,7 @@ ALL_TESTS = ALL_TESTS[start:end]
 # or as specified by the user
 progress = 0
 if not args.ci:
-    logfile = open("result.log", "w")
+    logfile = open("result.log", "w")  # noqa:SIM115
     progressbar = tqdm.tqdm(total=len(ALL_TESTS))
 else:
     logfile = sys.stdout
@@ -155,9 +157,11 @@ async def run1(coroutine_id):
         gpuid = coroutine_id % GPUS
     else:
         gpu_assignments = args.gpus.split(":")
-        assert args.nproc == len(
-            gpu_assignments
-        ), "Please specify GPU assignment for each process, separated by :"
+        if args.nproc != len(gpu_assignments):
+            raise AssertionError(
+                f"Please specify GPU assignment for each process, separated by : "
+                f"(got {len(gpu_assignments)} assignments for {args.nproc} processes)"
+            )
         gpuid = gpu_assignments[coroutine_id]
 
     while progress < len(ALL_TESTS):
@@ -169,7 +173,7 @@ async def run1(coroutine_id):
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), args.timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print("Timeout:", test, file=logfile)
             proc.kill()
             if args.ci and not args.nohang:
@@ -200,5 +204,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())

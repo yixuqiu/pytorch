@@ -4,9 +4,7 @@
 
 #include <utility>
 
-namespace torch {
-namespace nn {
-namespace functional {
+namespace torch::nn::functional {
 
 #ifndef DOXYGEN_SHOULD_SKIP_THIS
 namespace detail {
@@ -54,7 +52,7 @@ inline Tensor _dropoutNd_helper(
     double p,
     bool training,
     bool inplace,
-    const char* fn_name) {
+    const char* /*fn_name*/) {
   TORCH_CHECK(
       p >= 0. && p <= 1.,
       "dropout probability has to be between 0 and 1, but got ",
@@ -229,6 +227,4 @@ inline Tensor feature_alpha_dropout(
       std::move(input), options.p(), options.training(), options.inplace());
 }
 
-} // namespace functional
-} // namespace nn
-} // namespace torch
+} // namespace torch::nn::functional

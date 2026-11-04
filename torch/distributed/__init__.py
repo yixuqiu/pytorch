@@ -1,10 +1,19 @@
-import os
+# mypy: allow-untyped-defs
+import contextlib
+import logging
 import sys
-from enum import Enum
-import pdb
-import io
+import traceback
+import typing
+from datetime import timedelta
 
 import torch
+
+
+RankType = int | torch.SymInt
+
+
+log = logging.getLogger(__name__)
+
 
 def is_available() -> bool:
     """
@@ -20,6 +29,35 @@ def is_available() -> bool:
     return hasattr(torch._C, "_c10d_init")
 
 
+_spmd_types_available: bool | None = None
+
+
+def _is_spmd_types_available() -> bool:
+    """Check if the spmd_types package is installed."""
+    import importlib.util
+
+    global _spmd_types_available
+    if _spmd_types_available is None:
+        _spmd_types_available = importlib.util.find_spec("spmd_types") is not None
+    return _spmd_types_available
+
+
+def _spmd_no_typecheck():
+    """
+    Return a spmd_types no_typecheck context, or a no-op if not installed.
+    """
+    if _is_spmd_types_available():
+        import spmd_types
+
+        return spmd_types.no_typecheck()
+
+    @contextlib.contextmanager
+    def no_typecheck():
+        yield
+
+    return no_typecheck()
+
+
 if is_available() and not torch._C._c10d_init():
     raise RuntimeError("Failed to initialize torch.distributed")
 
@@ -28,59 +66,101 @@ DistError = torch._C._DistError
 DistBackendError = torch._C._DistBackendError
 DistNetworkError = torch._C._DistNetworkError
 DistStoreError = torch._C._DistStoreError
+QueueEmptyError = torch._C._DistQueueEmptyError
 
 if is_available():
     from torch._C._distributed_c10d import (
-        Store,
-        FileStore,
-        TCPStore,
-        ProcessGroup as ProcessGroup,
-        Backend as _Backend,
-        PrefixStore,
-        Reducer,
-        Logger,
-        BuiltinCommHookType,
-        GradBucket,
-        Work as _Work,
-        _DEFAULT_FIRST_BUCKET_BYTES,
-        _register_comm_hook,
-        _register_builtin_comm_hook,
         _broadcast_coalesced,
         _compute_bucket_assignment_by_size,
-        _verify_params_across_processes,
+        _DEFAULT_FIRST_BUCKET_BYTES,
+        _make_nccl_premul_sum,
+        _register_builtin_comm_hook,
+        _register_comm_hook,
         _test_python_store,
+        _verify_params_across_processes,
+        Backend as _Backend,
+        Backend as BackendBase,
+        BuiltinCommHookType,
         DebugLevel,
+        FileStore,
         get_debug_level,
+        GradBucket,
+        Logger,
+        PrefixStore,
+        ProcessGroup as ProcessGroup,
+        Reducer,
         set_debug_level,
         set_debug_level_from_env,
-        _make_nccl_premul_sum,
+        Store,
+        TCPStore,
+        Work as _Work,
     )
 
-    class _DistributedPdb(pdb.Pdb):
+    def _c10d_getattr(name: str):
+        # FakeProcessGroup moved from C++ to Python; keep the old path working.
+        if name == "FakeProcessGroup":
+            from torch.distributed._backends.fake import FakeProcessGroup
+
+            return FakeProcessGroup
+        raise AttributeError(
+            f"module 'torch._C._distributed_c10d' has no attribute '{name}'"
+        )
+
+    torch._C._distributed_c10d.__getattr__ = _c10d_getattr  # type: ignore[attr-defined]
+
+    def _make_distributed_pdb():
         """
         Supports using PDB from inside a multiprocessing child process.
 
         Usage:
-        _DistributedPdb().set_trace()
+        _make_distributed_pdb().set_trace()
         """
-        def interaction(self, *args, **kwargs):
-            _stdin = sys.stdin
-            try:
-                sys.stdin = open('/dev/stdin')
-                pdb.Pdb.interaction(self, *args, **kwargs)
-            finally:
-                sys.stdin = _stdin
 
-    def breakpoint(rank: int = 0):
+        # Lazy import pdb only if we set breakpoints.
+        import pdb
+
+        class _DistributedPdb(pdb.Pdb):
+            def interaction(self, *args, **kwargs):
+                _stdin = sys.stdin
+                try:
+                    with open("/dev/stdin") as sys.stdin:
+                        pdb.Pdb.interaction(self, *args, **kwargs)
+                finally:
+                    sys.stdin = _stdin
+
+        return _DistributedPdb()
+
+    _breakpoint_cache: dict[int, typing.Any] = {}
+
+    def breakpoint(rank: int = 0, skip: int = 0, timeout_s=3600):
         """
         Set a breakpoint, but only on a single rank.  All other ranks will wait for you to be
         done with the breakpoint before continuing.
 
         Args:
             rank (int): Which rank to break on.  Default: ``0``
+            skip (int): Skip the first ``skip`` calls to this breakpoint. Default: ``0``.
+            timeout_s (int, optional): Timeout in seconds applied to every process
+                group so waiting ranks don't time out during the debug session.
+                ``None`` leaves timeouts unchanged. Default: ``3600``.
         """
+        if skip > 0:
+            key = hash(str(traceback.format_exc()))
+            counter = _breakpoint_cache.get(key, 0) + 1
+            _breakpoint_cache[key] = counter
+            if counter <= skip:
+                log.warning("Skip the breakpoint, counter=%d", counter)
+                return
+
+        # avoid having the default timeout (if short) interrupt your debug session
+        if timeout_s is not None:
+            for group in torch.distributed.distributed_c10d._pg_map:
+                torch.distributed.distributed_c10d.set_timeout(
+                    timedelta(seconds=timeout_s), group
+                )
+
         if get_rank() == rank:
-            pdb = _DistributedPdb()
+            pdb = _make_distributed_pdb()
             pdb.message(
                 "\n!!! ATTENTION !!!\n\n"
                 f"Type 'up' to get to the frame that called dist.breakpoint(rank={rank})\n"
@@ -98,35 +178,36 @@ if is_available():
             del guard
 
     if sys.platform != "win32":
-        from torch._C._distributed_c10d import (
-            HashStore,
-            _round_robin_process_groups,
-        )
+        from torch._C._distributed_c10d import HashStore
 
-    from .distributed_c10d import *  # noqa: F403
+    from .device_mesh import DeviceMesh, init_device_mesh
 
     # Variables prefixed with underscore are not auto imported
     # See the comment in `distributed_c10d.py` above `_backend` on why we expose
     # this.
-
+    from .distributed_c10d import *  # noqa: F403
     from .distributed_c10d import (
         _all_gather_base,
-        _reduce_scatter_base,
-        _create_process_group_wrapper,
-        _rank_not_in_group,
         _coalescing_manager,
         _CoalescingManager,
+        _create_process_group_wrapper,
         _get_process_group_name,
+        _get_reconfigure_handle,
+        _new_window,
+        _rank_not_in_group,
+        _reconfigure,
+        _reduce_scatter_base,
+        _supports_reconfigure,
+        _supports_window,
+        _time_estimator,
         get_node_local_rank,
     )
-
+    from .remote_device import _remote_device
     from .rendezvous import (
-        rendezvous,
         _create_store_from_options,
         register_rendezvous_handler,
+        rendezvous,
     )
-
-    from .remote_device import _remote_device
 
     set_debug_level_from_env()
 
@@ -137,6 +218,8 @@ else:
     # stubs as necessary.
     # We cannot define stubs directly because they confuse pyre
 
-    class _ProcessGroupStub:
+    class _Stub:
         pass
-    sys.modules["torch.distributed"].ProcessGroup = _ProcessGroupStub  # type: ignore[attr-defined]
+
+    sys.modules["torch.distributed"].GroupName = _Stub  # type: ignore[attr-defined]
+    sys.modules["torch.distributed"].ProcessGroup = _Stub  # type: ignore[attr-defined]

@@ -1,12 +1,10 @@
 #include <ATen/core/class_type.h>
 
 #include <ATen/core/Dict.h>
-#include <ATen/core/Tensor.h>
 #include <ATen/core/function_schema.h>
 #include <ATen/core/ivalue.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/irange.h>
-#include <ATen/core/grad_mode.h>
 #include <ATen/core/function.h>
 
 namespace c10 {
@@ -67,16 +65,16 @@ static std::string getSchemaInputTypesString(const FunctionSchema& schema) {
   if (forward_args.size() == 1) {
     input_types << "()";
   }
-  return input_types.str();
+  return std::move(input_types).str();
 }
 
-std::string ClassType::getForwardPreHookErrorMessage(int pre_hook_idx) const {
+std::string ClassType::getForwardPreHookErrorMessage(size_t pre_hook_idx) const {
   const std::string& pre_hook_name = forward_pre_hooks_[pre_hook_idx]->name();
   const FunctionSchema& forward_schema = getMethod("forward").getSchema();
   std::string input_types = getSchemaInputTypesString(forward_schema);
   const std::vector<Argument>& forward_args = forward_schema.arguments();
 
-  std::string single_output = "";
+  std::string single_output;
   if (forward_args.size() == 2 &&
       forward_args[1].type()->cast<TupleType>() == nullptr) {
     // if the output type is a single tuple, it needs to be wrapped in an outer tuple
@@ -98,7 +96,7 @@ std::string ClassType::getForwardPreHookErrorMessage(int pre_hook_idx) const {
   return return_string;
 }
 
-std::string ClassType::getForwardHookErrorMessage(int hook_idx) const {
+std::string ClassType::getForwardHookErrorMessage(size_t hook_idx) const {
   const std::string& hook_name = forward_hooks_[hook_idx]->name();
   const FunctionSchema& forward_schema = getMethod("forward").getSchema();
   std::string input_types = getSchemaInputTypesString(forward_schema);
@@ -190,7 +188,7 @@ static void checkForwardHookInputArguments(
 }
 
 void ClassType::checkForwardPreHookSchema(
-    int pre_hook_idx,
+    size_t pre_hook_idx,
     const FunctionSchema& pre_hook_schema) const {
   const torch::jit::Function* pre_hook = forward_pre_hooks_[pre_hook_idx];
   std::string hook_id =
@@ -287,7 +285,7 @@ void ClassType::checkForwardPreHookSchema(
 }
 
 void ClassType::checkForwardHookSchema(
-      int hook_idx,
+      size_t hook_idx,
       const FunctionSchema& hook_schema) const {
   const torch::jit::Function* hook = forward_hooks_[hook_idx];
   std::string hook_id =
@@ -451,14 +449,13 @@ bool ClassType::isSubtypeOfExt(const Type& rhs, std::ostream* why_not) const {
         return false;
       }
       if (!self_method->getSchema().isSubtypeOf(
-              // NOLINTNEXTLINE(bugprone-argument-comment)
-              schema, /*is_method=*/true, why_not)) {
+              schema, /*as_method=*/true, why_not)) {
         if (why_not) {
           *why_not << "Method on class '" << repr_str()
                    << "' (1) is not compatible with interface '"
                    << rhs.repr_str() << "' (2)\n"
-                   << "  (1) " << self_method->getSchema() << "\n"
-                   << "  (2) " << schema << "\n";
+                   << "  (1) " << self_method->getSchema() << '\n'
+                   << "  (2) " << schema << '\n';
         }
         return false;
       }
@@ -469,7 +466,7 @@ bool ClassType::isSubtypeOfExt(const Type& rhs, std::ostream* why_not) const {
 }
 
 ClassTypePtr ClassType::create(
-    c10::optional<QualifiedName> qualifiedName,
+    std::optional<QualifiedName> qualifiedName,
     std::weak_ptr<CompilationUnit> cu,
     bool is_module,
     std::string doc_string,
@@ -483,7 +480,7 @@ ClassTypePtr ClassType::create(
 }
 
 ClassType::ClassType(
-    c10::optional<QualifiedName> name,
+    std::optional<QualifiedName> name,
     std::weak_ptr<CompilationUnit> cu,
     bool is_module,
     std::string doc_string,
@@ -620,7 +617,7 @@ IValue ClassType::getConstant(size_t slot) const {
   return constantValues_[slot];
 }
 
-c10::optional<IValue> ClassType::findConstant(const std::string& name) const {
+std::optional<IValue> ClassType::findConstant(const std::string& name) const {
   TORCH_INTERNAL_ASSERT(constantNames_.size() == constantValues_.size());
   size_t pos = 0;
   for (const auto& c : constantNames_) {
@@ -631,7 +628,7 @@ c10::optional<IValue> ClassType::findConstant(const std::string& name) const {
   }
 
   if (pos >= constantNames_.size()) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   return constantValues_[pos];
 }
@@ -652,14 +649,14 @@ std::shared_ptr<const CompilationUnit> ClassType::compilation_unit() const {
   return cu;
 }
 
-c10::optional<ClassType::Property> ClassType::getProperty(const std::string& name) {
+std::optional<ClassType::Property> ClassType::getProperty(const std::string& name) {
   for (auto& prop : properties_) {
     if (name == prop.name) {
       return prop;
     }
   }
 
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 void ClassType::addProperty(const std::string& name, torch::jit::Function* getter, torch::jit::Function* setter) {
@@ -667,7 +664,7 @@ void ClassType::addProperty(const std::string& name, torch::jit::Function* gette
   properties_.push_back({name, getter, setter});
 }
 
-c10::optional<size_t> ClassType::findConstantSlot(const std::string& name) const {
+std::optional<size_t> ClassType::findConstantSlot(const std::string& name) const {
   TORCH_CHECK(constantNames_.size() == constantValues_.size());
   size_t slot = 0;
   for (const auto& constant : constantNames_) {
@@ -676,7 +673,7 @@ c10::optional<size_t> ClassType::findConstantSlot(const std::string& name) const
     }
     slot++;
   }
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 const std::string& ClassType::getConstantName(size_t slot) const {

@@ -12,10 +12,15 @@
 #include <c10/macros/Export.h>
 #include <c10/util/MaybeOwned.h>
 #include <c10/util/intrusive_ptr.h>
+#include <functional>
+#include <limits>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wswitch-default")
 
 namespace torch {
 class TORCH_API CustomClassHolder : public c10::intrusive_ptr_target {};
@@ -70,7 +75,7 @@ struct ComplexHolder : c10::intrusive_ptr_target {
  public:
   template <typename T>
   ComplexHolder(c10::complex<T> c) {
-    val = convert<decltype(val), c10::complex<T>>(c);
+    val = c10::convert<decltype(val), c10::complex<T>>(c);
   }
   ComplexHolder() = default;
   c10::complex<double> val;
@@ -86,24 +91,24 @@ struct StreamData3Holder : c10::intrusive_ptr_target {
 
 } // namespace ivalue
 
-// This is an owning wrapper for a c10::optional<std::vector<T>>
-// that can be implicitly converted to a (non-owning) optional<ArrayRef<T>>.
+// This is an owning wrapper for a std::optional<std::vector<T>>
+// that can be implicitly converted to a (non-owning) std::optional<ArrayRef<T>>.
 // Its purpose is to be used in generated code to keep the vector alive
 // either until the end of a statement (as a temporary), or as a saved arg
 // in autograd.
 template <typename T>
 struct OptionalArray {
-  c10::optional<std::vector<T>> list;
+  std::optional<std::vector<T>> list;
 
   OptionalArray() = default;
   OptionalArray(std::vector<T> val) : list(std::move(val)) {}
 
   // Used when saving an argument for the backwards pass.
-  OptionalArray& operator=(c10::optional<ArrayRef<T>> ref) {
+  OptionalArray& operator=(std::optional<ArrayRef<T>> ref) {
     if (ref) {
       list = std::vector<T>(ref->begin(), ref->end());
     } else {
-      list = nullopt;
+      list = std::nullopt;
     }
     return *this;
   }
@@ -113,21 +118,21 @@ struct OptionalArray {
     if (ref) {
       list = std::vector<T>(ref->begin(), ref->end());
     } else {
-      list = nullopt;
+      list = std::nullopt;
     }
     return *this;
   }
 
-  operator c10::optional<c10::ArrayRef<T>>() {
+  operator std::optional<c10::ArrayRef<T>>() {
     if (!list) {
-      return nullopt;
+      return std::nullopt;
     }
     return *list;
   }
 
   operator c10::OptionalArrayRef<T>() {
     if (!list) {
-      return nullopt;
+      return std::nullopt;
     }
     return *list;
   }
@@ -160,6 +165,7 @@ struct Capsule {
   _(Double)                  \
   _(ComplexDouble)           \
   _(Int)                     \
+  _(UInt)                    \
   _(SymInt)                  \
   _(SymFloat)                \
   _(SymBool)                 \
@@ -501,28 +507,26 @@ struct TORCH_API IValue final {
   // Tuple
   IValue(c10::intrusive_ptr<ivalue::Tuple> v);
 
+  template <typename... Ts>
+  using enable_if_ivalue_compatible =
+      std::enable_if<std::conjunction<
+          std::negation<std::is_lvalue_reference<Ts>>...,
+          std::is_constructible<IValue, Ts>...>::value>;
+
   template <
       typename... Args,
-      std::enable_if_t<
-          !std::disjunction_v<
-              std::is_lvalue_reference<Args>...,
-              std::negation<std::is_constructible<IValue, Args>>...>,
-          std::nullptr_t> = nullptr>
+      typename = typename enable_if_ivalue_compatible<Args...>::type>
   IValue(const std::tuple<Args...>& t);
   template <
       typename... Args,
-      std::enable_if_t<
-          !std::disjunction_v<
-              std::is_lvalue_reference<Args>...,
-              std::negation<std::is_constructible<IValue, Args>>...>,
-          std::nullptr_t> = nullptr>
+      typename = typename enable_if_ivalue_compatible<Args...>::type>
   IValue(std::tuple<Args...>&& t);
   bool isTuple() const {
     return Tag::Tuple == tag;
   }
   c10::intrusive_ptr<ivalue::Tuple> toTuple() &&;
   c10::intrusive_ptr<ivalue::Tuple> toTuple() const&;
-  C10_NODISCARD ivalue::Tuple& toTupleRef() const;
+  [[nodiscard]] ivalue::Tuple& toTupleRef() const;
 
   // Double
   IValue(double d) : tag(Tag::Double) {
@@ -622,7 +626,14 @@ struct TORCH_API IValue final {
   IValue(const c10::SymBool& i) {
     if (auto mi = i.maybe_as_bool()) {
       tag = Tag::Bool;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
       payload.u.as_int = *mi;
+#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+      /* due to byteorder if value assigned as_int, as_bool actually is not set correctly */
+      payload.u.as_bool = *mi;
+#else
+#error Unexpected or undefined __BYTE_ORDER__
+#endif
     } else {
       tag = Tag::SymBool;
       payload.u.as_intrusive_ptr = i.toSymNodeImpl().release();
@@ -652,6 +663,29 @@ struct TORCH_API IValue final {
       TORCH_INTERNAL_ASSERT(0, "expected int");
     }
   }
+
+  // Unsigned
+  IValue(uint64_t u) : tag( u <= std::numeric_limits<int64_t>::max() ? Tag::Int : Tag::UInt) {
+    payload.u.as_uint = u;
+  }
+
+
+  // See Note [Meaning of HAS_u]
+  // IValue type model closely follows that of c10::Scalar
+  // Where all integers are upcast to 64-bit representation, and `as_int` is used as default
+  // representation unless value could not be represented as signed int
+  bool isUnsigned() const {
+    return Tag::UInt == tag || (Tag::Int == tag && payload.u.as_int >= 0);
+  }
+
+  uint64_t toUInt() const {
+    if (isUnsigned()) {
+      return payload.u.as_uint;
+    } else {
+      TORCH_INTERNAL_ASSERT(0, "expected unsigned int");
+    }
+  }
+
 
   // Bool
   IValue(bool b) : tag(Tag::Bool) {
@@ -683,6 +717,8 @@ struct TORCH_API IValue final {
   c10::List<int64_t> toIntList() &&;
   c10::List<int64_t> toIntList() const&;
   std::vector<int64_t> toIntVector() const;
+  c10::List<c10::SymInt> toSymIntList() &&;
+  c10::List<c10::SymInt> toSymIntList() const&;
   std::vector<c10::SymInt> toSymIntVector() const;
   at::DimVector toDimVector() const;
 
@@ -690,16 +726,16 @@ struct TORCH_API IValue final {
   IValue(c10::intrusive_ptr<ivalue::ConstantString> v);
   IValue(std::string v);
   IValue(const char* v) : IValue(std::string(v)) {}
-  IValue(c10::string_view v) : IValue(std::string(v)){};
+  IValue(std::string_view v) : IValue(std::string(v)){}
   bool isString() const {
     return Tag::String == tag;
   }
   c10::intrusive_ptr<ivalue::ConstantString> toString() &&;
   c10::intrusive_ptr<ivalue::ConstantString> toString() const&;
   const std::string& toStringRef() const;
-  c10::optional<std::reference_wrapper<const std::string>> toOptionalStringRef()
+  std::optional<std::reference_wrapper<const std::string>> toOptionalStringRef()
       const;
-  c10::string_view toStringView() const;
+  std::string_view toStringView() const;
 
   // DoubleList
   bool isDoubleList() const;
@@ -726,9 +762,9 @@ struct TORCH_API IValue final {
 
   // OptionalTensorList
   bool isOptionalTensorList() const;
-  c10::List<c10::optional<at::Tensor>> toOptionalTensorList() &&;
-  c10::List<c10::optional<at::Tensor>> toOptionalTensorList() const&;
-  std::vector<c10::optional<at::Tensor>> toOptionalTensorVector() const;
+  c10::List<std::optional<at::Tensor>> toOptionalTensorList() &&;
+  c10::List<std::optional<at::Tensor>> toOptionalTensorList() const&;
+  std::vector<std::optional<at::Tensor>> toOptionalTensorVector() const;
 
   // GenericList
   IValue(c10::List<IValue> v);
@@ -817,10 +853,10 @@ struct TORCH_API IValue final {
       IValue(std::unordered_map<Key, Value> v);
 
   template <class T, enable_if_ivalue_constructible<T> = nullptr>
-  IValue(c10::optional<T> v);
+  IValue(std::optional<T> v);
   template <class T, enable_if_list_is_ivalue_constructible<T> = nullptr>
   IValue(c10::OptionalArrayRef<T> v);
-  IValue(c10::nullopt_t);
+  IValue(std::nullopt_t /*unused*/);
 
   // ClassType
   IValue(c10::intrusive_ptr<ivalue::Object> v);
@@ -891,8 +927,14 @@ struct TORCH_API IValue final {
     } else {
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
           s.isIntegral(false), "Unknown type in Scalar");
-      tag = Tag::Int;
-      payload.u.as_int = s.toLong();
+      if (s.isUnsigned()) {
+        const auto val = s.toUInt64();
+        payload.u.as_uint = val;
+        tag = val <= std::numeric_limits<int64_t>::max() ? Tag::Int : Tag::UInt;
+      } else {
+        payload.u.as_int = s.toLong();
+        tag = Tag::Int;
+      }
     }
   }
 
@@ -916,7 +958,9 @@ struct TORCH_API IValue final {
       return toSymFloat();
     else if (isSymBool())
       return toSymBool();
-    throw std::runtime_error("IValue is not a Scalar");
+    else if (isUnsigned())
+      return toUInt();
+    TORCH_CHECK(false, "IValue is not a Scalar");
   }
 
   // Device
@@ -972,13 +1016,6 @@ struct TORCH_API IValue final {
     return static_cast<at::QScheme>(toInt());
   }
 
-  // Dimname
-  IValue(at::Dimname dimname) : IValue(dimname.symbol().toQualString()) {}
-
-  at::Dimname toDimname() const {
-    return at::Dimname::fromSymbol(Symbol::fromQualString(toStringRef()));
-  }
-
   // Generator
   IValue(at::Generator g) : tag(Tag::Generator) {
     payload.u.as_intrusive_ptr =
@@ -1021,9 +1058,9 @@ struct TORCH_API IValue final {
   // ToOptional: convert a IValue to the Optional obj that accepts both T and
   // None
   template <typename T>
-  optional<T> toOptional();
+  std::optional<T> toOptional() &&;
   template <typename T>
-  optional<T> toOptional() const;
+  std::optional<T> toOptional() const&;
 
   /// @private [doxygen private]
   /// this is a shallow comparison of two IValues to test the object identity
@@ -1091,9 +1128,10 @@ struct TORCH_API IValue final {
         // Opaque tensors such as the ones constructed by the MKL-DNN backend
         // don't have storage so we just use their TensorImpls.
         // TODO: Find way to expose alias info for opaque tensors.
-        return reinterpret_cast<size_t>(ten.unsafeGetTensorImpl());
+        return std::hash<const void*>()(ten.unsafeGetTensorImpl());
       } else {
-        return reinterpret_cast<size_t>(ten.storage().unsafeGetStorageImpl());
+        return std::hash<const void*>()(
+            ten.storage().unsafeGetStorageImpl());
       }
     }
     size_t operator()(const IValue& val) const {
@@ -1117,7 +1155,24 @@ struct TORCH_API IValue final {
   using HashAliasedIValueMap =
       std::unordered_map<IValue, IValue, HashAliasedIValue, CompAliasedIValues>;
 
-  // Chechs if this and rhs has a subvalues in common.
+  struct HashIdentityIValue {
+    size_t operator()(const IValue& val) const {
+      return val.payload.u.as_int;
+    }
+  };
+
+  struct CompIdentityIValues {
+    bool operator()(const IValue& lhs, const IValue& rhs) const {
+      return lhs.is(rhs);
+    }
+  };
+
+  using HashIdentityIValues =
+      std::unordered_set<IValue, HashIdentityIValue, CompIdentityIValues>;
+  using HashIdentityIValueMap =
+      std::unordered_map<IValue, IValue, HashIdentityIValue, CompIdentityIValues>;
+
+  // Checks if this and rhs has a subvalues in common.
   // [t1,t2] and [t2, t3] returns true.
   bool overlaps(const IValue& rhs) const;
 
@@ -1128,10 +1183,10 @@ struct TORCH_API IValue final {
   // TODO: There are several places that recurse over IValue. This is fragile.
   // This visitor should be used to recurse over ivalues.
   void visit(const std::function<bool(const IValue&)>& visitor) const;
-  IValue deepcopy(c10::optional<at::Device> device = c10::nullopt) const;
+  IValue deepcopy(std::optional<at::Device> device = std::nullopt) const;
   IValue deepcopy(
-      HashAliasedIValueMap& memo,
-      c10::optional<at::Device> device = c10::nullopt) const;
+      HashIdentityIValueMap& memo,
+      std::optional<at::Device> device = std::nullopt) const;
 
  private:
   static c10::intrusive_ptr_target* null_to_undefined_tensor(
@@ -1146,7 +1201,7 @@ struct TORCH_API IValue final {
   // this value different (e.g. using NaN boxing), and this would make it more
   // costly to determine the tag for all types vs just determining if something
   // is a particular type. Instead we want clients to use the `isX` methods when
-  // possible. If for perf. reasons you really, absolutely, must have a jump
+  // possible. If for performance reasons you really, absolutely, must have a jump
   // table, then we can revisit this.
   enum class Tag : uint32_t {
 #define DEFINE_TAG(x) x,
@@ -1227,6 +1282,8 @@ struct TORCH_API IValue final {
       case Tag::ComplexDouble:
         return true;
       case Tag::Int:
+        return false;
+      case Tag::UInt:
         return false;
       case Tag::SymInt:
         return true;
@@ -1324,6 +1381,8 @@ struct TORCH_API IValue final {
     union TriviallyCopyablePayload {
       TriviallyCopyablePayload() : as_int(0) {}
       int64_t as_int;
+      // See Note [Meaning of HAS_u]
+      uint64_t as_uint;
       double as_double;
       bool as_bool;
       // Invariant: never nullptr; null state is represented as
@@ -1335,8 +1394,14 @@ struct TORCH_API IValue final {
         DeviceIndex index;
       } as_device;
     } u;
+    static_assert(std::is_trivially_copyable_v<TriviallyCopyablePayload>);
     at::Tensor as_tensor;
     Payload() : u() {}
+    Payload(const Payload&) = delete;
+    Payload(Payload&&) = delete;
+    Payload& operator=(const Payload&) = delete;
+    Payload& operator=(Payload&&) = delete;
+    // NOLINTNEXTLINE(modernize-use-equals-default)
     ~Payload() {}
   };
 
@@ -1424,7 +1489,7 @@ struct TORCH_API WeakIValue final {
               reclaim(static_cast<at::TensorImpl*>(payload.as_intrusive_ptr));
       c10::intrusive_ptr<at::TensorImpl, c10::UndefinedTensorImpl> ip(
           temp.lock());
-      temp.release();
+      std::ignore = temp.release();
       if (!ip) {
         return IValue();
       } else {
@@ -1437,7 +1502,7 @@ struct TORCH_API WeakIValue final {
               : payload.as_intrusive_ptr);
       IValue::Payload pl;
       pl.u.as_intrusive_ptr = temp.lock().release();
-      temp.release();
+      std::ignore = temp.release();
       if (!pl.u.as_intrusive_ptr) {
         return IValue();
       } else {
@@ -1454,7 +1519,7 @@ struct TORCH_API WeakIValue final {
         c10::intrusive_ptr_target,
         c10::UndefinedTensorImpl>::reclaim(payload.as_intrusive_ptr);
     size_t result = temp.use_count();
-    temp.release();
+    std::ignore = temp.release();
     return result;
   }
 
@@ -1466,7 +1531,7 @@ struct TORCH_API WeakIValue final {
         c10::intrusive_ptr_target,
         c10::UndefinedTensorImpl>::reclaim(payload.as_intrusive_ptr);
     size_t result = temp.weak_use_count();
-    temp.release();
+    std::ignore = temp.release();
     return result;
   }
   size_t hash() const {
@@ -1506,32 +1571,32 @@ struct TORCH_API WeakTypePtr {
 struct WeakOrStrongCompilationUnit {
   explicit WeakOrStrongCompilationUnit(
       std::shared_ptr<torch::jit::CompilationUnit> shared_cu)
-      : strong_ptr_(std::move(shared_cu)), weak_ptr_(c10::nullopt) {}
+      : strong_ptr_(std::move(shared_cu)), weak_ptr_(std::nullopt) {}
 
   explicit WeakOrStrongCompilationUnit(
       std::weak_ptr<torch::jit::CompilationUnit> weak_cu)
-      : strong_ptr_(c10::nullopt), weak_ptr_(std::move(weak_cu)) {}
+      : strong_ptr_(std::nullopt), weak_ptr_(std::move(weak_cu)) {}
 
   std::shared_ptr<torch::jit::CompilationUnit> getStrongRefOrThrow() const {
-    TORCH_INTERNAL_ASSERT(strong_ptr_ != c10::nullopt);
+    TORCH_INTERNAL_ASSERT(strong_ptr_.has_value());
     return *strong_ptr_;
   }
 
   std::weak_ptr<torch::jit::CompilationUnit> getWeakRefOrThrow() const {
-    TORCH_INTERNAL_ASSERT(weak_ptr_ != c10::nullopt);
+    TORCH_INTERNAL_ASSERT(weak_ptr_.has_value());
     return *weak_ptr_;
   }
 
   bool holdingStrongRef() const {
-    return strong_ptr_ != c10::nullopt;
+    return strong_ptr_.has_value();
   }
 
   bool holdingEmptyStrongRef() const {
-    return holdingStrongRef() && *strong_ptr_ == nullptr;
+    return strong_ptr_ == nullptr;
   }
 
-  c10::optional<std::shared_ptr<torch::jit::CompilationUnit>> strong_ptr_;
-  c10::optional<std::weak_ptr<torch::jit::CompilationUnit>> weak_ptr_;
+  std::optional<std::shared_ptr<torch::jit::CompilationUnit>> strong_ptr_;
+  std::optional<std::weak_ptr<torch::jit::CompilationUnit>> weak_ptr_;
 };
 
 // An Object will hold a non-owning Compilation Unit reference if it is a
@@ -1560,5 +1625,7 @@ struct TORCH_API WeakOrStrongTypePtr {
 };
 
 } // namespace c10
+
+C10_DIAGNOSTIC_POP()
 
 #include <ATen/core/ivalue_inl.h> // IWYU pragma: keep

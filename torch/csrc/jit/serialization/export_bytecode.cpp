@@ -18,6 +18,7 @@
 #include <torch/csrc/jit/mobile/interpreter.h>
 #include <torch/csrc/jit/mobile/method.h>
 #include <torch/csrc/jit/mobile/module.h>
+#include <torch/csrc/jit/passes/inline_fork_wait.h>
 #include <torch/csrc/jit/passes/inliner.h>
 #include <torch/csrc/jit/serialization/callstack_debug_info_serialization.h>
 #include <torch/csrc/jit/serialization/import_export_constants.h>
@@ -32,7 +33,7 @@
 
 namespace torch::jit {
 
-static std::vector<Method> gatherGetSetStates(ObjectPtr obj) {
+static std::vector<Method> gatherGetSetStates(const ObjectPtr& obj) {
   std::vector<Method> methods;
   // Use DFS on IValue's to traverse dependencies of module._ivalue and
   // add all setstate/getstates to initial stack.
@@ -67,7 +68,7 @@ static std::vector<Method> findAllDependentFunctions(
     const Module& module,
     Graph& graph) {
   std::vector<Method> methods;
-  std::unordered_set<c10::string_view> called_method_names;
+  std::unordered_set<std::string_view> called_method_names;
   auto nodes = findAllNodes(graph, c10::prim::CallMethod, true);
   for (Node* node : nodes) {
     if (auto iface = node->input(0)->type()->castRaw<InterfaceType>()) {
@@ -78,8 +79,7 @@ static std::vector<Method> findAllDependentFunctions(
 
   for (const auto& submodule : module.modules()) {
     for (const auto& m : submodule.get_methods()) {
-      if (called_method_names.find(m.function().qualname().name()) !=
-          called_method_names.end()) {
+      if (called_method_names.contains(m.function().qualname().name())) {
         methods.emplace_back(m);
       }
     }
@@ -108,7 +108,7 @@ static std::vector<std::unique_ptr<GraphFunction>> inlineFunctions(
     auto tup = std::make_pair(
         cur.owner()._ivalue()->type()->name()->qualifiedName(),
         &cur.function());
-    if (visited.find(tup) != visited.end()) {
+    if (visited.contains(tup)) {
       continue;
     }
     visited.insert(tup);
@@ -149,7 +149,6 @@ mobile::Code compileGraphToMobileCode(
 
   // operator names
   std::vector<std::string> method_names;
-  std::vector<int64_t> op_debug_handles;
   int next_new_op_index = 0;
 
   auto op_to_specified_args = code.op_to_num_specified_args();
@@ -166,7 +165,7 @@ mobile::Code compileGraphToMobileCode(
       // and is not allowed. For an operator with num_args = -1, it means the
       // number of arguments is not available for this operator, we don't do any
       // backward compatibility adaptation at runtime.
-      c10::optional<int> num_args = c10::nullopt;
+      std::optional<int> num_args = std::nullopt;
       auto it = op_to_specified_args.find(unique_name);
       if (it != op_to_specified_args.end()) {
         num_args = it->second;
@@ -377,6 +376,9 @@ mobile::Module jitModuleToMobile(
 
   for (const auto& func :
        inlineFunctions(methods_to_export, options.incl_interface_call)) {
+    if (options.inline_fork_wait) {
+      InlineForkWait(func->graph());
+    }
     auto mobile_code = compileGraphToMobileCode(
         func->name(), func->graph(), options, debug_info_recorder);
     const auto& schema = func->getSchema();
@@ -395,7 +397,8 @@ mobile::Module jitModuleToMobile(
       backend_debug_info_map.begin(), backend_debug_info_map.end());
   m.setDebugTable(MobileDebugTable(
       debug_handle_cs_ptr_map.begin(), debug_handle_cs_ptr_map.end()));
-  m.set_min_operator_version(get_min_operator_version_from_version_map(m));
+  m.set_min_operator_version(
+      static_cast<int64_t>(get_min_operator_version_from_version_map(m)));
   m.set_bytecode_version(options.model_version);
   return m;
 }

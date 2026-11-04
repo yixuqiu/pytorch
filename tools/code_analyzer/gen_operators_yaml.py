@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
+
+from __future__ import annotations
+
 import argparse
 import json
 import sys
-from typing import Any, Dict, List, Optional
+from argparse import Namespace
+from typing import Any
 
 import yaml
+
+# pyrefly: ignore [missing-import]
 from gen_op_registration_allowlist import (
     canonical_name,
     gen_transitive_closure,
     load_op_dep_graph,
 )
+
 from torchgen.selective_build.operator import (
     merge_operator_dicts,
     SelectiveBuildOperator,
 )
 from torchgen.selective_build.selector import merge_kernel_metadata
+
 
 # Generate YAML file containing the operators used for a specific PyTorch model.
 # ------------------------------------------------------------------------------
@@ -63,13 +71,13 @@ from torchgen.selective_build.selector import merge_kernel_metadata
 #    used by training, and not just the root operators. All Training ops are
 #    also considered for inference, so these are merged into inference ops.
 #
-# 3. Operator Depencency Graph (--dep-graph-yaml-path): A path to the
+# 3. Operator Dependency Graph (--dep-graph-yaml-path): A path to the
 #    operator dependency graph used to determine which operators depend on
 #    which other operators for correct functioning. This is used for
 #    generating the transitive closure of all the operators used by the
 #    model based on the root operators when static selective build is used.
 #    For tracing based selective build, we don't need to perform this
-#    transitive cloure.
+#    transitive closure.
 #
 # 4. Model Metadata (--model-name, --model-versions, --model-assets,
 #    --model-backends): Self-descriptive. These are used to tell this
@@ -83,17 +91,17 @@ from torchgen.selective_build.selector import merge_kernel_metadata
 #
 
 
-def canonical_opnames(opnames: List[str]) -> List[str]:
+def canonical_opnames(opnames: list[str]) -> list[str]:
     return [canonical_name(opname) for opname in opnames]
 
 
 def make_filter_from_options(
     model_name: str,
-    model_versions: List[str],
-    model_assets: Optional[List[str]],
-    model_backends: Optional[List[str]],
+    model_versions: list[str],
+    model_assets: list[str] | None,
+    model_backends: list[str] | None,
 ):
-    def is_model_included(model_info):
+    def is_model_included(model_info) -> bool:
         model = model_info["model"]
         if model["name"] != model_name:
             return False
@@ -108,7 +116,7 @@ def make_filter_from_options(
 
 
 # Returns if a the specified rule is a new or old style pt_operator_library
-def is_new_style_rule(model_name: str, model_versions: Optional[List[str]]):
+def is_new_style_rule(model_name: str, model_versions: list[str] | None):
     return model_name is not None and model_versions is not None
 
 
@@ -116,13 +124,13 @@ def is_new_style_rule(model_name: str, model_versions: Optional[List[str]]):
 # appear in at least one model yaml. Throws if verification is failed,
 # returns None on success
 def verify_all_specified_present(
-    model_assets: Optional[List[str]],
-    model_versions: List[str],
-    selected_models_yaml: List[Dict[str, Any]],
+    model_assets: list[str] | None,
+    model_versions: list[str],
+    selected_models_yaml: list[dict[str, Any]],
     rule_name: str,
     model_name: str,
     new_style_rule: bool,
-):
+) -> None:
     def find_missing_items(model_items, key, selected_models_yaml):
         missing_items = []
         if not new_style_rule or not model_items:
@@ -178,10 +186,10 @@ def verify_all_specified_present(
 # Uses the selected models configs and then combines them into one dictionary,
 # formats them as a string, and places the string into output as a top level debug_info
 def create_debug_info_from_selected_models(
-    output: Dict[str, object],
-    selected_models: List[dict],
+    output: dict[str, object],
+    selected_models: list[dict],
     new_style_rule: bool,
-):
+) -> None:
     model_dict = {
         "asset_info": {},  # maps asset name -> dict of asset metadata like hashes
         "is_new_style_rule": new_style_rule,
@@ -194,13 +202,14 @@ def create_debug_info_from_selected_models(
 
         asset_info = model_dict["asset_info"].setdefault(asset, {})
 
+        # pyrefly: ignore [missing-attribute]
         asset_info.setdefault("md5_hash", []).append(hash)
 
     # Will later be used in gen_oplist to generate the model/version/asset checking
     output["debug_info"] = [json.dumps(model_dict)]
 
 
-def fill_output(output: Dict[str, object], options: object):
+def fill_output(output: dict[str, object], options: Namespace) -> None:
     """Populate the output dict with the information required to serialize
     the YAML file used for selective build.
     """
@@ -305,6 +314,7 @@ def fill_output(output: Dict[str, object], options: object):
             all_build_features = all_build_features | set(model_info["build_features"])
 
     # This following section on transitive closure is relevant to static build only
+    # pyrefly: ignore [bad-argument-type]
     canonical_root_ops = canonical_opnames(static_root_ops)
     # If no canonical_root_ops exist, don't compute the transitive closure
     # otherwise, we will include __BASE__ and __ROOT__ ops and mark them as required
@@ -314,6 +324,7 @@ def fill_output(output: Dict[str, object], options: object):
     else:
         closure_op_list = set()
 
+    # pyrefly: ignore [bad-argument-type]
     canonical_training_root_ops = canonical_opnames(static_training_root_ops)
     # If no canonical_training_root_ops exist, don't compute the transitive closure
     # otherwise, we will include __BASE__ and __ROOT__ ops and mark them as required
@@ -457,7 +468,7 @@ def fill_output(output: Dict[str, object], options: object):
     # END TRACING BASED BUILD OPS
 
     # Merge dictionaries together to remove op duplication
-    operators: Dict[str, SelectiveBuildOperator] = {}
+    operators: dict[str, SelectiveBuildOperator] = {}
     for ops_dict in bucketed_ops:
         operators = merge_operator_dicts(operators, ops_dict)
 
@@ -466,7 +477,7 @@ def fill_output(output: Dict[str, object], options: object):
     # to True, since it indicates that this operator list came from something
     # other than a traced operator list.
     include_all_non_op_selectives = False
-    for op_name, op_info in operators.items():
+    for op_info in operators.values():
         include_all_non_op_selectives = (
             include_all_non_op_selectives or op_info.include_all_overloads
         )
@@ -604,7 +615,7 @@ def main(argv) -> None:
         "asset_info": {},
         "is_new_style_rule": False,
     }
-    output = {
+    output: dict[str, object] = {
         "debug_info": [json.dumps(model_dict)],
     }
 

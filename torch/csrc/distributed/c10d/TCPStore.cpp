@@ -1,82 +1,22 @@
+#include <c10/util/WaitCounter.h>
 #include <c10/util/irange.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
+#include <torch/csrc/distributed/c10d/Backoff.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
-#include <torch/csrc/distributed/c10d/TCPStoreBackend.hpp>
+#include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <torch/csrc/distributed/c10d/logging.h>
+#include <torch/csrc/distributed/c10d/store/TCPStoreBackend.hpp>
 
-#include <fcntl.h>
 #include <chrono>
 #include <fstream>
-#include <random>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 
-#ifdef _WIN32
-#include <io.h>
-#include <winsock2.h>
-#else
-#include <poll.h>
-#include <unistd.h>
-#endif
-
-#ifdef _WIN32
-#include <torch/csrc/distributed/c10d/WinSockUtils.hpp>
-#else
-#include <torch/csrc/distributed/c10d/UnixSockUtils.hpp>
-#endif
-
-#include <torch/csrc/distributed/c10d/socket.h>
-
 namespace c10d {
 namespace detail {
-
-class timing_guard {
-  Counter& counter_;
-  typedef std::chrono::time_point<std::chrono::high_resolution_clock>
-      time_point;
-  time_point start_;
-
- public:
-  timing_guard(Counter& counter)
-      : counter_(counter), start_(std::chrono::high_resolution_clock::now()) {}
-
-  ~timing_guard() {
-    stop();
-  }
-
-  void stop() {
-    if (start_ != time_point()) {
-      auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::high_resolution_clock::now() - start_)
-                      .count();
-      counter_.update(diff);
-      start_ = time_point();
-    }
-  }
-};
-
-void Counter::update(double val) {
-  count_ += 1;
-
-  auto delta = val - mean_;
-  mean_ += delta / count_;
-
-  auto delta2 = val - mean_;
-  m2_ += delta2 * delta2;
-}
-
-std::unordered_map<std::string, double> Counter::observe() const {
-  std::unordered_map<std::string, double> res;
-  res["count"] = (double)count_;
-  res["mean"] = mean_;
-  if (count_ >= 2) {
-    res["sample_variance"] = m2_ / (count_ - 1);
-  } else {
-    res["sample_variance"] = std::nan("1");
-  }
-  return res;
-}
 
 // Manages the lifecycle of a server daemon.
 class TCPServer {
@@ -91,6 +31,10 @@ class TCPServer {
       std::uint16_t port,
       std::unique_ptr<BackgroundThread>&& daemon)
       : port_{port}, daemon_{std::move(daemon)} {}
+
+  std::string repr() const {
+    return fmt::format("TCPServer(port={})", port_);
+  }
 
  private:
   std::uint16_t port_;
@@ -152,30 +96,57 @@ class TCPClient {
  public:
   static std::unique_ptr<TCPClient> connect(
       const SocketAddress& addr,
-      const TCPStoreOptions& opts);
+      const TCPStoreOptions& opts,
+      std::shared_ptr<Backoff> backoff);
 
-  void sendRaw(uint8_t* data, size_t lenght) {
-    tcputil::sendBytes(socket_.handle(), data, lenght);
+  void sendRaw(uint8_t* data, size_t length) {
+    try {
+      tcputil::sendBytes(socket_.handle(), data, length);
+    } catch (const std::exception& e) {
+      C10D_WARNING("sendBytes failed on {}: {}", socket_.repr(), e.what());
+      throw;
+    }
   }
 
   std::vector<std::uint8_t> receiveBits() {
-    return tcputil::recvVector<std::uint8_t>(socket_.handle());
+    try {
+      return tcputil::recvVector<std::uint8_t>(socket_.handle());
+    } catch (const std::exception& e) {
+      C10D_WARNING("recvVector failed on {}: {}", socket_.repr(), e.what());
+      throw;
+    }
   }
 
   template <typename T>
   T receiveValue() {
-    return tcputil::recvValue<T>(socket_.handle());
+    try {
+      return tcputil::recvValue<T>(socket_.handle());
+    } catch (const std::exception& e) {
+      C10D_WARNING("recvValue failed on {}: {}", socket_.repr(), e.what());
+      throw;
+    }
   }
   template <typename T>
-  bool receiveValueWithTimeout(T& t, std::chrono::milliseconds timeout) {
-    if (!socket_.waitForInput(timeout))
-      return false;
-    t = tcputil::recvValue<T>(socket_.handle());
-    return true;
+  std::optional<T> receiveValueWithTimeout(std::chrono::milliseconds timeout) {
+    if (!socket_.waitForInput(timeout)) {
+      return {};
+    }
+
+    try {
+      return tcputil::recvValue<T>(socket_.handle());
+    } catch (const std::exception& e) {
+      C10D_WARNING(
+          "recvValueWithTimeout failed on {}: {}", socket_.repr(), e.what());
+      throw;
+    }
   }
   void setTimeout(std::chrono::milliseconds value);
 
   explicit TCPClient(Socket&& socket) : socket_{std::move(socket)} {}
+
+  std::string repr() const {
+    return fmt::format("TCPClient({})", socket_.repr());
+  }
 
  private:
   Socket socket_;
@@ -183,10 +154,14 @@ class TCPClient {
 
 std::unique_ptr<TCPClient> TCPClient::connect(
     const SocketAddress& addr,
-    const TCPStoreOptions& opts) {
-  auto timeout = std::chrono::duration_cast<std::chrono::seconds>(opts.timeout);
+    const TCPStoreOptions& opts,
+    std::shared_ptr<Backoff> backoff) {
   Socket socket = Socket::connect(
-      addr.host, addr.port, SocketOptions{}.connect_timeout(timeout));
+      addr.host,
+      addr.port,
+      SocketOptions{}
+          .connect_timeout(opts.timeout)
+          .connect_backoff(std::move(backoff)));
 
   return std::make_unique<TCPClient>(std::move(socket));
 }
@@ -216,8 +191,10 @@ void TCPClient::setTimeout(std::chrono::milliseconds value) {
 
 class SendBuffer {
   // ethernet mtu 1500 - 40 (ip v6 header) - 20 (tcp header)
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const size_t FLUSH_WATERMARK = 1440;
   std::vector<uint8_t> buffer;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   detail::TCPClient& client;
 
   void maybeFlush() {
@@ -230,7 +207,7 @@ class SendBuffer {
   SendBuffer(detail::TCPClient& client, detail::QueryType cmd)
       : client(client) {
     buffer.reserve(32); // enough for most commands
-    buffer.push_back((uint8_t)cmd);
+    buffer.push_back(static_cast<uint8_t>(cmd));
   }
 
   void appendString(const std::string& str) {
@@ -247,7 +224,7 @@ class SendBuffer {
 
   template <typename T>
   void appendValue(T value) {
-    uint8_t* begin = (uint8_t*)&value;
+    uint8_t* begin = reinterpret_cast<uint8_t*>(&value);
     buffer.insert(buffer.end(), begin, begin + sizeof(T));
     maybeFlush();
   }
@@ -265,40 +242,46 @@ class SendBuffer {
 using detail::Socket;
 
 // TCPStore class methods
-TCPStore::TCPStore(
-    const std::string& masterAddr,
-    std::uint16_t masterPort,
-    c10::optional<int> numWorkers,
-    bool isServer,
-    const std::chrono::milliseconds& timeout,
-    bool waitWorkers)
-    : TCPStore{
-          masterAddr,
-          TCPStoreOptions{
-              masterPort,
-              isServer,
-              numWorkers ? c10::optional<std::size_t>(*numWorkers)
-                         : c10::nullopt,
-              waitWorkers,
-              timeout}} {}
 
+// Although we still allow multi-params in ctor in Python, that behavior is
+// removed from cpp and we construct the opts implicitly for users in the pybind
+// of TCPStore.
 TCPStore::TCPStore(std::string host, const TCPStoreOptions& opts)
     : Store{opts.timeout},
       addr_{std::move(host)},
       numWorkers_{opts.numWorkers},
       usingLibUv_{opts.useLibUV} {
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__init);
+
   if (opts.useLibUV) {
-    TORCH_CHECK(
+    TORCH_CHECK_WITH(
+        DistStoreError,
         ::c10d::detail::is_libuv_tcpstore_backend_available(),
-        "use_libuv was requested but PyTorch was build without libuv support");
+        "use_libuv was requested but PyTorch was built without libuv support, run with USE_LIBUV=0 to disable it.");
   }
 
   Socket::initialize();
 
+  addr_.port = opts.port;
+
   if (opts.isServer) {
-    server_ = detail::TCPServer::start(opts);
-    // server successfully started
-    C10D_DEBUG("The server has started on port = {}.", server_->port());
+    try {
+      server_ = detail::TCPServer::start(opts);
+      // server successfully started
+      C10D_DEBUG("The server has started on port = {}.", server_->port());
+      addr_.port = server_->port();
+    } catch (const SocketError&) {
+      bool useAgentStore = getCvarBool({"TORCHELASTIC_USE_AGENT_STORE"}, false);
+      int masterPort = getCvarInt({"MASTER_PORT"}, 0);
+      if (useAgentStore && masterPort == opts.port) {
+        C10D_ERROR(
+            "The server socket on {} has failed to bind. "
+            "TORCHELASTIC_USE_AGENT_STORE is enabled so ignoring the error.",
+            opts.port);
+      } else {
+        throw;
+      }
+    }
 
     std::ifstream maxconnFile("/proc/sys/net/core/somaxconn");
     if (maxconnFile.good() && numWorkers_.has_value()) {
@@ -318,28 +301,55 @@ TCPStore::TCPStore(std::string host, const TCPStoreOptions& opts)
         C10D_INFO("failed to parse somaxconn proc file due to {}", e.what());
       }
     }
-
-    addr_.port = server_->port();
-  } else {
-    addr_.port = opts.port;
   }
 
-  if (numWorkers_.has_value()) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distrib(1, *numWorkers_);
-    // TODO (xilunwu): this wait logic may be removed after fixing read_offset
-    // stagger connecting to the store when there are too many ranks to
-    // avoid causing a DDoS
-    std::this_thread::sleep_for(std::chrono::milliseconds(distrib(gen)));
-  }
+  // Try connecting several times -- if the server listen backlog is full it may
+  // fail on the first send in validate.
+  auto deadline = std::chrono::steady_clock::now() + opts.timeout;
+  auto backoff = std::make_shared<ExponentialBackoffWithJitter>();
 
-  client_ = detail::TCPClient::connect(addr_, opts);
-  // TCP connection established
-  C10D_DEBUG("TCP client connected to host {}:{}", addr_.host, addr_.port);
+  auto retry = 0;
+  do {
+    try {
+      client_ = detail::TCPClient::connect(addr_, opts, backoff);
+      // TCP connection established
+      C10D_DEBUG("TCP client connected to host {}:{}", addr_.host, addr_.port);
 
-  // client's first query for validation
-  validate();
+      // client's first query for validation
+      validate();
+
+      // ping to verify network connectivity
+      ping();
+
+      // success
+      break;
+    } catch (const c10::DistNetworkError& ex) {
+      if (deadline < std::chrono::steady_clock::now()) {
+        C10D_ERROR(
+            "TCP client failed to connect/validate to host {}:{} - timed out (try={}, timeout={}ms): {}",
+            addr_.host,
+            addr_.port,
+            retry,
+            opts.timeout.count(),
+            ex.what());
+        throw;
+      }
+
+      auto delayDuration = backoff->nextBackoff();
+
+      C10D_WARNING(
+          "TCP client failed to connect/validate to host {}:{} - retrying (try={}, timeout={}ms, delay={}ms): {}",
+          addr_.host,
+          addr_.port,
+          retry,
+          opts.timeout.count(),
+          delayDuration.count(),
+          ex.what());
+
+      std::this_thread::sleep_for(delayDuration);
+      retry += 1;
+    }
+  } while (true);
 
   if (opts.waitWorkers) {
     waitForWorkers();
@@ -348,9 +358,20 @@ TCPStore::TCPStore(std::string host, const TCPStoreOptions& opts)
 
 TCPStore::~TCPStore() = default;
 
+c10::intrusive_ptr<Store> TCPStore::clone() {
+  TCPStoreOptions opts;
+  opts.port = addr_.port;
+  opts.isServer = false;
+  opts.waitWorkers = false;
+  opts.timeout = timeout_;
+  opts.useLibUV = usingLibUv_;
+
+  return c10::make_intrusive<TCPStore>(addr_.host, opts);
+}
+
 void TCPStore::waitForWorkers() {
-  detail::timing_guard tguard(clientCounters_["waitForWorkers"]);
-  if (numWorkers_ == c10::nullopt) {
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__waitForWorkers);
+  if (!numWorkers_.has_value()) {
     return;
   }
 
@@ -393,6 +414,25 @@ void TCPStore::validate() {
   buffer.flush();
 }
 
+void TCPStore::ping() {
+  const std::lock_guard<std::mutex> lock(activeOpLock_);
+  detail::SendBuffer buffer(*client_, detail::QueryType::PING);
+
+  uint32_t nonce = getpid();
+  buffer.appendValue<std::uint32_t>(nonce);
+  buffer.flush();
+
+  uint32_t returnedNonce = client_->receiveValue<std::uint32_t>();
+  if (nonce != returnedNonce) {
+    C10_THROW_ERROR(
+        DistNetworkError,
+        fmt::format(
+            "Ping failed, invalid value returned from server. Expected: {}, Got: {}",
+            nonce,
+            returnedNonce));
+  }
+}
+
 void TCPStore::_splitSet(
     const std::string& key,
     const std::vector<uint8_t>& data) {
@@ -406,7 +446,7 @@ void TCPStore::_splitSet(
 }
 
 void TCPStore::set(const std::string& key, const std::vector<uint8_t>& data) {
-  detail::timing_guard tguard(clientCounters_["set"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__set);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   detail::SendBuffer buffer(*client_, detail::QueryType::SET);
   buffer.appendString(keyPrefix_ + key);
@@ -418,7 +458,7 @@ std::vector<uint8_t> TCPStore::compareSet(
     const std::string& key,
     const std::vector<uint8_t>& expectedValue,
     const std::vector<uint8_t>& desiredValue) {
-  detail::timing_guard tguard(clientCounters_["compareSet"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__compareSet);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   detail::SendBuffer buffer(*client_, detail::QueryType::COMPARE_SET);
   buffer.appendString(keyPrefix_ + key);
@@ -430,7 +470,7 @@ std::vector<uint8_t> TCPStore::compareSet(
 }
 
 std::vector<uint8_t> TCPStore::get(const std::string& key) {
-  detail::timing_guard tguard(clientCounters_["get"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__get);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   return doGet(keyPrefix_ + key);
 }
@@ -445,13 +485,13 @@ std::vector<uint8_t> TCPStore::doGet(const std::string& key) {
 }
 
 int64_t TCPStore::add(const std::string& key, int64_t value) {
-  detail::timing_guard tguard(clientCounters_["add"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__add);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   return incrementValueBy(keyPrefix_ + key, value);
 }
 
 bool TCPStore::deleteKey(const std::string& key) {
-  detail::timing_guard tguard(clientCounters_["deleteKey"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__delete);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   detail::SendBuffer buffer(*client_, detail::QueryType::DELETE_KEY);
   buffer.appendString(keyPrefix_ + key);
@@ -479,7 +519,7 @@ int64_t TCPStore::getNumKeys() {
 }
 
 bool TCPStore::check(const std::vector<std::string>& keys) {
-  detail::timing_guard tguard(clientCounters_["check"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__check);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   detail::SendBuffer buffer(*client_, detail::QueryType::CHECK);
   buffer.appendValue(keys.size());
@@ -496,7 +536,8 @@ bool TCPStore::check(const std::vector<std::string>& keys) {
   if (response == detail::CheckResponseType::NOT_READY) {
     return false;
   }
-  TORCH_CHECK(false, "ready or not_ready response expected");
+  TORCH_CHECK_WITH(
+      DistStoreError, false, "ready or not_ready response expected");
 }
 
 void TCPStore::wait(const std::vector<std::string>& keys) {
@@ -506,7 +547,7 @@ void TCPStore::wait(const std::vector<std::string>& keys) {
 void TCPStore::wait(
     const std::vector<std::string>& keys,
     const std::chrono::milliseconds& timeout) {
-  detail::timing_guard tguard(clientCounters_["wait"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__wait);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   std::vector<std::string> prefixedKeys{};
   prefixedKeys.reserve(keys.size());
@@ -529,11 +570,12 @@ void TCPStore::doWait(
     buffer.flush();
   }
 
-  detail::WaitResponseType response;
-  if (client_->receiveValueWithTimeout<detail::WaitResponseType>(
-          response, timeout)) {
-    if (response != detail::WaitResponseType::STOP_WAITING) {
-      TORCH_CHECK(false, "Stop_waiting response is expected");
+  auto response_opt =
+      client_->receiveValueWithTimeout<detail::WaitResponseType>(timeout);
+  if (response_opt.has_value()) {
+    if (response_opt != detail::WaitResponseType::STOP_WAITING) {
+      TORCH_CHECK_WITH(
+          DistStoreError, false, "Stop_waiting response is expected");
     }
     return;
   }
@@ -544,25 +586,32 @@ void TCPStore::doWait(
     buffer.flush();
   }
 
-  response = client_->receiveValue<detail::WaitResponseType>();
+  auto response = client_->receiveValue<detail::WaitResponseType>();
   // this can happen if the server responds before we cancel, just ignore it
   if (response != detail::WaitResponseType::WAIT_CANCELED) {
     if (response != detail::WaitResponseType::STOP_WAITING) {
-      TORCH_CHECK(false, "Stop_waiting response is expected");
+      TORCH_CHECK_WITH(
+          DistStoreError, false, "Stop_waiting response is expected");
     }
 
     response = client_->receiveValue<detail::WaitResponseType>(); // ignore
     if (response != detail::WaitResponseType::WAIT_CANCELED) {
-      TORCH_CHECK(false, "wait_canceled response is expected");
+      TORCH_CHECK_WITH(
+          DistStoreError, false, "wait_canceled response is expected");
     }
   }
-  C10_THROW_ERROR(DistStoreError, "Socket Timeout");
+  C10_THROW_ERROR(
+      DistStoreError,
+      fmt::format(
+          "wait timeout after {}ms, keys: {}",
+          timeout.count(),
+          fmt::join(keys, ", ")));
 }
 
 void TCPStore::append(
     const std::string& key,
     const std::vector<uint8_t>& data) {
-  detail::timing_guard tguard(clientCounters_["append"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__append);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   detail::SendBuffer buffer(*client_, detail::QueryType::APPEND);
   buffer.appendString(keyPrefix_ + key);
@@ -572,7 +621,7 @@ void TCPStore::append(
 
 std::vector<std::vector<uint8_t>> TCPStore::multiGet(
     const std::vector<std::string>& keys) {
-  detail::timing_guard tguard(clientCounters_["multiGet"]);
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__multiGet);
   const std::lock_guard<std::mutex> lock(activeOpLock_);
   std::vector<std::string> prefixedKeys;
   prefixedKeys.reserve(keys.size());
@@ -590,7 +639,7 @@ std::vector<std::vector<uint8_t>> TCPStore::multiGet(
 
   std::vector<std::vector<uint8_t>> result;
   result.reserve(keys.size());
-  for (size_t i = 0; i < keys.size(); ++i) {
+  for ([[maybe_unused]] const auto _ : c10::irange(keys.size())) {
     result.emplace_back(client_->receiveBits());
   }
   return result;
@@ -599,14 +648,15 @@ std::vector<std::vector<uint8_t>> TCPStore::multiGet(
 void TCPStore::multiSet(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint8_t>>& values) {
-  detail::timing_guard tguard(clientCounters_["multiSet"]);
-  TORCH_CHECK(
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__multiSet);
+  TORCH_CHECK_WITH(
+      DistStoreError,
       keys.size() == values.size(),
       "multiSet keys and values vectors must be of same size");
   const std::lock_guard<std::mutex> lock(activeOpLock_);
 
   detail::SendBuffer buffer(*client_, detail::QueryType::MULTI_SET);
-  buffer.appendValue<std::int64_t>(keys.size());
+  buffer.appendValue<std::int64_t>(static_cast<int64_t>(keys.size()));
   for (auto i : c10::irange(keys.size())) {
     buffer.appendString(keyPrefix_ + keys[i]);
     buffer.appendBytes(values[i]);
@@ -614,17 +664,145 @@ void TCPStore::multiSet(
   buffer.flush();
 }
 
+void TCPStore::queuePush(
+    const std::string& key,
+    const std::vector<uint8_t>& data) {
+  TORCH_CHECK_WITH(
+      NotImplementedError,
+      usingLibUv_,
+      "queues not implemented on legacy TCPStore backend");
+
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__queuePush);
+
+  const std::lock_guard<std::mutex> lock(activeOpLock_);
+
+  detail::SendBuffer buffer(*client_, detail::QueryType::QUEUE_PUSH);
+  buffer.appendString(keyPrefix_ + key);
+  buffer.appendBytes(data);
+  buffer.flush();
+}
+
+std::vector<uint8_t> TCPStore::queuePop(const std::string& key, bool block) {
+  TORCH_CHECK_WITH(
+      NotImplementedError,
+      usingLibUv_,
+      "queues not implemented on legacy TCPStore backend");
+
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__queuePop);
+
+  const std::lock_guard<std::mutex> lock(activeOpLock_);
+
+  if (block) {
+    doWait(keyPrefix_ + key, timeout_);
+  }
+
+  detail::SendBuffer buffer(*client_, detail::QueryType::QUEUE_POP);
+  buffer.appendString(keyPrefix_ + key);
+  buffer.flush();
+
+  auto keys = client_->receiveValue<int64_t>();
+  TORCH_CHECK_WITH(DistQueueEmptyError, keys > 0, "queue is empty");
+
+  return client_->receiveBits();
+}
+
+int64_t TCPStore::queueLen(const std::string& key) {
+  TORCH_CHECK_WITH(
+      NotImplementedError,
+      usingLibUv_,
+      "queues not implemented on legacy TCPStore backend");
+
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__queueLen);
+
+  const std::lock_guard<std::mutex> lock(activeOpLock_);
+
+  detail::SendBuffer buffer(*client_, detail::QueryType::QUEUE_LEN);
+  buffer.appendString(keyPrefix_ + key);
+  buffer.flush();
+
+  return client_->receiveValue<int64_t>();
+}
+
+std::vector<std::string> TCPStore::listKeys() {
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__list);
+
+  const std::lock_guard<std::mutex> lock(activeOpLock_);
+
+  detail::SendBuffer buffer(*client_, detail::QueryType::LIST_KEYS);
+  buffer.flush();
+
+  auto numKeys = client_->receiveValue<int64_t>();
+  std::vector<std::string> keys;
+  keys.reserve(numKeys);
+  for (auto i = 0; i < numKeys; ++i) {
+    auto bits = client_->receiveBits();
+    std::string str(bits.begin(), bits.end());
+    if (str.starts_with(keyPrefix_)) {
+      str = str.substr(keyPrefix_.size());
+    } else {
+      continue;
+    }
+    keys.emplace_back(str);
+  }
+  return keys;
+}
+
+void TCPStore::barrier(
+    const std::string& key,
+    int64_t world_size,
+    const std::chrono::milliseconds& timeout) {
+  STATIC_SCOPED_WAIT_COUNTER(pytorch.wait_counter.TCPStore__barrier);
+  const std::lock_guard<std::mutex> lock(activeOpLock_);
+
+  detail::SendBuffer buffer(*client_, detail::QueryType::BARRIER);
+  buffer.appendString(keyPrefix_ + key);
+  buffer.appendValue<int64_t>(world_size);
+  buffer.flush();
+
+  auto response_opt =
+      client_->receiveValueWithTimeout<detail::WaitResponseType>(timeout);
+  if (response_opt.has_value()) {
+    if (response_opt != detail::WaitResponseType::STOP_WAITING) {
+      TORCH_CHECK_WITH(
+          DistStoreError, false, "Stop_waiting response is expected");
+    }
+    return;
+  }
+
+  // Timeout occurred - send cancel and handle response
+  {
+    detail::SendBuffer cancelBuffer(*client_, detail::QueryType::CANCEL_WAIT);
+    cancelBuffer.flush();
+  }
+
+  auto response = client_->receiveValue<detail::WaitResponseType>();
+  // This can happen if the server responds before we cancel
+  if (response != detail::WaitResponseType::WAIT_CANCELED) {
+    if (response != detail::WaitResponseType::STOP_WAITING) {
+      TORCH_CHECK_WITH(
+          DistStoreError, false, "Stop_waiting response is expected");
+    }
+    // Wait for the cancel acknowledgment
+    response = client_->receiveValue<detail::WaitResponseType>();
+    if (response != detail::WaitResponseType::WAIT_CANCELED) {
+      TORCH_CHECK_WITH(
+          DistStoreError, false, "wait_canceled response is expected");
+    }
+  }
+
+  C10_THROW_ERROR(
+      DistStoreError,
+      fmt::format("barrier timeout after {}ms, key: {}", timeout.count(), key));
+}
+
 bool TCPStore::hasExtendedApi() const {
   return true;
 }
 
-std::unordered_map<std::string, std::unordered_map<std::string, double>>
-TCPStore::collectClientCounters() const noexcept {
-  std::unordered_map<std::string, std::unordered_map<std::string, double>> res;
-  for (const auto& kv : clientCounters_) {
-    res[kv.first] = kv.second.observe();
-  }
-  return res;
+std::string TCPStore::repr() const {
+  auto clientRepr = client_ ? client_->repr() : "<nullptr>";
+  auto serverRepr = server_ ? server_->repr() : "<nullptr>";
+  return fmt::format("TCPStore(client={}, server={})", clientRepr, serverRepr);
 }
 
 } // namespace c10d

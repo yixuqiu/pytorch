@@ -23,7 +23,7 @@ class TORCH_API TypeParser {
   TypePtr parseTorchbindClassType();
   TypePtr parseNonSimple(const std::string& token);
 
-  void expect(const char* s);
+  void expect(std::string_view s);
   void expectChar(char c);
   template <typename T>
   TypePtr parseSingleElementType();
@@ -31,13 +31,13 @@ class TORCH_API TypeParser {
   void lex();
 
   std::string next();
-  c10::string_view nextView();
+  std::string_view nextView();
   void advance();
-  C10_NODISCARD c10::string_view cur() const;
+  [[nodiscard]] std::string_view cur() const;
 
   std::string pythonStr_;
   size_t start_;
-  c10::string_view next_token_;
+  std::string_view next_token_;
 
   // Used for parsing string list
   std::vector<std::string> pythonStrs_;

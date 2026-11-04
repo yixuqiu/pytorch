@@ -1,5 +1,4 @@
 # Owner(s): ["module: dynamo"]
-# flake8: noqa
 import torch
 import torch._dynamo
 import torch._dynamo.test_case
@@ -10,9 +9,12 @@ from torch._dynamo.testing import (
     EagerAndRecordGraphs,
     normalize_gm,
 )
+from torch.testing._internal.common_utils import HardwareClassification
 
 
 class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_tensor_property_on_tensor(self):
         def fn(x):
             return x * x.y
@@ -30,7 +32,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
             graph = gm
             return gm
 
-        fn = torch._dynamo.optimize(grab_graph_backend, nopython=True)(fn)
+        fn = torch.compile(fn, backend=grab_graph_backend, fullgraph=True)
         compile_result = fn(x_)
         self.assertEqual(eager_result, compile_result)
 
@@ -59,7 +61,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
             graph = gm
             return gm
 
-        fn = torch._dynamo.optimize(grab_graph_backend, nopython=True)(fn)
+        fn = torch.compile(fn, backend=grab_graph_backend, fullgraph=True)
         compile_result = fn(x_, y_)
         self.assertEqual(eager_result, compile_result)
 
@@ -88,7 +90,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
             graph = gm
             return gm
 
-        fn = torch._dynamo.optimize(grab_graph_backend, nopython=True)(fn)
+        fn = torch.compile(fn, backend=grab_graph_backend, fullgraph=True)
         compile_result = fn(x_)
         self.assertEqual(eager_result, compile_result)
 
@@ -110,7 +112,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
 
         eager_result = fn(x_, y_)
 
-        fn = torch._dynamo.optimize("eager", nopython=True)(fn)
+        fn = torch.compile(fn, backend="eager", fullgraph=True)
         compile_result = fn(x_, y_)
         self.assertEqual(eager_result, compile_result)
 
@@ -121,7 +123,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
 
         x_ = torch.randn([2, 2])
 
-        fn = torch._dynamo.optimize("eager", nopython=True)(fn)
+        fn = torch.compile(fn, backend="eager", fullgraph=True)
         compile_result_const = fn(x_, 4)
         self.assertEqual(compile_result_const, x_ * 4)
 
@@ -136,7 +138,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
 
         x_ = torch.randn([2, 2])
 
-        fn = torch._dynamo.optimize("inductor", nopython=True)(fn)
+        fn = torch.compile(fn, backend="inductor", fullgraph=True)
         compile_result_const = fn(x_, 4)
         self.assertEqual(compile_result_const, x_ * 4)
 
@@ -169,7 +171,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         eager_result = fn(x, y, z)
 
         counter = CompileCounter()
-        fn = torch._dynamo.optimize(counter, nopython=True)(fn)
+        fn = torch.compile(fn, backend=counter, fullgraph=True)
 
         compile_result = fn(x, y, z)
         self.assertEqual(compile_result, eager_result)
@@ -216,7 +218,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         eager_result = fn(x, y, z)
 
         counter = CompileCounter()
-        fn = torch._dynamo.optimize(counter, nopython=False)(fn)
+        fn = torch.compile(fn, backend=counter, fullgraph=False)
 
         compile_result = fn(x, y, z)
         self.assertEqual(compile_result, eager_result)
@@ -268,7 +270,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
 
         counter = CompileCounter()
 
-        fn = torch._dynamo.optimize(counter, nopython=False)(fn)
+        fn = torch.compile(fn, backend=counter, fullgraph=False)
 
         compile_result = fn(x, y, z)
         self.assertEqual(compile_result, eager_result)
@@ -300,7 +302,7 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
 
         counter = CompileCounterWithBackend(eager_and_record)
 
-        fn = torch._dynamo.optimize(counter, nopython=True)(fn)
+        fn = torch.compile(fn, backend=counter, fullgraph=True)
 
         compile_result = fn(x, y)
 
@@ -309,33 +311,29 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
 
         self.assertEqual(compile_result, eager_result)
         self.assertEqual(counter.frame_count, 1)
-        self.assertEqual(counter.op_count, 6)
+        self.assertEqual(counter.op_count, 5)
         self.assertExpectedInline(
             actual,
             """\
 class GraphModule(torch.nn.Module):
-    def forward(self, L_y_: "f32[2, 2]", L_x_: "f32[2, 2]"):
-        l_y_ = L_y_
+    def forward(self, L_x_: "f32[2, 2]", L_y_: "f32[2, 2]"):
         l_x_ = L_x_
+        l_y_ = L_y_
 
-        detach: "f32[2, 2]" = l_y_.detach()
+        _get_data_attr: "f32[2, 2]" = torch._C._autograd._get_data_attr(l_y_)
 
-        _set_grad_enabled = torch._C._set_grad_enabled(False)
+        _set_grad_enabled = torch._C._set_grad_enabled(False);  _set_grad_enabled = None
 
-        set_: "f32[2, 2]" = torch_Tensor_set_(l_x_, detach);  detach = None
+        shallow_copy_data_: "f32[2, 2]" = torch.ops.aten.shallow_copy_data_(l_x_, _get_data_attr);  _get_data_attr = shallow_copy_data_ = None
 
-        _set_grad_enabled_1 = torch._C._set_grad_enabled(True)
-
-        _lower_version_count_by_1 = torch__dynamo_variables_builtin__lower_version_count_by_1(set_);  set_ = None
+        _set_grad_enabled_1 = torch._C._set_grad_enabled(True);  _set_grad_enabled_1 = None
 
         mul: "f32[2, 2]" = l_x_ * l_y_;  l_x_ = l_y_ = None
         return (mul,)
 """,
         )
 
-    # Note - this does not actually get captured in the graph yet.
-    # The plan of record is to introduce a set_data op, entirely subsume the operation into a call_function
-    # in the fx graph, and let aot_autograd handle it.
+    # See [Note: set_data_on_scoped_tensor] This does not actually get captured in the graph yet.
     def test_set_data_on_scoped_tensor(self):
         def fn(x):
             z = torch.zeros([4, 4])
@@ -351,7 +349,7 @@ class GraphModule(torch.nn.Module):
 
         counter = CompileCounter()
 
-        fn = torch._dynamo.optimize(counter, nopython=False)(fn)
+        fn = torch.compile(fn, backend=counter, fullgraph=False)
 
         compile_result = fn(x)
         self.assertEqual(compile_result, eager_result)
@@ -378,8 +376,8 @@ class GraphModule(torch.nn.Module):
         counter = CompileCounter()
 
         mudc_2 = MyUserDefinedClass(x, y)
-        do_some_setattr_stuff = torch._dynamo.optimize(counter, nopython=True)(
-            mudc_2.do_some_setattr_stuff
+        do_some_setattr_stuff = torch.compile(
+            mudc_2.do_some_setattr_stuff, backend=counter, fullgraph=True
         )
 
         compile_result = do_some_setattr_stuff()

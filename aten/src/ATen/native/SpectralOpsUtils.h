@@ -21,7 +21,7 @@ enum class fft_norm_mode {
 // NOTE [ Fourier Transform Conjugate Symmetry ]
 //
 // Real-to-complex Fourier transform satisfies the conjugate symmetry. That is,
-// assuming X is the transformed K-dimensionsal signal, we have
+// assuming X is the transformed K-dimensional signal, we have
 //
 //     X[i_1, ..., i_K] = X[j_i, ..., j_K]*,
 //
@@ -63,7 +63,7 @@ inline int64_t infer_ft_complex_to_real_onesided_size(int64_t complex_size,
     std::ostringstream ss;
     ss << "expected real signal size " << expected_size << " is incompatible "
        << "with onesided complex frequency size " << complex_size;
-    AT_ERROR(ss.str());
+    TORCH_CHECK(false, std::move(ss).str());
   }
 }
 
@@ -71,7 +71,7 @@ using fft_fill_with_conjugate_symmetry_fn =
     void (*)(ScalarType dtype, IntArrayRef mirror_dims, IntArrayRef half_sizes,
              IntArrayRef in_strides, const void* in_data,
              IntArrayRef out_strides, void* out_data);
-DECLARE_DISPATCH(fft_fill_with_conjugate_symmetry_fn, fft_fill_with_conjugate_symmetry_stub);
+DECLARE_DISPATCH(fft_fill_with_conjugate_symmetry_fn, fft_fill_with_conjugate_symmetry_stub)
 
 // In real-to-complex transform, cuFFT and MKL only fill half of the values
 // due to conjugate symmetry. This function fills in the other half of the full

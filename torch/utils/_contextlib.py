@@ -1,26 +1,61 @@
+# mypy: allow-untyped-defs
 # Extra utilities for working with context managers that should have been
 # in the standard library but are not
 
 import functools
 import inspect
-import warnings
 import sys
-from typing import Any, Callable, TypeVar, cast
+import warnings
+from collections.abc import Callable
+from typing import Any, cast, overload, Self, TypeVar
+
 
 # Used for annotating the decorator usage of _DecoratorContextManager (e.g.,
 # 'no_grad' and 'enable_grad').
 # See https://mypy.readthedocs.io/en/latest/generics.html#declaring-decorators
 FuncType = Callable[..., Any]
-F = TypeVar('F', bound=FuncType)
+F = TypeVar("F", bound=FuncType)
 
 
-def _wrap_generator(ctx_factory, func):
+def _context_manager_name(ctx) -> str:
+    if isinstance(ctx, functools.partial):
+        return _context_manager_name(ctx.func)
+
+    if not callable(ctx):
+        return type(ctx).__name__
+
+    context_manager = getattr(ctx, "__self__", None)
+    if (
+        context_manager is not None
+        and hasattr(context_manager, "__enter__")
+        and hasattr(context_manager, "__exit__")
+    ):
+        return type(context_manager).__name__
+
+    for attr in ("__qualname__", "__name__"):
+        name = getattr(ctx, attr, None)
+        if isinstance(name, str):
+            return name
+
+    return type(ctx).__name__
+
+
+def _set_stack_frame_name(func, name: str) -> None:
+    code = func.__code__
+    code_attrs = {"co_name": name}
+    if hasattr(code, "co_qualname"):
+        code_attrs["co_qualname"] = name
+    func.__code__ = code.replace(**code_attrs)
+
+
+def _wrap_generator(ctx_factory, func, ctx_name):
     """
     Wrap each generator invocation with the context manager factory.
 
     The input should be a function that returns a context manager,
     not a context manager itself, to handle one-shot context managers.
     """
+
     @functools.wraps(func)
     def generator_context(*args, **kwargs):
         gen = func(*args, **kwargs)
@@ -63,6 +98,7 @@ def _wrap_generator(ctx_factory, func):
             # by returning it (see docs for python's return-statement).
             return e.value
 
+    _set_stack_frame_name(generator_context, ctx_name)
     return generator_context
 
 
@@ -82,17 +118,20 @@ def context_decorator(ctx, func):
     be a multi-shot context manager that can be directly invoked multiple times)
     or a callable that produces a context manager.
     """
-    assert not (callable(ctx) and hasattr(ctx, '__enter__')), (
-        f"Passed in {ctx} is both callable and also a valid context manager "
-        "(has __enter__), making it ambiguous which interface to use.  If you "
-        "intended to pass a context manager factory, rewrite your call as "
-        "context_decorator(lambda: ctx()); if you intended to pass a context "
-        "manager directly, rewrite your call as context_decorator(lambda: ctx)"
-    )
+    if callable(ctx) and hasattr(ctx, "__enter__"):
+        raise AssertionError(
+            f"Passed in {ctx} is both callable and also a valid context manager "
+            "(has __enter__), making it ambiguous which interface to use.  If you "
+            "intended to pass a context manager factory, rewrite your call as "
+            "context_decorator(lambda: ctx()); if you intended to pass a context "
+            "manager directly, rewrite your call as context_decorator(lambda: ctx)"
+        )
 
     if not callable(ctx):
+
         def ctx_factory():
             return ctx
+
     else:
         ctx_factory = ctx
 
@@ -106,14 +145,18 @@ def context_decorator(ctx, func):
             "individually."
         )
 
+    ctx_name = _context_manager_name(ctx)
+
     if inspect.isgeneratorfunction(func):
-        return _wrap_generator(ctx_factory, func)
+        return _wrap_generator(ctx_factory, func, ctx_name)
 
     @functools.wraps(func)
     def decorate_context(*args, **kwargs):
+        # pyrefly: ignore [bad-context-manager]
         with ctx_factory():
             return func(*args, **kwargs)
 
+    _set_stack_frame_name(decorate_context, ctx_name)
     return decorate_context
 
 
@@ -122,10 +165,14 @@ class _DecoratorContextManager:
 
     def __call__(self, orig_func: F) -> F:
         if inspect.isclass(orig_func):
-            warnings.warn("Decorating classes is deprecated and will be disabled in "
-                          "future versions. You should only decorate functions or methods. "
-                          "To preserve the current behavior of class decoration, you can "
-                          "directly decorate the `__init__` method and nothing else.")
+            warnings.warn(
+                "Decorating classes is deprecated and will be disabled in "
+                "future versions. You should only decorate functions or methods. "
+                "To preserve the current behavior of class decoration, you can "
+                "directly decorate the `__init__` method and nothing else.",
+                FutureWarning,
+                stacklevel=2,
+            )
             func = cast(F, lambda *args, **kwargs: orig_func(*args, **kwargs))
         else:
             func = orig_func
@@ -146,7 +193,12 @@ class _DecoratorContextManager:
 class _NoParamDecoratorContextManager(_DecoratorContextManager):
     """Allow a context manager to be used as a decorator without parentheses."""
 
-    def __new__(cls, orig_func=None):
+    @overload
+    def __new__(cls, orig_func: F) -> F: ...  # type: ignore[misc]
+    @overload
+    def __new__(cls, orig_func: None = None) -> Self: ...
+
+    def __new__(cls, orig_func: F | None = None) -> Self | F:  # type: ignore[misc]
         if orig_func is None:
             return super().__new__(cls)
         return cls()(orig_func)

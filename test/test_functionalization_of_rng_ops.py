@@ -1,37 +1,45 @@
 # Owner(s): ["oncall: pt2"]
+import functools
 import sys
 import unittest
+from unittest.mock import patch
+
 import torch
-from torch.testing._internal.common_utils import (
-    TestCase,
-    run_tests,
+import torch.utils.checkpoint
+from functorch.compile import aot_function, min_cut_rematerialization_partition, nop
+
+from torch.testing._internal.common_device_type import (
+    dtypes,
+    instantiate_device_type_tests,
 )
 
-from torch.testing._internal.common_device_type import instantiate_device_type_tests, dtypes
-from functorch.compile import aot_function, nop, min_cut_rematerialization_partition
-from unittest.mock import patch
-import functools
-import torch.utils.checkpoint
-
-
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     IS_CI,
     IS_WINDOWS,
+    run_tests,
+    TestCase,
 )
 
 if IS_WINDOWS and IS_CI:
-    sys.stderr.write(
-        "torch.compile not supported on windows"
-    )
+    sys.stderr.write("torch.compile not supported on windows")
     if __name__ == "__main__":
         sys.exit(0)
     raise unittest.SkipTest("torch.compile not supported on windows")
 
+
 def count_philox_rand(gm, args, freq):
-    assert [node.target for node in gm.graph.nodes].count(torch.ops.rngprims.philox_rand.default) == freq
+    count = [node.target for node in gm.graph.nodes].count(
+        torch.ops.rngprims.philox_rand.default
+    )
+    if count != freq:
+        raise AssertionError(f"expected {freq} philox_rand ops, got {count}")
     return gm
 
+
 class TestFunctionalizationRngOps(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_rand_like(self, dtype, device):
@@ -72,8 +80,6 @@ class TestFunctionalizationRngOps(TestCase):
 
             self.assertEqual(ref, res)
 
-
-
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_rand_like_dynamic_bwd(self, dtype, device):
@@ -95,7 +101,6 @@ class TestFunctionalizationRngOps(TestCase):
             res.sum().backward()
 
             self.assertEqual(ref, res)
-
 
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
@@ -134,14 +139,14 @@ class TestFunctionalizationRngOps(TestCase):
 
             @staticmethod
             def backward(ctx, grad_out):
-                x, = ctx.saved_tensors
+                (x,) = ctx.saved_tensors
                 return grad_out * torch.rand_like(grad_out) * torch.cos(x)
 
         custom = Custom.apply
 
         x = torch.rand(*shape, device=device, dtype=dtype, requires_grad=True)
 
-        x_clone = x.clone().detach().requires_grad_(True)
+        x_clone = x.detach().clone().requires_grad_(True)
 
         torch.cuda.manual_seed(123)
         ref = custom(x)
@@ -174,7 +179,7 @@ class TestFunctionalizationRngOps(TestCase):
 
             @staticmethod
             def backward(ctx, grad_out):
-                x, = ctx.saved_tensors
+                (x,) = ctx.saved_tensors
                 return grad_out * torch.rand_like(grad_out) * torch.cos(x)
 
         class CustomOp2(torch.autograd.Function):
@@ -186,9 +191,8 @@ class TestFunctionalizationRngOps(TestCase):
 
             @staticmethod
             def backward(ctx, grad_out):
-                x, = ctx.saved_tensors
+                (x,) = ctx.saved_tensors
                 return grad_out * torch.rand_like(grad_out) * torch.rand_like(x)
-
 
         custom_op1 = CustomOp1.apply
         custom_op2 = CustomOp2.apply
@@ -210,11 +214,10 @@ class TestFunctionalizationRngOps(TestCase):
             b = a.sin()
             return aot_custom_op2(b)
 
-
         for seed in range(10):
             torch.cuda.manual_seed(seed)
             x = torch.rand(*shape, device=device, dtype=dtype, requires_grad=True)
-            x_clone = x.clone().detach().requires_grad_(True)
+            x_clone = x.detach().clone().requires_grad_(True)
 
             torch.cuda.manual_seed(seed)
             ref = fn(x)
@@ -265,10 +268,9 @@ class TestFunctionalizationRngOps(TestCase):
             a = torch.sin(a)
             return a
 
-
         x = torch.rand(*shape, device=device, dtype=dtype, requires_grad=True)
 
-        x_clone = x.clone().detach().requires_grad_(True)
+        x_clone = x.detach().clone().requires_grad_(True)
 
         torch.cuda.manual_seed(123)
         ref = fn(x)
@@ -277,7 +279,12 @@ class TestFunctionalizationRngOps(TestCase):
         torch.cuda.manual_seed(123)
         fwd_compiler = functools.partial(count_philox_rand, freq=2)
         bwd_compiler = functools.partial(count_philox_rand, freq=0)
-        aot_custom = aot_function(fn, fwd_compiler, bwd_compiler, partition_fn=min_cut_rematerialization_partition)
+        aot_custom = aot_function(
+            fn,
+            fwd_compiler,
+            bwd_compiler,
+            partition_fn=min_cut_rematerialization_partition,
+        )
         # aot_custom = aot_function(fn, fwd_compiler, bwd_compiler)
         res = aot_custom(x_clone)
         res.sum().backward()
@@ -299,13 +306,13 @@ class TestFunctionalizationRngOps(TestCase):
         x = torch.ones(2, 2, device="cuda", requires_grad=True)
         y = torch.rand(2, 2, device="cuda", requires_grad=True)
         torch.cuda.manual_seed(123)
-        ref = fn(x, y)
+        fn(x, y)
 
-        # With checkpointing we should recompute dropout in bwd, and should see philox_rand
+        # With checkpointing we should recompute dropout in bwd, and philox_rand is passed from fwd
         fwd_compiler = functools.partial(count_philox_rand, freq=1)
-        bwd_compiler = functools.partial(count_philox_rand, freq=1)
+        bwd_compiler = functools.partial(count_philox_rand, freq=0)
         aot_fn = aot_function(fn, fwd_compiler, bwd_compiler)
-        # We cant check accuracy here because rand_like generated different rand numbers than dropout
+        # We can't check accuracy here because rand_like generated different rand numbers than dropout
         res = aot_fn(x, y)
         res.sum().backward()
 
@@ -319,15 +326,61 @@ class TestFunctionalizationRngOps(TestCase):
 
         # Ensure the decomp is happening
         aot_fn = aot_function(fn, functools.partial(count_philox_rand, freq=1))
-        # We cant check accuracy here because rand_like generated different rand numbers than dropout
+        # We can't check accuracy here because rand_like generated different rand numbers than dropout
         aot_fn(x)
 
+    @dtypes(torch.float32)
+    def test_checkpoint_with_unused_rng_in_backward(self, dtype, device):
+        # Test that RNG ops in checkpointed regions that are not needed for
+        # backward computation don't cause KeyError in functionalize_rng_ops.
+        #
+        # This reproduces a bug where rand is used in an additive way:
+        #   rand = torch.rand(...)
+        #   result = x + rand * scale
+        #
+        # The gradient of addition doesn't depend on the VALUE of rand,
+        # only on its shape. So backward doesn't need to recompute rand,
+        # and it gets eliminated from the backward graph by DCE.
+        # But functionalize_rng_ops was assuming all recomputable RNG ops
+        # exist in both forward and backward graphs.
 
-only_for = ("cuda",)
-instantiate_device_type_tests(TestFunctionalizationRngOps, globals(), only_for=only_for)
+        def g(x):
+            # rand used additively - NOT needed in backward
+            # (gradient of add doesn't depend on the value)
+            # This pattern matches real-world jitter/noise augmentation
+            noise = torch.rand(x.shape[0], 1, device=x.device, dtype=x.dtype)
+            x = x + noise * 1.0
+            return x
+
+        def fn(x):
+            return torch.utils.checkpoint.checkpoint(g, x, use_reentrant=False)
+
+        x = torch.ones(2, 4, device=device, dtype=dtype, requires_grad=True)
+        x_clone = x.detach().clone().requires_grad_(True)
+
+        # Use torch.compile to trigger the same code path as the original error
+        ref_fn = torch.compile(g, backend="aot_eager")
+        torch.manual_seed(123)
+        ref = ref_fn(x_clone)
+        ref.sum().backward()
+
+        torch.manual_seed(123)
+        compiled_fn = torch.compile(fn, backend="aot_eager")
+        res = compiled_fn(x)
+        # This should not raise KeyError: 'rand' in functionalize_rng_ops
+        res.sum().backward()
+
+        # check results match the non-checkpoint case
+        self.assertEqual(ref, res)
+        self.assertEqual(x.grad, x_clone.grad)
+
+
+instantiate_device_type_tests(TestFunctionalizationRngOps, globals(), only_for="cuda")
 
 
 class NegativeTest(TestCase):
+    hw_classification = HardwareClassification.CPU
+
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_on_cpu(self, dtype, device):
@@ -343,8 +396,7 @@ class NegativeTest(TestCase):
             aot_fn(x)
 
 
-only_for = ("cpu",)
-instantiate_device_type_tests(NegativeTest, globals(), only_for=only_for)
+instantiate_device_type_tests(NegativeTest, globals(), only_for="cpu")
 
 if __name__ == "__main__":
     run_tests()

@@ -8,10 +8,6 @@
 // Cover codegen'd unboxing logic for these types:
 //'Device',
 //'Device?',
-//'Dimname',
-//'Dimname[1]',
-//'Dimname[]',
-//'Dimname[]?',
 //'Generator?',
 //'Layout?',
 //'MemoryFormat',
@@ -197,7 +193,7 @@ TEST(LiteInterpreterTest, MultipleOps) {
   auto testModelFile = "ModelWithMultipleOps.ptl";
 
   // class ModelWithMultipleOps(torch.nn.Module):
-  //     def __init__(self):
+  //     def __init__(self) -> None:
   //         super().__init__()
   //         self.ops = torch.nn.Sequential(
   //             torch.nn.ReLU(),

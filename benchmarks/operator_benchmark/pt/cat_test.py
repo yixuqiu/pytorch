@@ -1,9 +1,8 @@
 import random
-from typing import List
-
-import torch
 
 import operator_benchmark as op_bench
+
+import torch
 
 
 """Microbenchmarks for Cat operator"""
@@ -126,7 +125,7 @@ class CatBenchmark(op_bench.TorchBenchmarkBase):
         random.seed(42)
         inputs = []
         gen_sizes = []
-        if type(sizes) == list and N == -1:
+        if type(sizes) is list and N == -1:
             gen_sizes = sizes
         else:
             for i in range(N):
@@ -143,7 +142,7 @@ class CatBenchmark(op_bench.TorchBenchmarkBase):
         self.inputs = {"result": result, "inputs": inputs, "dim": dim}
         self.set_module_name("cat")
 
-    def forward(self, result: torch.Tensor, inputs: List[torch.Tensor], dim: int):
+    def forward(self, result: torch.Tensor, inputs: list[torch.Tensor], dim: int):
         return torch.cat(inputs, dim=dim, out=result)
 
 

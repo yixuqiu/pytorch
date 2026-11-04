@@ -1,11 +1,9 @@
 #include <ATen/ATen.h>
 #include <ATen/NestedTensorImpl.h>
 #include <ATen/native/nested/NestedTensorTransformerUtils.h>
-#include <iostream>
 #include <tuple>
-namespace at {
-namespace native {
-namespace preprocessing {
+
+namespace at::native::preprocessing {
 
 namespace {
 
@@ -15,12 +13,12 @@ namespace {
  * on device. And all we need on CPU to launch the kernel is NNz. We could refactor the
  * the below function but it adds more complexity than I think is needed.
  */
-int64_t get_nnz(Tensor nestedtensor) {
+int64_t get_nnz(const Tensor& nestedtensor) {
   auto* nt_impl = get_nested_tensor_impl(nestedtensor);
   const auto& sizes = nt_impl->get_nested_sizes();
   auto size_tensor_stride = sizes.stride(0);
   const int64_t batch_size = nestedtensor.size(0);
-  auto* sizes_ptr = sizes.data_ptr<int64_t>();
+  const auto* sizes_ptr = sizes.const_data_ptr<int64_t>();
   int64_t cumulative_sequence_length = 0;
   for (const auto i : c10::irange(batch_size)) {
     // Calculate the cumulative sum of the sequence lengths
@@ -39,7 +37,7 @@ int64_t get_nnz(Tensor nestedtensor) {
    * @return A tuple of cumulative sequence lengths and the maximum sequence
    * length, and the last element in the cumulative_sequence_lengths
    */
-  std::tuple<Tensor, int64_t, int64_t> cumulative_and_max_seq_len_nnz(Tensor qkv) {
+  std::tuple<Tensor, int64_t, int64_t> cumulative_and_max_seq_len_nnz(const Tensor& qkv) {
     TORCH_CHECK(
         qkv.is_nested(),
         "QKV must be nested for flash cumulative_seq_len calculation.")
@@ -51,17 +49,17 @@ int64_t get_nnz(Tensor nestedtensor) {
     auto cumulative_seqlen = at::zeros(
         {batch_size + 1}, TensorOptions().device(at::kCPU).dtype(at::kInt));
 
-    auto* sizes_ptr = sizes.data_ptr<int64_t>();
-    auto* cumulative_seqlen_ptr = cumulative_seqlen.data_ptr<int32_t>();
+    const auto* sizes_ptr = sizes.const_data_ptr<int64_t>();
+    auto* cumulative_seqlen_ptr = cumulative_seqlen.mutable_data_ptr<int32_t>();
 
-    int32_t sum = 0;
+    int64_t sum = 0;
     int64_t max_seqlen = -1;
-    cumulative_seqlen_ptr[0] = sum;
+    cumulative_seqlen_ptr[0] = static_cast<int32_t>(sum);
     for (const auto i : c10::irange(batch_size)) {
       // Calculate the cumulative sum of the sequence lengths
       auto current_seq_len = sizes_ptr[(i * size_tensor_stride)];
       sum += current_seq_len;
-      cumulative_seqlen_ptr[i + 1] = sum;
+      cumulative_seqlen_ptr[i + 1] = static_cast<int32_t>(sum);
 
       // Find the max element while we traverse
       max_seqlen = std::max(max_seqlen, current_seq_len);
@@ -86,13 +84,14 @@ int64_t get_nnz(Tensor nestedtensor) {
    */
   bool is_safe_to_get_storage_as_tensor(const NestedTensorImpl* tensor) {
     const int64_t* tensor_offsets_ptr =
-        tensor->get_storage_offsets().data_ptr<int64_t>();
+        tensor->get_storage_offsets().const_data_ptr<int64_t>();
     const Tensor& tensor_sizes = tensor->get_nested_sizes();
     const Tensor& tensor_strides = tensor->get_nested_strides();
 
     const int64_t n_tensors = tensor_strides.size(0);
-    constexpr int64_t n_dims = 3;
+    constexpr int n_dims = 3;
     // This is safe since head_dim is assured to be consistent
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     const int64_t num_heads = tensor -> opt_size(2).value();
     const int64_t tensor_stride_0 = tensor_strides.stride(0);
 
@@ -100,7 +99,7 @@ int64_t get_nnz(Tensor nestedtensor) {
       return true;
     }
 
-    int64_t* previous_tensor_stride = tensor_strides.data_ptr<int64_t>();
+    const int64_t* previous_tensor_stride = tensor_strides.const_data_ptr<int64_t>();
 
     // Check initially that the first tensor's strides
     // are in strictly descending order
@@ -122,7 +121,7 @@ int64_t get_nnz(Tensor nestedtensor) {
         }
       }
       // Check that each tensor i in the nested tensor has the same strides
-      for (int i{1}; i < n_tensors; i++) {
+      for (int64_t i{1}; i < n_tensors; i++) {
         for (const int64_t j : c10::irange(n_dims)) {
           if (previous_tensor_stride[j] !=
               previous_tensor_stride[i * tensor_stride_0 + j]) {
@@ -134,9 +133,8 @@ int64_t get_nnz(Tensor nestedtensor) {
 
     // Check the offsets are a constant multiple from the previous numels
     const int64_t* tensor_size_ptr = tensor_sizes.const_data_ptr<int64_t>();
-    const int64_t* tensor_stride_ptr = tensor_strides.const_data_ptr<int64_t>();
 
-    int64_t numel_0 = (tensor_size_ptr[0] * tensor_stride_ptr[0]);
+    int64_t numel_0 = (tensor_size_ptr[0] * previous_tensor_stride[0]);
     TORCH_INTERNAL_ASSERT(numel_0 > 0, "numels must be positive!");
 
     int64_t offset_constant =
@@ -145,7 +143,7 @@ int64_t get_nnz(Tensor nestedtensor) {
       // TODO: When 0 seq_len nested tensors are allowed we need to guard
       // against this
       int64_t previous_numel = tensor_size_ptr[(i - 1) * tensor_stride_0] *
-          tensor_stride_ptr[(i - 1) * tensor_stride_0];
+          previous_tensor_stride[(i - 1) * tensor_stride_0];
       TORCH_INTERNAL_ASSERT(previous_numel > 0, "numels must be positive!");
       int64_t current_offset_constant =
           (tensor_offsets_ptr[i] - tensor_offsets_ptr[i - 1]) / previous_numel;
@@ -181,9 +179,9 @@ int64_t get_nnz(Tensor nestedtensor) {
 
     constexpr int64_t head_dim_stride = 1;
     const int64_t* nt_strides =
-        tensor_impl->get_nested_strides().data_ptr<int64_t>();
+        tensor_impl->get_nested_strides().const_data_ptr<int64_t>();
     const int64_t* nt_offsets_ptr =
-        tensor_impl->get_storage_offsets().data_ptr<int64_t>();
+        tensor_impl->get_storage_offsets().const_data_ptr<int64_t>();
 
     const int64_t nnz_stride = nt_strides[0];
     const int64_t head_stride = num_heads_needs_broadcast ? 0 : nt_strides[1];
@@ -246,7 +244,7 @@ int64_t get_nnz(Tensor nestedtensor) {
     //     this is because needs_broadcast indicates that the batch_size is 1
     //     and hence there is only 1 value for seq_len
     // (2) The cum_seq_lens are given by [0, {*}_t.size(1), 2 * {*}_t.size(1),
-    // ..., outut_batch_size * {*}_t.size(1)] (3) Nnz_{*} is given by
+    // ..., output_batch_size * {*}_t.size(1)] (3) Nnz_{*} is given by
     // output_batch_size * {*}_t.size(1);
 
     int64_t max_seqlen_batch_q = 0, Nnz_q = 0;
@@ -260,11 +258,7 @@ int64_t get_nnz(Tensor nestedtensor) {
           TensorOptions().device(at::kCUDA).dtype(at::kInt));
       Nnz_q = output_batch_size * max_seqlen_batch_q;
     } else {
-      auto cumulative_and_max_q_and_nnz_q = cumulative_and_max_seq_len_nnz(q_t);
-      cumulative_sequence_length_q =
-          std::get<0>(cumulative_and_max_q_and_nnz_q);
-      max_seqlen_batch_q = std::get<1>(cumulative_and_max_q_and_nnz_q);
-      Nnz_q = std::get<2>(cumulative_and_max_q_and_nnz_q);
+      std::tie(cumulative_sequence_length_q, max_seqlen_batch_q, Nnz_q) = cumulative_and_max_seq_len_nnz(q_t);
     }
 
     int64_t max_seqlen_batch_kv = 0, Nnz_kv = 0;
@@ -279,13 +273,10 @@ int64_t get_nnz(Tensor nestedtensor) {
           TensorOptions().device(at::kCUDA).dtype(at::kInt));
       Nnz_kv = output_batch_size * max_seqlen_batch_kv;
     } else {
-      auto cumulative_and_max_kv_and_nnz_kv = k_batch_size_needs_broadcast
+      std::tie(cumulative_sequence_length_kv, max_seqlen_batch_kv, Nnz_kv) =
+      k_batch_size_needs_broadcast
           ? cumulative_and_max_seq_len_nnz(v_t)
           : cumulative_and_max_seq_len_nnz(k_t);
-      cumulative_sequence_length_kv =
-          std::get<0>(cumulative_and_max_kv_and_nnz_kv);
-      max_seqlen_batch_kv = std::get<1>(cumulative_and_max_kv_and_nnz_kv);
-      Nnz_kv = std::get<2>(cumulative_and_max_kv_and_nnz_kv);
     }
 
     bool q_num_heads_needs_broadcast = q_num_heads != output_num_heads;
@@ -371,14 +362,14 @@ int64_t get_nnz(Tensor nestedtensor) {
     }
 
     return std::make_tuple(
-        query_buffer_reshaped,
-        key_buffer_reshaped,
-        value_buffer_reshaped,
-        cumulative_sequence_length_q,
-        cumulative_sequence_length_kv,
+        std::move(query_buffer_reshaped),
+        std::move(key_buffer_reshaped),
+        std::move(value_buffer_reshaped),
+        std::move(cumulative_sequence_length_q),
+        std::move(cumulative_sequence_length_kv),
         max_seqlen_batch_q,
         max_seqlen_batch_kv,
-        output_shape);
+        std::move(output_shape));
   }
 
 } // namespace
@@ -412,24 +403,8 @@ sdpa_nested_preprocessing(
   Tensor k_t = key.transpose(1, 2);
   Tensor v_t = value.transpose(1, 2);
 
-  auto cumulative_and_max_q_and_nnz_q = cumulative_and_max_seq_len_nnz(q_t);
-  auto cumulative_and_max_kv_and_nnz_kv = cumulative_and_max_seq_len_nnz(k_t);
-
-  // [TODO] K and V have to have the same Nnz, should probably torch_check
-  // assume in order to not iterate over v
-
-  Tensor cumulative_sequence_length_q =
-      std::get<0>(cumulative_and_max_q_and_nnz_q);
-  Tensor cumulative_sequence_length_kv =
-      std::get<0>(cumulative_and_max_kv_and_nnz_kv);
-
-  const int64_t max_seqlen_batch_q =
-      std::get<1>(cumulative_and_max_q_and_nnz_q);
-  const int64_t max_seqlen_batch_kv =
-      std::get<1>(cumulative_and_max_kv_and_nnz_kv);
-
-  const int64_t Nnz_q = std::get<2>(cumulative_and_max_q_and_nnz_q);
-  const int64_t Nnz_kv = std::get<2>(cumulative_and_max_kv_and_nnz_kv);
+  auto [cumulative_sequence_length_q, max_seqlen_batch_q, Nnz_q] = cumulative_and_max_seq_len_nnz(q_t);
+  auto [cumulative_sequence_length_kv, max_seqlen_batch_kv, Nnz_kv]= cumulative_and_max_seq_len_nnz(k_t);
 
   Tensor query_buffer_reshaped;
   Tensor key_buffer_reshaped;
@@ -462,14 +437,14 @@ sdpa_nested_preprocessing(
   }
 
   return std::make_tuple(
-      query_buffer_reshaped,
-      key_buffer_reshaped,
-      value_buffer_reshaped,
-      cumulative_sequence_length_q,
-      cumulative_sequence_length_kv,
+      std::move(query_buffer_reshaped),
+      std::move(key_buffer_reshaped),
+      std::move(value_buffer_reshaped),
+      std::move(cumulative_sequence_length_q),
+      std::move(cumulative_sequence_length_kv),
       max_seqlen_batch_q,
       max_seqlen_batch_kv,
-      output_shape);
+      std::move(output_shape));
 }
 
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
@@ -555,13 +530,11 @@ sdpa_nested_preprocessing_backward(
   }
 
   return std::make_tuple(
-      grad_out_buffer_reshaped,
-      query_buffer_reshaped,
-      key_buffer_reshaped,
-      value_buffer_reshaped,
-      output_buffer_reshaped);
+      std::move(grad_out_buffer_reshaped),
+      std::move(query_buffer_reshaped),
+      std::move(key_buffer_reshaped),
+      std::move(value_buffer_reshaped),
+      std::move(output_buffer_reshaped));
 }
 
-} // namespace preprocessing
-} // namespace native
-} // namespace at
+} // namespace at::native::preprocessing

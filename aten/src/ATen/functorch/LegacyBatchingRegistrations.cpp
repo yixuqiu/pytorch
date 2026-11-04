@@ -6,16 +6,13 @@
 
 #include <torch/library.h>
 #include <ATen/native/ResizeCommon.h>
-#include <ATen/ATen.h>
 #include <ATen/native/TensorShape.h>
 
-#include <ATen/NestedTensorImpl.h>
 #include <ATen/functorch/DynamicLayer.h>
-#include <ATen/functorch/TensorWrapper.h>
-#include <ATen/functorch/BatchingMetaprogramming.h>
 #include <ATen/functorch/LegacyVmapTransforms.h>
 #include <ATen/functorch/BatchedFallback.h>
 #include <ATen/functorch/BatchRulesHelper.h>
+#include <ATen/WrapDimUtils.h>
 
 #include <utility>
 
@@ -68,18 +65,18 @@ namespace at::functorch {
 
 namespace{
 // PyTorch allows operations to specify dim 0 and dim -1 on a scalar tensor.
-static bool is_allowed_dim_on_scalar_tensor(int64_t dim) {
+bool is_allowed_dim_on_scalar_tensor(int64_t dim) {
   return dim == 0 || dim == -1;
 }
 
-static int64_t get_current_level() {
+int64_t get_current_level() {
   auto maybe_level = maybeCurrentDynamicLayer();
   TORCH_INTERNAL_ASSERT(maybe_level.has_value());
   return maybe_level->layerId();
 }
 
 // This check should probably go into the dispatcher...
-static bool participatesInCurrentLevel(const Tensor& self) {
+bool participatesInCurrentLevel(const Tensor& self) {
   auto current_level = get_current_level();
   auto* maybe_batched_impl = maybeGetBatchedImpl(self);
   if (!maybe_batched_impl) {
@@ -90,7 +87,7 @@ static bool participatesInCurrentLevel(const Tensor& self) {
   return self_level == current_level;
 }
 
-static bool participatesInCurrentLevel(ITensorListRef self) {
+bool participatesInCurrentLevel(ITensorListRef self) {
   for (const Tensor& tensor : self) {
     if (participatesInCurrentLevel(tensor)) {
       return true;
@@ -157,7 +154,7 @@ Tensor& squeeze__batching_rule(Tensor& self) {
   const auto physical_shape = batched->value().sizes();
   auto how_many_dims_of_size_1_before_bdim = 0;
   for (const auto i : c10::irange(0, physical_shape.size())) {
-    if ((int64_t)i == bdim) {
+    if (static_cast<int64_t>(i) == bdim) {
       break;
     }
     if (physical_shape[i] == 1) {
@@ -285,11 +282,11 @@ std::vector<Tensor> unbind_batching_rule(const Tensor& self, int64_t dim) {
 // given (sizes, strides, storage_offset) returns the maximum location that
 // can be indexed (or nullopt if such a location doesn't exist, e.g., tensors
 // with zero-size dims).
-static optional<c10::SymInt> maximum_indexable_location(
+std::optional<c10::SymInt> maximum_indexable_location(
     c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, const c10::SymInt& storage_offset) {
   auto result = native::storage_size_for(sizes, strides);
   if (result == 0) {
-    return nullopt;
+    return std::nullopt;
   }
   return result + storage_offset;
 }
@@ -298,12 +295,12 @@ static optional<c10::SymInt> maximum_indexable_location(
 // This checks that the range of possible memory locations accessible by
 // x.as_strided(sizes, strides, maybe_storage_offset)
 // are within the bounds of possible memory locations accessible by x.
-static void checkBasicAsStridedValidForSlice(
+void checkBasicAsStridedValidForSlice(
     const Tensor& physical_tensor,
     int64_t num_batch_dims,
     c10::SymIntArrayRef sizes,
     c10::SymIntArrayRef strides,
-    const optional<c10::SymInt>& maybe_storage_offset) {
+    const std::optional<c10::SymInt>& maybe_storage_offset) {
   auto slice_sizes = physical_tensor.sym_sizes().slice(num_batch_dims);
   auto slice_strides = physical_tensor.sym_strides().slice(num_batch_dims);
   auto base_offset = physical_tensor.sym_storage_offset();
@@ -361,7 +358,7 @@ Tensor as_strided_batching_rule(
     const Tensor& tensor,
     c10::SymIntArrayRef sizes,
     c10::SymIntArrayRef strides,
-    optional<c10::SymInt> storage_offset) {
+    std::optional<c10::SymInt> storage_offset) {
   if (!participatesInCurrentLevel(tensor)) {
     c10::impl::ExcludeDispatchKeyGuard guard(DispatchKey::FuncTorchBatched);
     return at::as_strided_symint(tensor, sizes, strides, std::move(storage_offset));
@@ -536,7 +533,7 @@ Tensor cat_batching_rule(const ITensorListRef& tensors, int64_t dim) {
   // we'll just slice the tensor to get a Tensor of shape [0] to pass to at::cat.
   std::vector<Tensor> tensors_to_cat;
   tensors_to_cat.reserve(tensors.size());
-  c10::optional<int64_t> bdim_size = c10::nullopt;
+  std::optional<int64_t> bdim_size = std::nullopt;
 
   // find the bdim size. Might not exist if all BatchedTensors should be skipped
   // by cat's special case.
@@ -573,7 +570,7 @@ Tensor cat_batching_rule(const ITensorListRef& tensors, int64_t dim) {
   }
 
   auto new_dim = bdim_size.has_value() ? dim + 1 : dim;
-  c10::optional<int64_t> new_bdim = bdim_size.has_value() ? c10::make_optional((int64_t)0) : nullopt;
+  std::optional<int64_t> new_bdim = bdim_size.has_value() ? std::make_optional(static_cast<int64_t>(0)) : std::nullopt;
   auto result = at::cat(tensors_to_cat, new_dim);
   return makeBatched(result, new_bdim, get_current_level());
 }
@@ -628,10 +625,10 @@ Tensor new_empty_strided_batching_rule(
     const Tensor& self,
     SymIntArrayRef sym_size,
     SymIntArrayRef sym_stride,
-    optional<ScalarType> dtype,
-    optional<Layout> layout,
-    optional<Device> device,
-    optional<bool> pin_memory) {
+    std::optional<ScalarType> dtype,
+    std::optional<Layout> layout,
+    std::optional<Device> device,
+    std::optional<bool> pin_memory) {
 
   auto size = C10_AS_INTARRAYREF_SLOW(sym_size);
   auto stride = C10_AS_INTARRAYREF_SLOW(sym_stride);
@@ -713,10 +710,12 @@ Tensor nested_cat_batching_rule(const ITensorListRef& tensors, int64_t dim) {
   // Do a cat for each set of zipped unbound components
   const auto num_components = unbound.front().size();
   std::vector<Tensor> outputs;
+  outputs.reserve(num_components);
   for (auto i : c10::irange(num_components)) {
     std::vector<Tensor> arg_list;
-    for (auto j : c10::irange(unbound.size())) {
-      arg_list.push_back(unbound[j][i]);
+    arg_list.reserve(unbound.size());
+    for (const auto& unbound_elem : unbound) {
+      arg_list.push_back(unbound_elem[i]);
     }
     outputs.push_back(at::cat(arg_list, dim));
   }
@@ -733,7 +732,7 @@ TORCH_LIBRARY_IMPL(_, FuncTorchBatched, m) {
 }
 
 TORCH_LIBRARY_IMPL(aten, FuncTorchBatched, m) {
-  // still legacy b/c teturns multiple tensors
+  // still legacy b/c returns multiple tensors
   m.impl("split.Tensor", split_batching_rule);
   m.impl("split_with_sizes", split_with_sizes_batching_rule);
   m.impl("split_with_sizes_copy", split_with_sizes_copy_batching_rule);

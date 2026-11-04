@@ -1,4 +1,5 @@
-from typing import List, Optional
+# mypy: allow-untyped-defs
+from typing import cast
 
 import torch
 from torch import Tensor
@@ -7,14 +8,21 @@ from .optimizer import (
     _capturable_doc,
     _default_to_fused_or_foreach,
     _differentiable_doc,
+    _disable_dynamo_if_unsupported,
     _foreach_doc,
+    _functional_api_doc,
+    _get_capturable_supported_devices,
     _get_scalar_dtype,
     _get_value,
     _maximize_doc,
+    _params_doc,
+    _to_scalar,
     _use_grad_for_differentiable,
     _view_as_real,
     Optimizer,
+    ParamsT,
 )
+
 
 __all__ = ["Adamax", "adamax"]
 
@@ -22,17 +30,19 @@ __all__ = ["Adamax", "adamax"]
 class Adamax(Optimizer):
     def __init__(
         self,
-        params,
-        lr=2e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0,
-        foreach: Optional[bool] = None,
+        params: ParamsT,
+        lr: float | Tensor = 2e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0,
+        foreach: bool | None = None,
         *,
         maximize: bool = False,
         differentiable: bool = False,
         capturable: bool = False,
-    ):
+    ) -> None:
+        if isinstance(lr, Tensor) and lr.numel() != 1:
+            raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
@@ -44,16 +54,16 @@ class Adamax(Optimizer):
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
-        defaults = dict(
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
-            foreach=foreach,
-            maximize=maximize,
-            differentiable=differentiable,
-            capturable=capturable,
-        )
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": weight_decay,
+            "foreach": foreach,
+            "maximize": maximize,
+            "differentiable": differentiable,
+            "capturable": capturable,
+        }
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -118,7 +128,7 @@ class Adamax(Optimizer):
             closure (Callable, optional): A closure that reevaluates the model
                 and returns the loss.
         """
-        self._cuda_graph_capture_health_check()
+        self._accelerator_graph_capture_health_check()
 
         loss = None
         if closure is not None:
@@ -126,11 +136,11 @@ class Adamax(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_infs = []
-            state_steps = []
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            exp_avgs: list[Tensor] = []
+            exp_infs: list[Tensor] = []
+            state_steps: list[Tensor] = []
 
             beta1, beta2 = group["betas"]
             eps = group["eps"]
@@ -195,9 +205,8 @@ Adamax.__doc__ = (
     """
     + rf"""
     Args:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): learning rate (default: 2e-3)
+        {_params_doc}
+        lr (float, Tensor, optional): learning rate (default: 2e-3)
         betas (Tuple[float, float], optional): coefficients used for computing
             running averages of gradient and its square
         eps (float, optional): term added to the denominator to improve
@@ -215,86 +224,26 @@ Adamax.__doc__ = (
 )
 
 
-def adamax(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_infs: List[Tensor],
-    state_steps: List[Tensor],
-    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
-    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
-    foreach: Optional[bool] = None,
-    maximize: bool = False,
-    differentiable: bool = False,
-    capturable: bool = False,
-    has_complex: bool = False,
-    *,
-    eps: float,
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-):
-    r"""Functional API that performs adamax algorithm computation.
-
-    See :class:`~torch.optim.Adamax` for details.
-    """
-
-    if not torch._utils.is_compiling() and not all(
-        isinstance(t, torch.Tensor) for t in state_steps
-    ):
-        raise RuntimeError(
-            "API has changed, `state_steps` argument must contain a list of singleton tensors"
-        )
-
-    if foreach is None:
-        _, foreach = _default_to_fused_or_foreach(
-            params, differentiable, use_fused=False
-        )
-
-    if foreach and torch.jit.is_scripting():
-        raise RuntimeError("torch.jit.script not supported with foreach optimizers")
-
-    if foreach and not torch.jit.is_scripting():
-        func = _multi_tensor_adamax
-    else:
-        func = _single_tensor_adamax
-
-    func(
-        params,
-        grads,
-        exp_avgs,
-        exp_infs,
-        state_steps,
-        eps=eps,
-        beta1=beta1,
-        beta2=beta2,
-        lr=lr,
-        weight_decay=weight_decay,
-        maximize=maximize,
-        differentiable=differentiable,
-        has_complex=has_complex,
-        capturable=capturable,
-    )
-
-
 def _single_tensor_adamax(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_infs: List[Tensor],
-    state_steps: List[Tensor],
+    params: list[Tensor],
+    grads: list[Tensor],
+    exp_avgs: list[Tensor],
+    exp_infs: list[Tensor],
+    state_steps: list[Tensor],
     *,
     eps: float,
     beta1: float,
     beta2: float,
-    lr: float,
+    lr: float | Tensor,
     weight_decay: float,
     maximize: bool,
     differentiable: bool,
     capturable: bool,
     has_complex: bool,
-):
+) -> None:
+    if not torch.jit.is_scripting():
+        lr = _to_scalar(lr)
+
     for i, param in enumerate(params):
         grad = grads[i]
         grad = grad if not maximize else -grad
@@ -303,10 +252,15 @@ def _single_tensor_adamax(
         step_t = state_steps[i]
 
         # If compiling, the compiler will handle cudagraph checks, see note [torch.compile x capturable]
-        if not torch._utils.is_compiling() and capturable:
-            assert (param.is_cuda and step_t.is_cuda) or (
-                param.is_xla and step_t.is_xla
-            ), "If capturable=True, params and state_steps must be CUDA or XLA tensors."
+        if not torch.compiler.is_compiling() and capturable:
+            capturable_supported_devices = _get_capturable_supported_devices()
+            if not (
+                param.device.type == step_t.device.type
+                and param.device.type in capturable_supported_devices
+            ):
+                raise AssertionError(
+                    f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+                )
 
         # update step
         step_t += 1
@@ -347,64 +301,77 @@ def _single_tensor_adamax(
             bias_correction = 1 - beta1 ** _get_value(step_t)
             clr = lr / bias_correction
 
-            param.addcdiv_(exp_avg, exp_inf, value=-clr)
+            param.addcdiv_(exp_avg, exp_inf, value=-clr)  # type: ignore[arg-type]
 
 
 def _multi_tensor_adamax(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_infs: List[Tensor],
-    state_steps: List[Tensor],
+    params: list[Tensor],
+    grads: list[Tensor],
+    exp_avgs: list[Tensor],
+    exp_infs: list[Tensor],
+    state_steps: list[Tensor],
     *,
+    eps: float,
     beta1: float,
     beta2: float,
-    lr: float,
+    lr: float | Tensor,
     weight_decay: float,
-    eps: float,
     maximize: bool,
     differentiable: bool,
     capturable: bool,
     has_complex: bool,
-):
-    assert not differentiable, "_foreach ops don't support autograd"
+) -> None:
+    if differentiable:
+        raise AssertionError("_foreach ops don't support autograd")
 
     if len(params) == 0:
         return
 
     # If compiling, the compiler will handle cudagraph checks, see note [torch.compile x capturable]
-    if (
-        not torch._utils.is_compiling()
-        and capturable
-        and not all(p.is_cuda and step.is_cuda for p, step in zip(params, state_steps))
-    ):
-        raise RuntimeError(
-            "If capturable=True, params and state_steps must be CUDA tensors."
+    if not torch.compiler.is_compiling() and capturable:
+        capturable_supported_devices = _get_capturable_supported_devices(
+            supports_xla=False
         )
+        if not all(
+            p.device.type == step.device.type
+            and p.device.type in capturable_supported_devices
+            for p, step in zip(params, state_steps, strict=True)
+        ):
+            raise AssertionError(
+                f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+            )
+
+    lr = _to_scalar(lr)
 
     grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
-        [params, grads, exp_avgs, exp_infs, state_steps]
+        [params, grads, exp_avgs, exp_infs, state_steps]  # type: ignore[list-item]
     )
     for (
-        grouped_params,
-        grouped_grads,
-        grouped_exp_avgs,
-        grouped_exp_infs,
-        grouped_state_steps,
+        grouped_params_,
+        grouped_grads_,
+        grouped_exp_avgs_,
+        grouped_exp_infs_,
+        grouped_state_steps_,
     ), _ in grouped_tensors.values():
+        grouped_params = cast(list[Tensor], grouped_params_)
+        grouped_grads = cast(list[Tensor], grouped_grads_)
+        grouped_exp_avgs = cast(list[Tensor], grouped_exp_avgs_)
+        grouped_exp_infs = cast(list[Tensor], grouped_exp_infs_)
+        grouped_state_steps = cast(list[Tensor], grouped_state_steps_)
+
         if has_complex:
             _view_as_real(
                 grouped_params, grouped_grads, grouped_exp_avgs, grouped_exp_infs
             )
 
         if maximize:
-            grouped_grads = torch._foreach_neg(grouped_grads)
+            grouped_grads = torch._foreach_neg(grouped_grads)  # type: ignore[assignment]
 
         # Update steps
         # If steps are on CPU, foreach will fall back to the slow path, which is a for-loop calling t.add(1) over
         # and over. 1 will then be wrapped into a Tensor over and over again, which is slower than if we just
         # wrapped it once now. The alpha is required to assure we go to the right overload.
-        if grouped_state_steps[0].is_cpu:
+        if not torch.compiler.is_compiling() and grouped_state_steps[0].is_cpu:
             torch._foreach_add_(
                 grouped_state_steps, torch.tensor(1.0, device="cpu"), alpha=1.0
             )
@@ -413,10 +380,10 @@ def _multi_tensor_adamax(
 
         if weight_decay != 0:
             if maximize:
-                # Re-use the intermediate memory (grouped_grads) already allocated for maximize
+                # Reuse the intermediate memory (grouped_grads) already allocated for maximize
                 torch._foreach_add_(grouped_grads, grouped_params, alpha=weight_decay)
             else:
-                grouped_grads = torch._foreach_add(
+                grouped_grads = torch._foreach_add(  # type: ignore[assignment]
                     grouped_grads, grouped_params, alpha=weight_decay
                 )
 
@@ -429,13 +396,14 @@ def _multi_tensor_adamax(
         # in this case, we need to introduce a copy of the grads
         # since one has not been introduced previously
         if not maximize and weight_decay == 0:
-            grouped_grads = torch._foreach_abs(grouped_grads)
+            grouped_grads = torch._foreach_abs(grouped_grads)  # type: ignore[assignment]
         else:
             torch._foreach_abs_(grouped_grads)
 
         torch._foreach_add_(grouped_grads, eps)
         torch._foreach_maximum_(grouped_exp_infs, grouped_grads)
 
+        bias_corrections: tuple[Tensor, ...] | list[Tensor]
         if capturable:
             bias_corrections = torch._foreach_pow(beta1, grouped_state_steps)
             # foreach_sub doesn't allow a scalar as the first arg
@@ -449,6 +417,68 @@ def _multi_tensor_adamax(
                 1 - beta1 ** _get_value(step) for step in grouped_state_steps
             ]
             step_size = [(_get_value(lr) / bc) * -1 for bc in bias_corrections]
-            torch._foreach_addcdiv_(
+            torch._foreach_addcdiv_(  # type: ignore[arg-type]
                 grouped_params, grouped_exp_avgs, grouped_exp_infs, step_size
             )
+
+
+@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_adamax)
+def adamax(
+    params: list[Tensor],
+    grads: list[Tensor],
+    exp_avgs: list[Tensor],
+    exp_infs: list[Tensor],
+    state_steps: list[Tensor],
+    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+    foreach: bool | None = None,
+    maximize: bool = False,
+    differentiable: bool = False,
+    capturable: bool = False,
+    has_complex: bool = False,
+    *,
+    eps: float,
+    beta1: float,
+    beta2: float,
+    lr: float | Tensor,
+    weight_decay: float,
+) -> None:
+    if not torch.compiler.is_compiling() and not all(
+        isinstance(t, torch.Tensor) for t in state_steps
+    ):
+        raise RuntimeError(
+            "API has changed, `state_steps` argument must contain a list of singleton tensors"
+        )
+
+    if foreach is None:
+        _, foreach = _default_to_fused_or_foreach(
+            params, differentiable, use_fused=False
+        )
+
+    if foreach and torch.jit.is_scripting():
+        raise RuntimeError("torch.jit.script not supported with foreach optimizers")
+
+    if foreach and not torch.jit.is_scripting():
+        func = _multi_tensor_adamax
+    else:
+        func = _single_tensor_adamax
+
+    func(
+        params,
+        grads,
+        exp_avgs,
+        exp_infs,
+        state_steps,
+        eps=eps,
+        beta1=beta1,
+        beta2=beta2,
+        lr=lr,
+        weight_decay=weight_decay,
+        maximize=maximize,
+        differentiable=differentiable,
+        has_complex=has_complex,
+        capturable=capturable,
+    )
+
+
+adamax.__doc__ = _functional_api_doc.format(optimizer="Adamax")

@@ -1,12 +1,13 @@
+# mypy: allow-untyped-defs
 import torch
 import torch._prims_common as utils
 
 # Utilities should come BEFORE this import
 from torch._decomp import register_decomposition
-
 from torch._prims_common import TensorLikeType
 from torch._prims_common.wrappers import out_wrapper
 from torch._refs import _broadcast_shapes
+
 
 # Data conversion references.
 #
@@ -73,13 +74,9 @@ long = _make_conversion_method("long", torch.long)
 short = _make_conversion_method("short", torch.short)
 
 
-@register_decomposition(torch._ops.ops.aten.complex)
-# Note: complex has type promotion tests disabled due to different semantics.
-# exact_dtype is for compat with complex_check_dtype from core.
-@out_wrapper(exact_dtype=True)
-def complex(real: TensorLikeType, imag: TensorLikeType) -> TensorLikeType:
+def _check_complex_pair_dtypes(real: TensorLikeType, imag: TensorLikeType) -> None:
     allowed_dtypes = (torch.float32, torch.float64, torch.float16)
-    torch._check(
+    torch._check_not_implemented(
         real.dtype in allowed_dtypes and imag.dtype in allowed_dtypes,
         lambda: (
             f"Expected both inputs to be Half, Float or Double tensors but got "
@@ -93,6 +90,14 @@ def complex(real: TensorLikeType, imag: TensorLikeType) -> TensorLikeType:
             f"scalar type {imag.dtype} for second argument"
         ),
     )
+
+
+@register_decomposition(torch._ops.ops.aten.complex)
+# Note: complex has type promotion tests disabled due to different semantics.
+# exact_dtype is for compat with complex_check_dtype from core.
+@out_wrapper(exact_dtype=True)
+def complex(real: TensorLikeType, imag: TensorLikeType) -> TensorLikeType:
+    _check_complex_pair_dtypes(real, imag)
     result_dtype = utils.corresponding_complex_dtype(real.dtype)  # type: ignore[arg-type]
     common_shape = _broadcast_shapes(real.shape, imag.shape)
     result = real.new_empty(
@@ -112,7 +117,5 @@ def complex(real: TensorLikeType, imag: TensorLikeType) -> TensorLikeType:
 # exact_dtype is for compat with complex_check_dtype from core.
 @out_wrapper(exact_dtype=True)
 def polar(abs: TensorLikeType, angle: TensorLikeType) -> TensorLikeType:
-    result = torch.complex(abs, angle)
-    result.real = abs * torch.cos(angle)
-    result.imag = abs * torch.sin(angle)
-    return result
+    _check_complex_pair_dtypes(abs, angle)
+    return torch.complex(abs * torch.cos(angle), abs * torch.sin(angle))

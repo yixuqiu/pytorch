@@ -13,7 +13,6 @@
 #include <ATen/ops/full.h>
 #include <ATen/ops/pad_sequence_native.h>
 #include <ATen/ops/zeros.h>
-#include <ATen/ops/zeros_like_ops.h>
 #endif
 
 #include <c10/util/irange.h>
@@ -38,7 +37,7 @@ std::tuple<Tensor, Tensor> _pack_padded_sequence(const Tensor& _input, const Ten
   checkLongTensor(lengths_t);
 
   int64_t batch_size = input.size(1);
-  int64_t * lengths = lengths_t.data_ptr<int64_t>();
+  const int64_t * lengths = lengths_t.const_data_ptr<int64_t>();
 
   TORCH_CHECK(lengths_t.size(0) == batch_size,
            "Expected `len(lengths)` to be equal to batch_size, but got ", lengths_t.size(0),
@@ -51,7 +50,7 @@ std::tuple<Tensor, Tensor> _pack_padded_sequence(const Tensor& _input, const Ten
       // NB: enforce_sorted is implemented at a Python level, but the sortedness
       // check lives here. If enforce_sorted=False then this error should never
       // get called.
-      AT_ERROR("`lengths` array must be sorted in decreasing order when "
+      TORCH_CHECK(false, "`lengths` array must be sorted in decreasing order when "
                "`enforce_sorted` is True. You can pass `enforce_sorted=False` "
                "to pack_padded_sequence and/or pack_sequence to sidestep this "
                "requirement if you do not need ONNX exportability.");
@@ -98,7 +97,7 @@ std::tuple<Tensor, Tensor> _pack_padded_sequence(const Tensor& _input, const Ten
     if (l > prev_l) {
       auto current_batch_size = batch_size - i;
       steps.push_back(input.slice(0, prev_l, l).slice(1, 0, current_batch_size).contiguous().view(step_shape));
-      for (int64_t j = 0; j < (l - prev_l); ++j) {
+      for ([[maybe_unused]] const auto _ : c10::irange(l - prev_l)) {
         (*batch_sizes++) = current_batch_size;
       }
       prev_l = l;
@@ -106,7 +105,7 @@ std::tuple<Tensor, Tensor> _pack_padded_sequence(const Tensor& _input, const Ten
     TORCH_CHECK(l >= prev_l);
   }
 
-  return std::make_tuple(at::cat(steps), batch_sizes_t);
+  return std::make_tuple(at::cat(steps), std::move(batch_sizes_t));
 }
 
 // `grad` could be on arbitrary device and of arbitrary dtype, but `_batch_sizes`
@@ -126,7 +125,7 @@ Tensor _pack_padded_sequence_backward_symint(const Tensor& grad, c10::SymIntArra
   // NOTE: this op advertises as CompositeImplicitAutograd, but uses data_ptr().
   // we should fix this.
   auto max_seq_len = batch_sizes_t.size(0);
-  int64_t * batch_sizes = batch_sizes_t.data_ptr<int64_t>();
+  const int64_t * batch_sizes = batch_sizes_t.const_data_ptr<int64_t>();
   for (const auto i : c10::irange(max_seq_len)) {
     grad_input[i].slice(0, 0, batch_sizes[i]).copy_(grad.slice(0, offset, offset + batch_sizes[i]));
     offset += batch_sizes[i];
@@ -142,8 +141,9 @@ Tensor _pack_padded_sequence_backward_symint(const Tensor& grad, c10::SymIntArra
 std::tuple<Tensor, Tensor> _pad_packed_sequence(const Tensor& data, const Tensor& _batch_sizes, bool batch_first, const Scalar& padding_value, int64_t total_length) {
   auto batch_sizes_t = _batch_sizes.contiguous();
   checkLongTensor(batch_sizes_t);
+  TORCH_CHECK(batch_sizes_t.numel() > 0, "batch_sizes can not be empty");
 
-  int64_t * batch_sizes = batch_sizes_t.data_ptr<int64_t>();
+  const int64_t * batch_sizes = batch_sizes_t.const_data_ptr<int64_t>();
   int64_t max_batch_size = batch_sizes[0];
   int64_t max_real_seq_length = batch_sizes_t.size(0);
   int64_t max_seq_length = max_real_seq_length;
@@ -188,7 +188,7 @@ std::tuple<Tensor, Tensor> _pad_packed_sequence(const Tensor& data, const Tensor
     }
     int64_t dec = prev_batch_size - batch_size;
     if (dec > 0) {
-      for (C10_UNUSED const auto j : c10::irange(dec)) {
+      for ([[maybe_unused]] const auto j : c10::irange(dec)) {
         (*lengths--) = i;
       }
     }
@@ -199,12 +199,14 @@ std::tuple<Tensor, Tensor> _pad_packed_sequence(const Tensor& data, const Tensor
     output = output.transpose(0, 1);
   }
 
-  return std::make_tuple(output, lengths_t);
+  return std::make_tuple(std::move(output), std::move(lengths_t));
 }
 
-Tensor pad_sequence(TensorList sequences, bool batch_first, double padding_value) {
+Tensor pad_sequence(TensorList sequences, bool batch_first, double padding_value, const std::string_view padding_side) {
   const int64_t sequences_size = sequences.size();
   TORCH_CHECK(sequences_size > 0, "received an empty list of sequences");
+  TORCH_CHECK(padding_side == "left" || padding_side == "right",
+              "Expected padding_side to be one of left or right, but got ", padding_side, ".");
   IntArrayRef max_size = sequences[0].sizes();
   IntArrayRef trailing_dims = max_size.slice(1);
   int64_t max_len = std::max_element(
@@ -227,11 +229,12 @@ Tensor pad_sequence(TensorList sequences, bool batch_first, double padding_value
   for (const auto i : c10::irange(sequences_size)) {
     const Tensor& currseq = sequences[i];
     const int64_t length_i = currseq.size(0);
+    const int64_t start = padding_side == "left" ? max_len - length_i : 0;
     // use index notation to prevent duplicate references to the tensor
     if (batch_first) {
-      out.select(0, i).narrow(0, 0, length_i).copy_(currseq);
+      out.select(0, i).narrow(0, start, length_i).copy_(currseq);
     } else {
-      out.narrow(0, 0, length_i).select(1, i).copy_(currseq);
+      out.narrow(0, start, length_i).select(1, i).copy_(currseq);
     }
   }
   return out;

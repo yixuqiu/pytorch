@@ -1,50 +1,61 @@
 #!/bin/bash
 set -xe
-
+# Script used in CI and CD pipeline
 
 # Intel® software for general purpose GPU capabilities.
-# Refer to https://dgpu-docs.intel.com/releases/LTS_803.29_20240131.html
-
-# Intel® oneAPI Base Toolkit (version 2024.0.0) has been updated to include functional and security updates.
-# Refer to https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html
+# Refer to https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpus.html
 
 # Users should update to the latest version as it becomes available
 
 function install_ubuntu() {
+    . /etc/os-release
+    if [[ ! " jammy noble " =~ " ${VERSION_CODENAME} " ]]; then
+        echo "Ubuntu version ${VERSION_CODENAME} not supported"
+        exit
+    fi
+
     apt-get update -y
     apt-get install -y gpg-agent wget
 
-    # Set up the repository. To do this, download the key to the system keyring
-    wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
-        | gpg --dearmor --output /usr/share/keyrings/intel-graphics.gpg
-    wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-        | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
-
-    # Add the signed entry to APT sources and configure the APT client to use the Intel repository
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2350 unified" \
-        | tee /etc/apt/sources.list.d/intel-gpu-jammy.list
-    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
-        | tee /etc/apt/sources.list.d/oneAPI.list
-
-    # Update the packages list and repository index
-    apt-get update
-
-    # The xpu-smi packages
-    apt-get install -y flex bison xpu-smi
-    # Compute and Media Runtimes
-    apt-get install -y \
-        intel-opencl-icd intel-level-zero-gpu level-zero \
-        intel-media-va-driver-non-free libmfx1 libmfxgen1 libvpl2 \
-        libegl-mesa0 libegl1-mesa libegl1-mesa-dev libgbm1 libgl1-mesa-dev libgl1-mesa-dri \
-        libglapi-mesa libgles2-mesa-dev libglx-mesa0 libigdgmm12 libxatracker2 mesa-va-drivers \
-        mesa-vdpau-drivers mesa-vulkan-drivers va-driver-all vainfo hwinfo clinfo
-    # Development Packages
-    apt-get install -y libigc-dev intel-igc-cm libigdfcl-dev libigfxcmrt-dev level-zero-dev
-    # Install Intel® oneAPI Base Toolkit
-    if [ -n "$BASEKIT_VERSION" ]; then
-        apt-get install intel-basekit=$BASEKIT_VERSION -y
+    if [[ "${XPU_DRIVER_TYPE,,}" == "client" ]]; then
+        apt-get install -y software-properties-common
+        add-apt-repository -y ppa:kobuk-team/intel-graphics
+        apt-get install -y \
+            libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+            intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
+            libze-dev intel-ocloc xpu-smi
     else
-        apt-get install intel-basekit -y
+        # To add the online network package repository for the GPU Driver
+        wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
+            | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+            https://repositories.intel.com/gpu/ubuntu ${VERSION_CODENAME}${XPU_DRIVER_VERSION} unified" \
+            | tee /etc/apt/sources.list.d/intel-gpu-${VERSION_CODENAME}.list
+
+        # Update the packages list and repository index
+        apt-get update
+
+        # The xpu-smi packages
+        apt-get install -y flex bison xpu-smi
+
+        # Compute and Media Runtimes
+        if [[ " ${VERSION_CODENAME} " =~ " noble " ]]; then
+            apt-get install -y \
+                intel-opencl-icd libze-intel-gpu1 libze1 \
+                intel-media-va-driver-non-free libmfx-gen1 libvpl2 \
+                libegl-mesa0 libegl1-mesa-dev libgbm1 libgl1-mesa-dev libgl1-mesa-dri \
+                libglapi-mesa libgles2-mesa-dev libglx-mesa0 libigdgmm12 libxatracker2 mesa-va-drivers \
+                mesa-vdpau-drivers mesa-vulkan-drivers va-driver-all vainfo hwinfo clinfo intel-ocloc
+        else # jammy
+            apt-get install -y \
+                intel-opencl-icd libze-intel-gpu1 libze1 \
+                intel-media-va-driver-non-free libmfx-gen1 libvpl2 \
+                libegl-mesa0 libegl1-mesa libegl1-mesa-dev libgbm1 libgl1-mesa-dev libgl1-mesa-dri \
+                libglapi-mesa libglx-mesa0 libigdgmm12 libxatracker2 mesa-va-drivers \
+                mesa-vdpau-drivers mesa-vulkan-drivers va-driver-all vainfo hwinfo clinfo intel-ocloc
+        fi
+        # Development Packages
+        apt-get install -y libigc-dev intel-igc-cm libigdfcl-dev libigfxcmrt-dev libze-dev
     fi
 
     # Cleanup
@@ -52,44 +63,36 @@ function install_ubuntu() {
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 }
 
-function install_centos() {
+function install_rhel() {
+    . /etc/os-release
+    if [[ ! " 8.8 8.10 9.0 9.2 9.3 " =~ " ${VERSION_ID} " ]]; then
+        echo "RHEL version ${VERSION_ID} not supported"
+        exit
+    fi
+    # Using testing channel for CD build
+    if [[ "${ID}" == "almalinux" ]]; then
+        XPU_DRIVER_VERSION="/testing"
+    fi
+
     dnf install -y 'dnf-command(config-manager)'
+    # To add the online network package repository for the GPU Driver
     dnf config-manager --add-repo \
-        https://repositories.intel.com/gpu/rhel/8.6/production/2328/unified/intel-gpu-8.6.repo
-    # To add the EPEL repository needed for DKMS
-    dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
-        # https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-
-    # Create the YUM repository file in the /temp directory as a normal user
-    tee > /tmp/oneAPI.repo << EOF
-[oneAPI]
-name=Intel® oneAPI repository
-baseurl=https://yum.repos.intel.com/oneapi
-enabled=1
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
-EOF
-
-    # Move the newly created oneAPI.repo file to the YUM configuration directory /etc/yum.repos.d
-    mv /tmp/oneAPI.repo /etc/yum.repos.d
+        https://repositories.intel.com/gpu/rhel/${VERSION_ID}${XPU_DRIVER_VERSION}/unified/intel-gpu-${VERSION_ID}.repo
 
     # The xpu-smi packages
-    dnf install -y flex bison xpu-smi
+    dnf install -y xpu-smi
     # Compute and Media Runtimes
-    dnf install -y \
+    dnf install --skip-broken -y \
         intel-opencl intel-media intel-mediasdk libmfxgen1 libvpl2\
         level-zero intel-level-zero-gpu mesa-dri-drivers mesa-vulkan-drivers \
         mesa-vdpau-drivers libdrm mesa-libEGL mesa-libgbm mesa-libGL \
         mesa-libxatracker libvpl-tools intel-metrics-discovery \
         intel-metrics-library intel-igc-core intel-igc-cm \
-        libva libva-utils intel-gmmlib libmetee intel-gsc intel-ocloc hwinfo clinfo
+        libva libva-utils intel-gmmlib libmetee intel-gsc intel-ocloc
     # Development packages
     dnf install -y --refresh \
         intel-igc-opencl-devel level-zero-devel intel-gsc-devel libmetee-devel \
         level-zero-devel
-    # Install Intel® oneAPI Base Toolkit
-    dnf install intel-basekit -y
 
     # Cleanup
     dnf clean all
@@ -98,18 +101,144 @@ EOF
     rm -rf /var/lib/yum/history
 }
 
+function install_sles() {
+    . /etc/os-release
+    VERSION_SP=${VERSION_ID//./sp}
+    if [[ ! " 15sp4 15sp5 " =~ " ${VERSION_SP} " ]]; then
+        echo "SLES version ${VERSION_ID} not supported"
+        exit
+    fi
 
-# The installation depends on the base OS
-ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
-case "$ID" in
-    ubuntu)
-        install_ubuntu
-    ;;
-    centos)
-        install_centos
-    ;;
-    *)
-        echo "Unable to determine OS..."
+    # To add the online network package repository for the GPU Driver
+    zypper addrepo -f -r \
+        https://repositories.intel.com/gpu/sles/${VERSION_SP}${XPU_DRIVER_VERSION}/unified/intel-gpu-${VERSION_SP}.repo
+    rpm --import https://repositories.intel.com/gpu/intel-graphics.key
+
+    # The xpu-smi packages
+    zypper install -y lsb-release flex bison xpu-smi
+    # Compute and Media Runtimes
+    zypper install -y intel-level-zero-gpu level-zero intel-gsc intel-opencl intel-ocloc \
+        intel-media-driver libigfxcmrt7 libvpl2 libvpl-tools libmfxgen1 libmfx1
+    # Development packages
+    zypper install -y libigdfcl-devel intel-igc-cm libigfxcmrt-devel level-zero-devel
+}
+
+function install_xpu_packages() {
+    # Download the Intel® software for general purpose GPU capabilities
+    wget -qO /tmp/intel-deep-learning-essentials.sh ${XPU_PACKAGES_URL}
+    chmod +x /tmp/intel-deep-learning-essentials.sh
+    # Install the Intel® software for general purpose GPU capabilities
+    /tmp/intel-deep-learning-essentials.sh -a --silent --eula accept
+    # Cleanup
+    rm -f /tmp/intel-deep-learning-essentials.sh
+}
+
+function install_ubuntu_omix() {
+    . /etc/os-release
+    if [[ ! " jammy noble " =~ " ${VERSION_CODENAME} " ]]; then
+        echo "OMIX: Ubuntu version ${VERSION_CODENAME} not supported"
         exit 1
-    ;;
-esac
+    fi
+
+    apt-get update -y
+    apt-get install -y gpg-agent wget
+
+    # Add Intel GPG key
+    wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
+        | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
+
+    # Select OMIX repo: intel-omix-pvc for LTS driver (CI), intel-omix for rolling/client (CD)
+    if [[ "${XPU_DRIVER_TYPE,,}" == "lts" ]]; then
+        OMIX_REPO="intel-omix-pvc"
+    else
+        OMIX_REPO="intel-omix"
+    fi
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+        https://repositories.intel.com/gpu/ubuntu ${VERSION_CODENAME}/${OMIX_REPO}/${OMIX_VERSION} unified" \
+        | tee /etc/apt/sources.list.d/intel-gpu-${VERSION_CODENAME}.list
+    apt-get update
+
+    # Install OMIX (includes GPU driver + oneAPI DLE components)
+    apt-get install -y intel-omix-dev
+
+    # Cleanup
+    apt-get autoclean && apt-get clean
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+}
+
+function install_rhel_omix() {
+    . /etc/os-release
+    if [[ ! " 8.10 " =~ " ${VERSION_ID} " ]]; then
+        echo "OMIX: RHEL version ${VERSION_ID} not supported"
+        exit 1
+    fi
+
+    dnf install -y 'dnf-command(config-manager)'
+    dnf config-manager --add-repo \
+        https://repositories.intel.com/gpu/rhel/${VERSION_ID}/intel-omix/${OMIX_VERSION}/unified/intel-gpu-${VERSION_ID}.repo
+
+    # Install OMIX (includes GPU driver + oneAPI DLE components)
+    dnf install -y --refresh intel-omix-devel
+
+    # Cleanup
+    dnf clean all
+    rm -rf /var/cache/yum
+    rm -rf /var/lib/yum/yumdb
+    rm -rf /var/lib/yum/history
+}
+
+if [[ -n "$OMIX_VERSION" ]]; then
+    # OMIX path: unified package handles both GPU driver and DLE
+    ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
+    case "$ID" in
+        ubuntu)
+            install_ubuntu_omix
+        ;;
+        rhel|almalinux)
+            install_rhel_omix
+        ;;
+        *)
+            echo "OMIX: OS $ID not yet supported"
+            exit 1
+        ;;
+    esac
+else
+    # Legacy path: separate GPU driver + DLE offline installer
+
+    # Default use GPU driver rolling releases
+    XPU_DRIVER_VERSION=""
+    if [[ "${XPU_DRIVER_TYPE,,}" == "lts" ]]; then
+        # Use GPU driver LTS releases
+        XPU_DRIVER_VERSION="/lts/2523"
+    fi
+
+    # Default use Intel® oneAPI Deep Learning Essentials 2026.0
+    if [[ "$XPU_VERSION" == "2026.1" ]]; then
+        XPU_PACKAGES_URL="https://registrationcenter-download.intel.com/akdlm/IRC_NAS/bedab612-cf6b-4ece-872e-e72e9534ccab/intel-deep-learning-essentials-2026.1.3.17_offline.sh"
+    elif [[ "$XPU_VERSION" == "2026.0" ]]; then
+        XPU_PACKAGES_URL="https://registrationcenter-download.intel.com/akdlm/IRC_NAS/8170208e-86db-4faa-a0d6-1ecf62699574/intel-deep-learning-essentials-2026.0.0.624_offline.sh"
+    else
+        XPU_PACKAGES_URL="https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b3e6c1bf-a6d5-4580-8b1d-80cbfd38c8af/intel-deep-learning-essentials-2025.3.2.36_offline.sh"
+    fi
+
+    # The Driver installation depends on the base OS
+    ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
+    case "$ID" in
+        ubuntu)
+            install_ubuntu
+        ;;
+        rhel|almalinux)
+            install_rhel
+        ;;
+        sles)
+            install_sles
+        ;;
+        *)
+            echo "Unable to determine OS..."
+            exit 1
+        ;;
+    esac
+
+    # XPU support packages installation
+    install_xpu_packages
+fi

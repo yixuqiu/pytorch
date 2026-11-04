@@ -1,9 +1,10 @@
+import operator_benchmark as op_bench
+
 import torch
 import torch.ao.nn.quantized as nnq
 import torch.ao.quantization as tq
 import torch.nn as nn
 
-import operator_benchmark as op_bench
 
 """Microbenchmarks for general quantization operations."""
 
@@ -40,7 +41,8 @@ class QuantizePerTensorBenchmark(op_bench.TorchBenchmarkBase):
     r"""Benchmarks both quantization and dequantization."""
 
     def init(self, C, M, N, dtype, mode):
-        assert mode in ("Q", "D")
+        if mode not in ("Q", "D"):
+            raise AssertionError(f"mode must be 'Q' or 'D', but got '{mode}'")
         self.input = torch.rand(C, M, N)
         self.dtype = dtype
         self.op = nnq.Quantize(scale=1.0, zero_point=0, dtype=dtype)
@@ -77,7 +79,8 @@ class QuantizePerChannelBenchmark(op_bench.TorchBenchmarkBase):
     r"""Benchmarks both quantization and dequantization."""
 
     def init(self, C, M, N, dtype, axis, mode):
-        assert mode in ("Q", "D")
+        if mode not in ("Q", "D"):
+            raise AssertionError(f"mode must be 'Q' or 'D', but got '{mode}'")
         self.input = torch.rand(C, M, N)
         self.op = torch.quantize_per_channel
 
@@ -192,8 +195,8 @@ def fakeQuantizePerTensorOriginalKernel(
 
 fake_quantize_per_tensor_ops = op_bench.op_list(
     attrs=(
-        ("learnable_kernel", fakeQuantizePerTensorLearnableKernel),
-        ("original_kernel", fakeQuantizePerTensorOriginalKernel),
+        ("learnable_kernel_tensor", fakeQuantizePerTensorLearnableKernel),
+        ("original_kernel_tensor", fakeQuantizePerTensorOriginalKernel),
     ),
     attr_names=("op_name", "op_func"),
 )
@@ -239,15 +242,20 @@ class FakeQuantizePerTensorBaseOpBenchmark(op_bench.TorchBenchmarkBase):
             torch.rand(N, C, H, W, dtype=torch.float, device=device),
             requires_grad=self.auto_set(),
         )
-        self.scale = nn.Parameter(
-            torch.tensor([1.0]).to(device), requires_grad=self.auto_set()
-        )
-        if op_func.__name__ == "fakeQuantizePerChannelOriginalKernel":
+        # The original kernel ignores scale/zero_point, so they must not
+        # require grad: a per-input variant with only scale/zero_point
+        # requiring grad has no tensor in the autograd graph.
+        if op_func.__name__ == "fakeQuantizePerTensorOriginalKernel":
+            self.scale = nn.Parameter(
+                torch.tensor([1.0]).to(device), requires_grad=False
+            )
             self.zero_point = nn.Parameter(
-                torch.tensor([0.0]).to(device).to(zero_point_dtype),
-                requires_grad=self.auto_set(),
+                torch.tensor([0.0]).to(device), requires_grad=False
             )
         else:
+            self.scale = nn.Parameter(
+                torch.tensor([1.0]).to(device), requires_grad=self.auto_set()
+            )
             self.zero_point = nn.Parameter(
                 torch.tensor([0.0]).to(device), requires_grad=self.auto_set()
             )
@@ -296,8 +304,8 @@ def fakeQuantizePerChannelOriginalKernel(
 
 fake_quantize_per_channel_ops = op_bench.op_list(
     attrs=(
-        ("learnable_kernel", fakeQuantizePerChannelLearnableKernel),
-        ("original_kernel", fakeQuantizePerChannelOriginalKernel),
+        ("learnable_kernel_channel", fakeQuantizePerChannelLearnableKernel),
+        ("original_kernel_channel", fakeQuantizePerChannelOriginalKernel),
     ),
     attr_names=("op_name", "op_func"),
 )

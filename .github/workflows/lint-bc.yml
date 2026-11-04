@@ -8,11 +8,21 @@ on:
       - reopened
     branches-ignore:
       - nightly
+  push:
+    tags:
+      # TODO: Remove me later
+      -  ciflow/inductor-cu126/*
   workflow_dispatch:
 
 jobs:
+  check-ci:
+    if: github.repository_owner == 'pytorch'
+    uses: ./.github/workflows/_check-ci.yml
+
   bc_linter:
-    runs-on: ubuntu-latest
+    needs: check-ci
+    if: github.repository_owner == 'pytorch'
+    runs-on: ubuntu-24.04
     steps:
       - name: Run BC Lint Action
         uses: pytorch/test-infra/.github/actions/bc-lint@main

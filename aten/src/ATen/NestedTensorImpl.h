@@ -32,7 +32,7 @@ struct TORCH_API NestedTensorImpl : public c10::TensorImpl {
       at::Tensor nested_strides,
       at::Tensor storage_offsets);
   // assume contiguous, `nested_strides` and `offsets`
-  // can be infered from `nested_sizes`
+  // can be inferred from `nested_sizes`
   explicit NestedTensorImpl(
       const at::Tensor& buffer,
       const at::Tensor& nested_sizes);
@@ -61,10 +61,10 @@ struct TORCH_API NestedTensorImpl : public c10::TensorImpl {
   // Returns nullopt if the ith dimension is irregular. The ith dimension
   // of a NestedTensor is regular if the unbound tensors match in
   // size at the (i-1)th dimension.
-  c10::optional<int64_t> opt_size(int64_t d) const;
+  std::optional<int64_t> opt_size(int64_t d) const;
 
   int64_t size(int64_t d) const {
-    c10::optional<int64_t> optional_size = this->opt_size(d);
+    std::optional<int64_t> optional_size = this->opt_size(d);
     TORCH_CHECK(
         optional_size.has_value(),
         "Given dimension ",
@@ -115,7 +115,8 @@ struct TORCH_API NestedTensorImpl : public c10::TensorImpl {
   // with real implementations
   int64_t numel_custom() const override;
   c10::SymInt sym_numel_custom() const override;
-  bool is_contiguous_custom(MemoryFormat) const override;
+  c10::SymBool sym_is_contiguous_custom(
+      MemoryFormat /*memory_format*/) const override;
   int64_t size_custom(int64_t d) const override {
     return this->size(d);
   }
@@ -171,7 +172,7 @@ struct TORCH_API NestedTensorImpl : public c10::TensorImpl {
   // Optional to allow it to be computed lazily from nested.
   // TODO: maybe we can remove this metadata since
   //       we can compute it from `nested_sizes_`
-  mutable c10::optional<std::vector<int64_t>> opt_sizes_;
+  mutable std::optional<std::vector<int64_t>> opt_sizes_;
 
   template <typename VariableVersion>
   c10::intrusive_ptr<TensorImpl> shallow_copy_and_detach_core(

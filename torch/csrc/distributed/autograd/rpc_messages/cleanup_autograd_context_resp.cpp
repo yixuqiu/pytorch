@@ -1,8 +1,6 @@
 #include <torch/csrc/distributed/autograd/rpc_messages/cleanup_autograd_context_resp.h>
 
-namespace torch {
-namespace distributed {
-namespace autograd {
+namespace torch::distributed::autograd {
 
 c10::intrusive_ptr<rpc::Message> CleanupAutogradContextResp::
     toMessageImpl() && {
@@ -15,10 +13,8 @@ c10::intrusive_ptr<rpc::Message> CleanupAutogradContextResp::
 }
 
 std::unique_ptr<CleanupAutogradContextResp> CleanupAutogradContextResp::
-    fromMessage(const rpc::Message& message /* unused */) {
+    fromMessage(const rpc::Message& /*message*/ /* unused */) {
   return std::unique_ptr<CleanupAutogradContextResp>();
 }
 
-} // namespace autograd
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::autograd

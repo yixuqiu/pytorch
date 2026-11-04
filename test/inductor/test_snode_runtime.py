@@ -1,25 +1,29 @@
 # Owner(s): ["module: inductor"]
 
-
+import contextlib
 from unittest import skipIf
 
 import torch
 import torch.distributed as dist
-
-from torch._inductor import metrics
+from torch._inductor import config, metrics
 from torch._inductor.comm_analysis import estimate_nccl_collective_runtime
-from torch._inductor.compile_fx import compile_fx, count_bytes_inner
+from torch._inductor.compile_fx import compile_fx, compile_fx_inner
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import is_collective
-from torch.testing._internal.inductor_utils import HAS_CUDA
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
+
 
 aten = torch.ops.aten
 c10d = torch.ops.c10d_functional
 _c10d = torch.ops._c10d_functional
 
 
-def count_bytes_inductor(gm, example_inputs):
-    return compile_fx(gm, example_inputs, inner_compile=count_bytes_inner)
+def compile_but_use_eager(gm, example_inputs):
+    def inner_compile(gm, *args, **kwargs):
+        compile_fx_inner(gm, *args, **kwargs)
+        return gm
+
+    return compile_fx(gm, example_inputs, inner_compile=inner_compile)
 
 
 def calculate_runtime(f, *args) -> float:
@@ -27,17 +31,19 @@ def calculate_runtime(f, *args) -> float:
     Assumes all inputs are fp32
     """
     metrics.reset()
-    torch._dynamo.optimize(count_bytes_inductor)(f)(*args)
+    torch._logging.set_logs(inductor_metrics=True)
+    torch.compile(f, backend=compile_but_use_eager)(*args)
     print(metrics.node_runtimes)
 
     ret = 0.0
     for pair in metrics.node_runtimes:
         ret += pair[1]
 
+    torch._logging.set_logs()
     return ret
 
 
-DEVICE = "cuda"
+DEVICE = GPU_TYPE
 
 
 def T(*size, dtype=torch.float32, device=DEVICE, grad=False) -> torch.Tensor:
@@ -49,21 +55,38 @@ class TestCase(InductorTestCase):
 
     """
     Helper methods to compare runtime estimate against 0. Since this estimate is hardware dependent,
-    stronger comparisons may fail dependending on the host's specs.
+    stronger comparisons may fail depending on the host's specs.
 
     atol/rtol must be provided explicitly with each call, since precision/rel_tol overrides are not always utilized
     """
 
+    def setUp(self):
+        super().setUp()
+        # These tests check metrics.node_runtimes and we don't save / restore
+        # those in the FX graph cache.
+        self._test_snode_stack = contextlib.ExitStack()
+        self._test_snode_stack.enter_context(
+            config.patch({"fx_graph_remote_cache": False})
+        )
+
+    def tearDown(self):
+        self._test_snode_stack.close()
+        super().tearDown()
+
     def assertZero(self, x: float):
-        assert isinstance(x, float)
+        if not isinstance(x, float):
+            raise AssertionError(f"Expected float, got {type(x)}")
         super().assertEqual(x, 0.0, atol=0, rtol=0)
 
     def assertNotZero(self, x):
-        assert isinstance(x, float)
+        if not isinstance(x, float):
+            raise AssertionError(f"Expected float, got {type(x)}")
         super().assertNotEqual(x, 0.0, atol=0, rtol=0)
 
 
 class UnsupportedTests(TestCase):
+    device = DEVICE
+
     def test_no_op(self):
         def f(a):
             return a
@@ -80,6 +103,8 @@ class UnsupportedTests(TestCase):
 
 
 class ComputeBoundedTests(TestCase):
+    device = DEVICE
+
     def test_conv1d(self):
         def f(x, y):
             return torch.nn.functional.conv1d(x, y)
@@ -141,6 +166,8 @@ class ComputeBoundedTests(TestCase):
 
 
 class MemoryBoundedTests(TestCase):
+    device = DEVICE
+
     def test_relu(self):
         def f(a):
             return torch.nn.functional.relu(a)
@@ -173,8 +200,101 @@ class MemoryBoundedTests(TestCase):
         self.assertNotZero(calculate_runtime(f, *inp))
 
 
+class InputDistanceTests(TestCase):
+    device = DEVICE
+
+    def _get_snodes(self, f, *args):
+        metrics.reset()
+        torch._logging.set_logs(inductor_metrics=True)
+        torch.compile(f, backend=compile_but_use_eager)(*args)
+        torch._logging.set_logs()
+        return [snode for snode, _ in metrics.nodes_num_elem]
+
+    def test_chain_with_reduction(self):
+        """
+        input -> sum (depth 0) -> sum (depth 1)
+        Reductions prevent full fusion, giving us distinct depth levels.
+        """
+
+        def f(x):
+            a = x.sum(dim=-1)
+            return a.sum(dim=-1)
+
+        snodes = self._get_snodes(f, T(10, 10, 10))
+        all_min = [s.min_input_distance for s in snodes]
+        all_max = [s.max_input_distance for s in snodes]
+        self.assertEqual(min(all_min), 0)
+        self.assertEqual(max(all_max), 1)
+
+    def test_fused_node_depth_range(self):
+        """
+        A reduction fused with its pointwise epilogue should have
+        min_input_distance=0 and max_input_distance=1.
+        """
+
+        def f(x):
+            a = x.sum(dim=-1)
+            return a.cos()
+
+        snodes = self._get_snodes(f, T(10, 10))
+        # The reduction and pointwise get fused
+        self.assertEqual(len(snodes), 1)
+        self.assertEqual(snodes[0].min_input_distance, 0)
+        self.assertEqual(snodes[0].max_input_distance, 1)
+
+    def test_extern_kernel_chain(self):
+        """
+        mm (depth 0, extern) -> cos+sum fused (depth 1)
+        """
+
+        def f(a, b):
+            c = torch.mm(a, b)
+            d = c.cos()
+            return d.sum(dim=-1)
+
+        snodes = self._get_snodes(f, T(10, 10), T(10, 10))
+        all_min = [s.min_input_distance for s in snodes]
+        all_max = [s.max_input_distance for s in snodes]
+        self.assertEqual(min(all_min), 0)
+        self.assertEqual(max(all_max), 1)
+
+    def test_foreach_basic(self):
+        """
+        foreach_add on graph inputs should have depth 0.
+        """
+
+        def f(xs, ys):
+            return torch._foreach_add(xs, ys)
+
+        xs = [T(10), T(20)]
+        ys = [T(10), T(20)]
+        snodes = self._get_snodes(f, xs, ys)
+        for s in snodes:
+            self.assertEqual(s.min_input_distance, 0)
+            self.assertEqual(s.max_input_distance, 0)
+
+    def test_foreach_after_extern(self):
+        """
+        mm (extern, depth 0) -> foreach_add (depth 1)
+        The extern kernel creates a fusion barrier so the foreach
+        has a real dependency chain.
+        """
+
+        def f(a, b, ys):
+            c = torch.mm(a, b)
+            return torch._foreach_add([c, c], ys)
+
+        snodes = self._get_snodes(f, T(10, 10), T(10, 10), [T(10, 10), T(10, 10)])
+        all_min = [s.min_input_distance for s in snodes]
+        all_max = [s.max_input_distance for s in snodes]
+        self.assertEqual(min(all_min), 0)
+        self.assertGreaterEqual(max(all_max), 1)
+
+
 @skipIf(not dist.is_available(), "requires distributed")
 class TestCommAnalysis(TestCase):
+    device = DEVICE
+
     WORLD_SIZE: int = 8
     RANKS = list(range(8))
 
@@ -187,7 +307,8 @@ class TestCommAnalysis(TestCase):
         )
         try:
             metrics.reset()
-            torch._dynamo.optimize(count_bytes_inductor)(fn)(*inps)
+            torch._logging.set_logs(inductor_metrics=True)
+            torch.compile(fn)(*inps)
             found_collective = False
             for snode, runtime in metrics.node_runtimes:
                 if not is_collective(snode.node):
@@ -203,6 +324,7 @@ class TestCommAnalysis(TestCase):
                 self.assertNotZero(runtime)
             # Make sure a collective kernel is found in graph
             self.assertTrue(found_collective)
+            torch._logging.set_logs()
         finally:
             dist.destroy_process_group()
 
@@ -305,5 +427,5 @@ class TestCommAnalysis(TestCase):
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
-    if HAS_CUDA:
+    if HAS_GPU:
         run_tests(needs="filelock")

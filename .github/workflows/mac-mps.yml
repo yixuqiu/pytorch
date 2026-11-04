@@ -1,3 +1,4 @@
+# Owner(s): ["module: mps"]
 name: Mac MPS
 
 on:
@@ -13,33 +14,39 @@ concurrency:
 permissions: read-all
 
 jobs:
-  macos-12-py3-arm64-build:
-    name: macos-12-py3-arm64
+  check-ci:
+    if: github.repository_owner == 'pytorch'
+    uses: ./.github/workflows/_check-ci.yml
+
+  macos-py3-arm64-build:
+    needs: check-ci
+    if: github.repository_owner == 'pytorch'
+    name: macos-py3-arm64
     uses: ./.github/workflows/_mac-build.yml
     with:
-      sync-tag: macos-12-py3-arm64-build
-      build-environment: macos-12-py3-arm64
+      sync-tag: macos-py3-arm64-build
+      build-environment: macos-py3-arm64
       runner-type: macos-m1-stable
       build-generates-artifacts: true
       # To match the one pre-installed in the m1 runners
-      python-version: 3.9.12
-      # We need to set the environment file here instead of trying to detect it automatically because
-      # MacOS arm64 is cross-compiled from x86-64. Specifically, it means that arm64 conda environment
-      # is needed when building PyTorch MacOS arm64 from x86-64
-      environment-file: .github/requirements/conda-env-macOS-ARM64
+      python-version: 3.12.7
       test-matrix: |
         { include: [
-          { config: "mps", shard: 1, num_shards: 1, runner: "macos-m1-stable" },
-          { config: "mps", shard: 1, num_shards: 1, runner: "macos-m2-14" },
+          { config: "test_mps", shard: 1, num_shards: 1, runner: "macos-m1-15" },
+          { config: "test_mps", shard: 1, num_shards: 1, runner: "macos-m2-26" },
+          { config: "test_mps", shard: 1, num_shards: 1, runner: "macos-m2-27" },
         ]}
+    secrets: inherit
 
-  macos-12-py3-arm64-mps-test:
-    name: macos-12-py3-arm64-mps
-    uses: ./.github/workflows/_mac-test-mps.yml
-    needs: macos-12-py3-arm64-build
+  macos-py3-arm64-mps-test:
+    name: macos-py3-arm64-mps
+    uses: ./.github/workflows/_mac-test.yml
+    needs: macos-py3-arm64-build
     with:
-      sync-tag: macos-12-py3-arm64-mps-test
-      build-environment: macos-12-py3-arm64
+      sync-tag: macos-py3-arm64-mps-test
+      build-environment: ${{ needs.macos-py3-arm64-build.outputs.build-environment }}
       # Same as the build job
-      python-version: 3.9.12
-      test-matrix: ${{ needs.macos-12-py3-arm64-build.outputs.test-matrix }}
+      python-version: 3.12.7
+      test-matrix: ${{ needs.macos-py3-arm64-build.outputs.test-matrix }}
+      disable-monitor: false
+    secrets: inherit

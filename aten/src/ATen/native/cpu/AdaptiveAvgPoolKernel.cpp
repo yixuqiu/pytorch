@@ -218,8 +218,7 @@ cpu_adaptive_avg_pool2d_channels_last(
           int64_t d2 = 0;
           for (; d2 < size - (size % bVec::size()); d2 += bVec::size()) {
             bVec data_bvec = bVec::loadu(in + d2);
-            fVec data_fvec0, data_fvec1;
-            std::tie(data_fvec0, data_fvec1) = convert_to_float<scalar_t>(data_bvec);
+            auto [data_fvec0, data_fvec1] = convert_to_float<scalar_t>(data_bvec);
 
             fVec sum_fvec0 = fVec::loadu(sum + d2) + data_fvec0;
             fVec sum_fvec1 = fVec::loadu(sum + d2 + fVec::size()) + data_fvec1;
@@ -418,7 +417,7 @@ void cpu_adaptive_avg_pool3d(
   auto input = input_.contiguous();
   auto output = output_.contiguous();
 
-  auto input_data = input.data_ptr<scalar_t>();
+  auto input_data = input.const_data_ptr<scalar_t>();
   auto output_data = output.data_ptr<scalar_t>();
 
   int64_t ndim = input.ndimension();
@@ -434,7 +433,7 @@ void cpu_adaptive_avg_pool3d(
   // parallel on dim of N, C
   at::parallel_for(0, channels, 0, [&](int64_t begin, int64_t end) {
     for (const auto c : c10::irange(begin, end)) {
-      scalar_t* input_ptr = input_data + c * input_depth * input_height * input_width;
+      const scalar_t* input_ptr = input_data + c * input_depth * input_height * input_width;
       scalar_t* output_ptr = output_data + c * output_depth * output_height * output_width;
 
       for (const auto od : c10::irange(output_depth)) {
@@ -484,7 +483,7 @@ cpu_adaptive_avg_pool3d_channels_last(
   auto input = input_.contiguous(memory_format);
   auto output = output_.contiguous(memory_format);
 
-  auto input_data = input.data_ptr<scalar_t>();
+  auto input_data = input.const_data_ptr<scalar_t>();
   auto output_data = output.data_ptr<scalar_t>();
 
   int64_t nbatch = input.size(0);
@@ -521,7 +520,7 @@ cpu_adaptive_avg_pool3d_channels_last(
       scalar_t* out = output_data + i * channels;
       int64_t size = channels;
 
-      // Note: For oridinary usage scenario, each out lane should
+      // Note: For ordinary usage scenario, each out lane should
       //   fit in L1 cache; otherwise consider block dim C.
       // Pass I: zero the out lane
       int64_t d1 = 0;
@@ -536,7 +535,7 @@ cpu_adaptive_avg_pool3d_channels_last(
       for (const auto id : c10::irange(id0, id1)) {
         for (const auto ih : c10::irange(ih0, ih1)) {
           for (const auto iw : c10::irange(iw0, iw1)) {
-            scalar_t* in = input_data + n * input_depth * input_height * input_width * channels +
+            const scalar_t* in = input_data + n * input_depth * input_height * input_width * channels +
                 id * input_height * input_width * channels + ih * input_width * channels + iw * channels;
 
             int64_t d2 = 0;
@@ -580,7 +579,7 @@ cpu_adaptive_avg_pool3d_channels_last(
   auto input = input_.contiguous(memory_format);
   auto output = output_.contiguous(memory_format);
 
-  auto input_data = input.data_ptr<scalar_t>();
+  auto input_data = input.const_data_ptr<scalar_t>();
   auto output_data = output.data_ptr<scalar_t>();
 
   int64_t nbatch = input.size(0);
@@ -636,15 +635,14 @@ cpu_adaptive_avg_pool3d_channels_last(
       for (const auto id : c10::irange(id0, id1)) {
         for (const auto ih : c10::irange(ih0, ih1)) {
             for (const auto iw : c10::irange(iw0, iw1)) {
-                scalar_t* in = input_data + n * input_depth * input_height * input_width * channels +
+                const scalar_t* in = input_data + n * input_depth * input_height * input_width * channels +
                     id * input_height * input_width * channels +
                     ih * input_width * channels + iw * channels;
 
                 int64_t d2 = 0;
                 for (; d2 < size - (size % bVec::size()); d2 += bVec::size()) {
                     bVec data_bvec = bVec::loadu(in + d2);
-                    fVec data_fvec0, data_fvec1;
-                    std::tie(data_fvec0, data_fvec1) = convert_to_float<scalar_t>(data_bvec);
+                    auto [data_fvec0, data_fvec1] = convert_to_float<scalar_t>(data_bvec);
 
                     fVec sum_fvec0 = fVec::loadu(sum + d2) + data_fvec0;
                     fVec sum_fvec1 = fVec::loadu(sum + d2 + fVec::size()) + data_fvec1;
@@ -856,9 +854,9 @@ void adapative_avg_pool3d_backward_kernel_impl(
 
 } // anonymous namespace
 
-REGISTER_DISPATCH(adaptive_avg_pool2d_kernel, &adaptive_avg_pool2d_kernel_impl);
-REGISTER_DISPATCH(adaptive_avg_pool2d_backward_kernel, &adapative_avg_pool2d_backward_kernel_impl);
-REGISTER_DISPATCH(adaptive_avg_pool3d_kernel, &adaptive_avg_pool3d_kernel_impl);
-REGISTER_DISPATCH(adaptive_avg_pool3d_backward_kernel, &adapative_avg_pool3d_backward_kernel_impl);
+REGISTER_DISPATCH(adaptive_avg_pool2d_kernel, &adaptive_avg_pool2d_kernel_impl)
+REGISTER_DISPATCH(adaptive_avg_pool2d_backward_kernel, &adapative_avg_pool2d_backward_kernel_impl)
+REGISTER_DISPATCH(adaptive_avg_pool3d_kernel, &adaptive_avg_pool3d_kernel_impl)
+REGISTER_DISPATCH(adaptive_avg_pool3d_backward_kernel, &adapative_avg_pool3d_backward_kernel_impl)
 
 } // at::native

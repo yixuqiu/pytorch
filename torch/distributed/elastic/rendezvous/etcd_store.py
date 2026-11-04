@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -8,12 +9,15 @@ import datetime
 import random
 import time
 from base64 import b64decode, b64encode
-from typing import Optional
-
-import etcd  # type: ignore[import]
 
 # pyre-ignore[21]: Could not find name `Store` in `torch.distributed`.
 from torch.distributed import Store
+
+
+try:
+    import etcd  # type: ignore[import]
+except ModuleNotFoundError:
+    from . import _etcd_stub as etcd
 
 
 # Delay (sleep) for a small random amount to reduce CAS failures.
@@ -35,7 +39,7 @@ class EtcdStore(Store):
         etcd_client,
         etcd_store_prefix,
         # Default timeout same as in c10d/Store.hpp
-        timeout: Optional[datetime.timedelta] = None,
+        timeout: datetime.timedelta | None = None,
     ):
         super().__init__()  # required for pybind trampoline.
 
@@ -116,7 +120,8 @@ class EtcdStore(Store):
             except etcd.EtcdCompareFailed:
                 cas_delay()
 
-    def wait(self, keys, override_timeout: Optional[datetime.timedelta] = None):
+    # pyrefly: ignore [bad-override]
+    def wait(self, keys, override_timeout: datetime.timedelta | None = None):
         """
         Wait until all of the keys are published, or until timeout.
 
@@ -144,9 +149,9 @@ class EtcdStore(Store):
     # In case of `str`, utf-8 encoding is assumed.
     #
     def _encode(self, value) -> str:
-        if type(value) == bytes:
+        if type(value) is bytes:
             return b64encode(value).decode()
-        elif type(value) == str:
+        elif type(value) is str:
             return b64encode(value.encode()).decode()
         raise ValueError("Value must be of type str or bytes")
 
@@ -155,9 +160,9 @@ class EtcdStore(Store):
     # Return type is `bytes`, which is more convenient with the Store interface.
     #
     def _decode(self, value) -> bytes:
-        if type(value) == bytes:
+        if type(value) is bytes:
             return b64decode(value)
-        elif type(value) == str:
+        elif type(value) is str:
             return b64decode(value.encode())
         raise ValueError("Value must be of type str or bytes")
 
@@ -175,25 +180,32 @@ class EtcdStore(Store):
 
         while True:
             # Read whole directory (of keys), filter only the ones waited for
-            all_nodes = self.client.get(key=self.prefix)
-            req_nodes = {
-                node.key: node.value for node in all_nodes.children if node.key in b64_keys
-            }
+            all_nodes = None
+            try:
+                all_nodes = self.client.get(key=self.prefix)
+                req_nodes = {
+                    node.key: node.value
+                    for node in all_nodes.children
+                    if node.key in b64_keys
+                }
 
-            if len(req_nodes) == len(b64_keys):
-                # All keys are available
-                return req_nodes
+                if len(req_nodes) == len(b64_keys):
+                    # All keys are available
+                    return req_nodes
+            except etcd.EtcdKeyNotFound:
+                pass
 
             watch_timeout = deadline - time.time()
             if watch_timeout <= 0:
                 return None
 
             try:
+                index = all_nodes.etcd_index + 1 if all_nodes else 0
                 self.client.watch(
                     key=self.prefix,
                     recursive=True,
                     timeout=watch_timeout,
-                    index=all_nodes.etcd_index + 1,
+                    index=index,
                 )
             except etcd.EtcdWatchTimedOut:
                 if time.time() >= deadline:

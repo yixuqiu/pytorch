@@ -33,7 +33,8 @@
     "torch.nn.quantizable": "torch.ao.nn.quantizable",
     "torch.nn.quantizable.modules": "torch.ao.nn.quantizable.modules",
     "torch.nn.quantizable.modules.activation": "torch.ao.nn.quantizable.modules.activation",
-    "torch.nn.quantizable.modules.rnn": "torch.ao.nn.quantizable.modules.rnn"
+    "torch.nn.quantizable.modules.rnn": "torch.ao.nn.quantizable.modules.rnn",
+    "torch.distributed.tensor.device_mesh": "torch.distributed.device_mesh"
   },
   "torch.backends": [
     "contextmanager"
@@ -46,6 +47,9 @@
     "scatter",
     "gather"
   ],
+  "torch.csrc.jit.tensorexpr.scripts.bisect": [
+    "bisect"
+  ],
   "torch.cuda.nccl": [
     "init_rank",
     "is_available",
@@ -56,6 +60,7 @@
     "AllToAllOptions",
     "AllreduceCoalescedOptions",
     "AllreduceOptions",
+    "BackendBase",
     "BarrierOptions",
     "BroadcastOptions",
     "BuiltinCommHookType",
@@ -208,30 +213,6 @@
   "torch.distributed.optim.utils": [
     "Type"
   ],
-  "torch.distributed.pipeline.sync.pipe": [
-    "Pipeline"
-  ],
-  "torch.distributed.pipeline.sync.skip.layout": [
-    "SkipLayout",
-    "inspect_skip_layout"
-  ],
-  "torch.distributed.pipeline.sync.skip.portal": [
-    "Context",
-    "Portal",
-    "PortalBlue",
-    "PortalCopy",
-    "PortalOrange"
-  ],
-  "torch.distributed.pipeline.sync.skip.skippable": [
-    "Skippable"
-  ],
-  "torch.distributed.pipeline.sync.skip.tracker": [
-    "SkipTracker",
-    "SkipTrackerThroughPotals",
-    "ThreadLocal",
-    "current_skip_tracker",
-    "use_skip_tracker"
-  ],
   "torch.distributed.remote_device": [
     "Optional",
     "Union"
@@ -282,7 +263,9 @@
     "Future"
   ],
   "torch.fx": [
+    "PH",
     "ProxyableClassMeta",
+    "CodeGen",
     "Tracer",
     "symbolic_trace",
     "wrap"
@@ -481,9 +464,11 @@
     "matrix_norm",
     "matrix_power",
     "matrix_rank",
+    "matrix_sqrth",
     "multi_dot",
     "norm",
     "pinv",
+    "polar",
     "qr",
     "slogdet",
     "solve",
@@ -496,6 +481,31 @@
     "vander",
     "vecdot",
     "vector_norm"
+  ],
+  "torch.masked": [
+    "amax",
+    "amin",
+    "argmax",
+    "argmin",
+    "as_masked_tensor",
+    "cumprod",
+    "cumsum",
+    "is_masked_tensor",
+    "log_softmax",
+    "logaddexp",
+    "logsumexp",
+    "masked_tensor",
+    "MaskedTensor",
+    "mean",
+    "median",
+    "norm",
+    "normalize",
+    "prod",
+    "softmax",
+    "softmin",
+    "std",
+    "sum",
+    "var"
   ],
   "torch.multiprocessing": [
     "Array",
@@ -545,7 +555,6 @@
   "torch.multiprocessing.reductions": [
     "ForkingPickler",
     "Union",
-    "check_serializing_named_tensor",
     "register_after_fork"
   ],
   "torch.multiprocessing.spawn": [
@@ -651,13 +660,6 @@
     "Iterable",
     "Optional"
   ],
-  "torch.onnx": [
-    "Dict",
-    "OperatorExportTypes",
-    "Optional",
-    "TensorProtoDataType",
-    "TrainingMode"
-  ],
   "torch.overrides": [
     "BaseTorchFunctionMode",
     "TorchFunctionMode",
@@ -713,8 +715,6 @@
     "add_quant_dequant",
     "_assert_valid_qconfig",
     "convert",
-    "convert_dynamic_jit",
-    "convert_jit",
     "default_fixed_qparams_range_0to1_fake_quant",
     "default_affine_fixed_qparams_fake_quant",
     "default_debug_observer",
@@ -739,7 +739,6 @@
     "enable_fake_quant",
     "enable_observer",
     "fuse_conv_bn",
-    "fuse_conv_bn_jit",
     "fuse_conv_bn_relu",
     "fuse_linear_bn",
     "fuse_modules",
@@ -759,19 +758,13 @@
     "load_observer_state_dict",
     "no_observer_set",
     "prepare",
-    "prepare_dynamic_jit",
-    "prepare_jit",
     "prepare_qat",
     "propagate_qconfig_",
     "qconfig_equals",
     "_get_quant_type_to_str",
     "quantize",
     "quantize_dynamic",
-    "quantize_dynamic_jit",
-    "quantize_jit",
     "quantize_qat",
-    "script_qconfig",
-    "script_qconfig_dict",
     "swap_module"
   ],
   "torch.quantization.fake_quantize": [
@@ -867,17 +860,6 @@
     "quantize_qat",
     "swap_module"
   ],
-  "torch.quantization.quantize_jit": [
-    "convert_dynamic_jit",
-    "convert_jit",
-    "fuse_conv_bn_jit",
-    "prepare_dynamic_jit",
-    "prepare_jit",
-    "quantize_dynamic_jit",
-    "quantize_jit",
-    "script_qconfig",
-    "script_qconfig_dict"
-  ],
   "torch.quantization.stubs": [
     "DeQuantStub",
     "QuantStub",
@@ -902,7 +884,9 @@
     "cast",
     "closing",
     "contextmanager",
-    "get_source_lines_and_file"
+    "get_source_lines_and_file",
+    "get_default_mmap_options",
+    "set_default_mmap_options"
   ],
   "torch.sparse": [
     "BFloat16Tensor",
@@ -1019,10 +1003,10 @@
   "torch.types": [
     "Any",
     "Device",
+    "FileLike",
     "List",
     "Number",
     "Sequence",
-    "Tuple",
     "Union"
   ],
   "torch.utils.benchmark.utils.compare": [
@@ -1316,12 +1300,10 @@
     "_weight_norm_interface",
     "autocast",
     "broadcast_shapes",
-    "candidate",
     "compiled_with_cxx11_abi",
     "from_dlpack",
     "lobpcg",
     "lu",
-    "obj",
     "segment_reduce",
     "set_default_dtype",
     "set_grad_enabled",
@@ -1692,10 +1674,6 @@
     "get_args_parser",
     "run"
   ],
-  "torch.distributed.pipeline.sync": [
-    "NoChunk",
-    "WithDevice"
-  ],
   "torch.distributed.rpc.rref_proxy": [
     "Future",
     "partial",
@@ -1714,7 +1692,12 @@
     "env",
     "get_logger",
     "macros",
-    "record"
+    "record",
+    "DefaultLogsSpecs",
+    "LogsSpecs",
+    "Optional",
+    "Set",
+    "Type"
   ],
   "torch.fx.annotate": [
     "Proxy",
@@ -1771,9 +1754,7 @@
     "Optional",
     "Union"
   ],
-  "torch.fx.experimental.migrate_gradual_types.constraint": [
-    "TensorType"
-  ],
+  "torch.fx.experimental.migrate_gradual_types.constraint": [],
   "torch.fx.experimental.migrate_gradual_types.constraint_generator": [
     "ApplyBroadcasting",
     "BatchNorm2d",
@@ -1829,6 +1810,7 @@
     "IndexSelect",
     "List",
     "Prod",
+    "Sequence",
     "T",
     "TGreatestUpperBound",
     "TVar",
@@ -1843,6 +1825,7 @@
     "BinConstraintD",
     "BinConstraintT",
     "Conj",
+    "Constraint",
     "ConstraintGenerator",
     "D",
     "DVar",
@@ -1921,7 +1904,6 @@
     "get_torch_dispatch_modes",
     "has_proxy_slot",
     "is_sym_node",
-    "maybe_disable_fake_tensor_mode",
     "maybe_handle_decomp",
     "proxy_call",
     "set_meta",
@@ -1932,7 +1914,8 @@
     "track_tensor",
     "track_tensor_tree",
     "wrap_key",
-    "wrapper_and_args_for_make_fx"
+    "wrapper_and_args_for_make_fx",
+    "TorchFunctionMetadataMode"
   ],
   "torch.fx.experimental.rewriter": [
     "Any",
@@ -1989,16 +1972,16 @@
     "EqualityConstraint",
     "GuardOnDataDependentSymNode",
     "LoggingShapeGuardPrinter",
+    "SymExprPrinter",
     "RelaxedUnspecConstraint",
     "RuntimeAssert",
     "ShapeGuardPrinter",
+    "ShapeGuardPythonPrinter",
     "StrictMinMaxConstraint",
     "bind_symbols",
     "cast_symbool_to_symint_guardless",
     "constrain_range",
     "constrain_unify",
-    "definitely_false",
-    "definitely_true",
     "error",
     "eval_guards",
     "eval_is_non_overlapping_and_dense",
@@ -2008,12 +1991,20 @@
     "fx_placeholder_targets",
     "fx_placeholder_vals",
     "guard_bool",
-    "has_hint",
+    "has_guarding_hint",
     "is_symbolic",
     "parallel_and",
     "parallel_or",
     "safe_expand",
-    "uninteresting_files"
+    "uninteresting_files",
+    "CallMethodKey",
+    "DivideByKey",
+    "InnerTensorKey",
+    "PropagateUnbackedSymInts",
+    "ShapeEnvSettings",
+    "log_lru_cache_stats",
+    "PendingUnbackedSymbolNotFound",
+    "lru_cache"
   ],
   "torch.fx.experimental.unification.match": [
     "first",
@@ -2191,21 +2182,6 @@
     "Tuple",
     "abstractmethod"
   ],
-  "torch.onnx.verification": [
-    "Any",
-    "Callable",
-    "Collection",
-    "Dict",
-    "FrozenSet",
-    "List",
-    "Mapping",
-    "Number",
-    "Optional",
-    "Sequence",
-    "Set",
-    "Tuple",
-    "Union"
-  ],
   "torch.quantization.fx": [
     "convert",
     "fuse",
@@ -2365,15 +2341,6 @@
   ],
   "torch.utils.collect_env": [
     "namedtuple"
-  ],
-  "torch.utils.data.datapipes.gen_pyi": [
-    "Any",
-    "Dict",
-    "List",
-    "Set",
-    "Tuple",
-    "Union",
-    "defaultdict"
   ],
   "torch.utils.data.datapipes.utils.snapshot": [
     "IterDataPipe",
@@ -2603,5 +2570,69 @@
   ],
   "torch.version": [
     "get_file_path"
+  ],
+  "torch.ao.nn.intrinsic.modules": [
+    "_FusedModule"
+  ],
+  "torch.distributed.benchmarks.benchmark_ddp_rpc": [
+    "BackendType",
+    "DDP",
+    "DistributedOptimizer",
+    "RRef",
+    "TensorPipeRpcBackendOptions"
+  ],
+  "torch.distributed.pipelining": [
+    "Pipe",
+    "PipelineStage",
+    "SplitPoint",
+    "pipe_split",
+    "pipeline"
+  ],
+  "torch.distributed.pipelining.microbatch": [
+    "Any",
+    "Dict",
+    "List",
+    "Optional",
+    "Tuple",
+    "tree_flatten",
+    "tree_unflatten"
+  ],
+  "torch.export": [
+    "Constraint",
+    "ShapesCollection"
+  ],
+  "torch.export.dynamic_shapes": [
+    "Constraint",
+    "ShapesCollection"
+  ],
+  "torch.export.graph_signature": [
+    "TokenArgument"
+  ],
+  "torch.fx.passes.runtime_assert": [
+    "Any",
+    "Dict",
+    "GraphModule",
+    "Optional",
+    "Set",
+    "ShapeEnv",
+    "SymNode",
+    "compatibility",
+    "lazy_format_graph_code"
+  ],
+  "torch.library": [
+    "opcheck",
+    "register_autograd",
+    "register_kernel"
+  ],
+  "torch.mtia": [
+    "DeferredMtiaCallError",
+    "StreamContext"
+  ],
+  "torch.utils.data.datapipes.dataframe.dataframe_wrapper": [
+    "Any",
+    "Optional"
+  ],
+  "torch.utils.hipify.hipify_python": [
+    "TrieNode"
   ]
 }

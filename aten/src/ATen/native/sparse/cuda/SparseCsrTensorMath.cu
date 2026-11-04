@@ -29,6 +29,7 @@
 #include <type_traits>
 
 
+#include <ATen/cuda/cub.cuh>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAUtils.h>
 #include <ATen/cuda/ThrustAllocator.h>
@@ -68,7 +69,7 @@ template <typename input_t, typename output_t>
 void convert_indices_from_coo_to_csr_cuda(const Tensor& result, const Tensor& input, const int64_t size) {
   int64_t numel = input.numel();
   const input_t* data_in = input.const_data_ptr<input_t>();
-  output_t* data_out = result.data_ptr<output_t>();
+  output_t* data_out = result.mutable_data_ptr<output_t>();
 
   if (numel == 0) {
     result.zero_();
@@ -119,7 +120,7 @@ void convert_indices_from_csr_to_coo_cuda(const Tensor& indices, const Tensor& c
   auto row1 = indices.select(0, transpose?batch_ndim + 0:batch_ndim + 1);
   auto col_indices_ = col_indices.expect_contiguous();
   row1.copy_(col_indices_->view({-1}));
-  output_t* data_out = row0.data_ptr<output_t>();
+  output_t* data_out = row0.mutable_data_ptr<output_t>();
 
   // Run nrows * nbatches threads...
   int64_t nbatches = total_nnz / nnz;
@@ -229,14 +230,14 @@ Tensor& add_out_dense_sparse_compressed_cuda(
              &src_layout]() {
               auto batch_count =
                   resultBuffer.dim() > 2 ? resultBuffer.size(-3) : 1;
-              scalar_t* values_accessor = valuesBuffer.data_ptr<scalar_t>();
-              scalar_t* out_ptr = resultBuffer.data_ptr<scalar_t>();
+              const scalar_t* values_accessor = valuesBuffer.const_data_ptr<scalar_t>();
+              scalar_t* out_ptr = resultBuffer.mutable_data_ptr<scalar_t>();
               scalar_t cast_value = alpha.to<scalar_t>();
 
-              index_t* compressed_indices_accessor =
-                  src_compressed_indices.data_ptr<index_t>();
-              index_t* plain_indices_accessor =
-                  src_plain_indices.data_ptr<index_t>();
+              const index_t* compressed_indices_accessor =
+                  src_compressed_indices.const_data_ptr<index_t>();
+              const index_t* plain_indices_accessor =
+                  src_plain_indices.const_data_ptr<index_t>();
               int64_t out_storage_offset = resultBuffer.storage_offset();
 
               auto out_strides = resultBuffer.strides();
@@ -266,9 +267,8 @@ Tensor& add_out_dense_sparse_compressed_cuda(
               // dimension.
               thrust::for_each(
                   policy,
-                  thrust::make_counting_iterator(int64_t(0)),
-                  thrust::make_counting_iterator(
-                      int64_t(src_compressed_indices.size(-1) - 1)),
+                  cccl_counting_iterator<int64_t>{0ll},
+                  cccl_counting_iterator<int64_t>{src_compressed_indices.size(-1) - 1},
                   [values_accessor,
                    compressed_indices_accessor,
                    plain_indices_accessor,
@@ -340,8 +340,12 @@ Tensor& add_out_sparse_compressed_cuda(
       return out;
     }
 
-    at::native::resize_as_sparse_compressed_(out, self);
-    sparse::impl::cuda::add_out_sparse_csr(self, other, Scalar(1), alpha, out);
+    // csrgeam2 must not read from storage that out is written to and
+    // resized into, so operate on clones of any input aliasing out.
+    const Tensor self_ = sparse_compressed_members_alias(self, out) ? self.clone() : self;
+    const Tensor other_ = sparse_compressed_members_alias(other, out) ? other.clone() : other;
+    at::native::resize_as_sparse_compressed_(out, self_);
+    sparse::impl::cuda::add_out_sparse_csr(self_, other_, Scalar(1), alpha, out);
   }
   return out;
 }
@@ -389,7 +393,7 @@ struct Reduction...Op {
 };
 
 
-Tensor _sparse_csr_..._cuda(const Tensor& input, IntArrayRef dims_to_sum, bool keepdim, c10::optional<ScalarType> dtype) {
+Tensor _sparse_csr_..._cuda(const Tensor& input, IntArrayRef dims_to_sum, bool keepdim, std::optional<ScalarType> dtype) {
   ...
       result = reduce_sparse_csr_cuda_template<scalar_t>(input_, dims_to_sum, keepdim, Reduction...Op<scalar_t>());
   ...
@@ -479,9 +483,8 @@ Tensor reduce_sparse_csr_dim0_cuda_template(const Tensor& sparse, ReductionOp ro
   Tensor values = sparse.values();
   auto ncols = sparse.size(1);
   auto nnz = col_indices.numel();
-  Tensor new_col_indices;
 
-  std::tie(new_col_indices, std::ignore) = at::_unique(col_indices, true, false);
+  auto new_col_indices = std::get<0>(at::_unique(col_indices, true, false));
   auto new_nnz = new_col_indices.numel();
   Tensor new_crow_indices = at::tensor(ArrayRef<int64_t>{0, new_nnz}, col_indices.options());
 
@@ -493,15 +496,15 @@ Tensor reduce_sparse_csr_dim0_cuda_template(const Tensor& sparse, ReductionOp ro
       values.options(), values.scalar_type(), new_nnz);
   Tensor new_values = std::get<0>(acc_buffer);
   Tensor new_values_acc = std::get<1>(acc_buffer);
-  scalar_t* values_ptr = values.data_ptr<scalar_t>();
-  acc_t* new_values_acc_ptr = new_values_acc.data_ptr<acc_t>();
+  const scalar_t* values_ptr = values.const_data_ptr<scalar_t>();
+  acc_t* new_values_acc_ptr = new_values_acc.mutable_data_ptr<acc_t>();
   int64_t THREADS = at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock;
   int64_t BLOCKS = (new_nnz + THREADS) / THREADS;
   at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_INDEX_TYPES(col_indices.scalar_type(), "reduce_sparse_csr_dim0_cuda_indices",
                           [&]() {
-                            index_t* col_indices_ptr = col_indices.data_ptr<index_t>();
-                            index_t* new_col_indices_ptr = new_col_indices.data_ptr<index_t>();
+                            const index_t* col_indices_ptr = col_indices.const_data_ptr<index_t>();
+                            const index_t* new_col_indices_ptr = new_col_indices.template const_data_ptr<index_t>();
                             reduce_sparse_csr_dim0_cuda_kernel<<<BLOCKS, THREADS, 0, stream>>>(new_values_acc_ptr,
                                                                                                new_col_indices_ptr,
                                                                                                new_nnz,
@@ -591,9 +594,9 @@ Tensor reduce_sparse_csr_dim1_cuda_template(const Tensor& sparse, ReductionOp ro
 
   AT_DISPATCH_INDEX_TYPES(crow_indices.scalar_type(), "reduce_sparse_csr_dim1_cuda_indices",
                           [&]() {
-                            index_t* crow_indices_ptr = crow_indices.data_ptr<index_t>();
-                            index_t* new_crow_indices_ptr = new_crow_indices.data_ptr<index_t>();
-                            index_t* row_map_ptr = row_map.data_ptr<index_t>();
+                            const index_t* crow_indices_ptr = crow_indices.const_data_ptr<index_t>();
+                            index_t* new_crow_indices_ptr = new_crow_indices.mutable_data_ptr<index_t>();
+                            index_t* row_map_ptr = row_map.mutable_data_ptr<index_t>();
                             reduce_crow_indices_dim1_cuda_kernel<<<1, 1, 0, stream>>>(new_crow_indices_ptr,
                                                                                       row_map_ptr,
                                                                                       crow_indices_ptr,
@@ -605,8 +608,8 @@ Tensor reduce_sparse_csr_dim1_cuda_template(const Tensor& sparse, ReductionOp ro
                             new_values.resize_(new_nnz);
                             new_values_acc.resize_(new_nnz);
 
-                            scalar_t* values_ptr = values.data_ptr<scalar_t>();
-                            acc_t* new_values_acc_ptr = new_values_acc.data_ptr<acc_t>();
+                            const scalar_t* values_ptr = values.const_data_ptr<scalar_t>();
+                            acc_t* new_values_acc_ptr = new_values_acc.mutable_data_ptr<acc_t>();
                             reduce_sparse_csr_dim1_cuda_kernel<<<BLOCKS, THREADS, 0, stream>>>(new_values_acc_ptr,
                                                                                                values_ptr,
                                                                                                crow_indices_ptr,
@@ -706,9 +709,83 @@ struct ReductionMulOp {
   __forceinline__ scalar_t identity_cpu() const { return 1; }
 };
 
+void _apply_sparse_csr_linear_solve(
+  const Tensor& A,
+  const Tensor& b,
+  const bool left,
+  const Tensor& x) {
+#if defined(USE_ROCM) || !defined(USE_CUDSS)
+  TORCH_CHECK(
+      false,
+      "Calling linear solver with sparse tensors requires compiling ",
+      "PyTorch with CUDA cuDSS and is not supported in ROCm build.");
+#else
+  // layout check
+  TORCH_CHECK(A.is_sparse_csr(), "A must be a CSR matrix");
+  TORCH_CHECK(b.layout() == kStrided, "b must be a strided tensor");
+  TORCH_CHECK(x.layout() == kStrided, "x must be a strided tensor");
+  // dim check
+  TORCH_CHECK(b.dim() == 1, "b must be a 1D tensor");
+  TORCH_CHECK(b.stride(0) == 1, "b must be a column major tensor");
+  TORCH_CHECK(b.size(0) == A.size(0), "linear system size mismatch.");
+  TORCH_CHECK(x.dim() == 1, "x must be a 1D tensor");
+  TORCH_CHECK(x.stride(0) == 1, "x must be a column major tensor");
+  TORCH_CHECK(x.size(0) == A.size(1), "linear system size mismatch.");
+  TORCH_CHECK(A.dtype() == b.dtype() && A.dtype() == x.dtype(), "A, x, and b must have the same dtype");
+  TORCH_CHECK(left == true, "only left == true is supported by the Sparse CSR backend")
+
+  Tensor crow = A.crow_indices();
+  Tensor col = A.col_indices();
+  if (crow.scalar_type() != ScalarType::Int) {
+    crow = crow.to(crow.options().dtype(ScalarType::Int));
+    col = col.to(col.options().dtype(ScalarType::Int));
+  }
+  const int* rowOffsets = crow.const_data_ptr<int>();
+  const int* colIndices = col.const_data_ptr<int>();
+  Tensor values = A.values();
+  // cuDSS data structures and handle initialization
+  cudssConfig_t config;
+  cudssMatrix_t b_mt;
+  cudssMatrix_t A_mt;
+  cudssMatrix_t x_mt;
+  cudssData_t cudss_data;
+  cudssHandle_t handle = at::cuda::getCurrentCudssHandle();
+
+  TORCH_CUDSS_CHECK(cudssConfigCreate(&config));
+  TORCH_CUDSS_CHECK(cudssDataCreate(handle, &cudss_data));
+
+  AT_DISPATCH_FLOATING_TYPES(values.scalar_type(), "create_matrix", ([&] {
+    const scalar_t* values_ptr = values.const_data_ptr<scalar_t>();
+    const scalar_t* b_ptr = b.const_data_ptr<scalar_t>();
+    scalar_t* x_ptr = x.mutable_data_ptr<scalar_t>();
+    auto CUDA_R_TYP = std::is_same_v<scalar_t, double> ? CUDA_R_64F : CUDA_R_32F;
+    // cuDSS descriptors require non-const pointers for the read-only A and b.
+    TORCH_CUDSS_CHECK(cudssMatrixCreateDn(
+        &b_mt, b.size(0), 1, b.size(0), const_cast<scalar_t*>(b_ptr),
+        CUDA_R_TYP, CUDSS_LAYOUT_COL_MAJOR));
+    TORCH_CUDSS_CHECK(cudssMatrixCreateDn(&x_mt, x.size(0), 1, x.size(0), x_ptr, CUDA_R_TYP, CUDSS_LAYOUT_COL_MAJOR));
+    TORCH_CUDSS_CHECK(cudssMatrixCreateCsr(
+        &A_mt, A.size(0), A.size(1), A._nnz(),
+        const_cast<int*>(rowOffsets),
+        const_cast<int*>(rowOffsets + crow.size(0)),
+        const_cast<int*>(colIndices), const_cast<scalar_t*>(values_ptr),
+        CUDA_R_32I, CUDA_R_TYP, CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL,
+        CUDSS_BASE_ZERO));
+  }));
+  TORCH_CUDSS_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, config, cudss_data, A_mt, x_mt, b_mt));
+  TORCH_CUDSS_CHECK(cudssExecute(handle, CUDSS_PHASE_FACTORIZATION, config, cudss_data, A_mt, x_mt, b_mt));
+  TORCH_CUDSS_CHECK(cudssExecute(handle, CUDSS_PHASE_SOLVE, config, cudss_data, A_mt, x_mt, b_mt));
+  // Destroy the opaque objects
+  TORCH_CUDSS_CHECK(cudssConfigDestroy(config));
+  TORCH_CUDSS_CHECK(cudssDataDestroy(handle, cudss_data));
+  TORCH_CUDSS_CHECK(cudssMatrixDestroy(A_mt));
+  TORCH_CUDSS_CHECK(cudssMatrixDestroy(x_mt));
+  TORCH_CUDSS_CHECK(cudssMatrixDestroy(b_mt));
+#endif
+}
 } // namespace
 
-Tensor _sparse_csr_sum_cuda(const Tensor& input, IntArrayRef dims_to_sum, bool keepdim, c10::optional<ScalarType> dtype) {
+Tensor _sparse_csr_sum_cuda(const Tensor& input, IntArrayRef dims_to_sum, bool keepdim, std::optional<ScalarType> dtype) {
   ScalarType dtype_ = dtype.value_or(input.scalar_type());
   Tensor input_ = at::sparse_csr::to_type(input, dtype_);
   Tensor result;
@@ -724,7 +801,7 @@ Tensor _sparse_csr_sum_cuda(const Tensor& input, IntArrayRef dims_to_sum, bool k
   return result;
 }
 
-Tensor _sparse_csr_prod_cuda(const Tensor& input, IntArrayRef dims_to_reduce, bool keepdim, c10::optional<ScalarType> dtype) {
+Tensor _sparse_csr_prod_cuda(const Tensor& input, IntArrayRef dims_to_reduce, bool keepdim, std::optional<ScalarType> dtype) {
   ScalarType dtype_ = dtype.value_or(input.scalar_type());
   Tensor input_ = input.to(dtype_);
   Tensor result;
@@ -735,5 +812,13 @@ Tensor _sparse_csr_prod_cuda(const Tensor& input, IntArrayRef dims_to_reduce, bo
     });
   return result;
 }
+
+Tensor _sparse_csr_linear_solve(const Tensor& A, const Tensor& b, const bool left) {
+  Tensor b_copy = b.contiguous();
+  Tensor out = b_copy.new_empty(b_copy.sizes());
+  _apply_sparse_csr_linear_solve(A, b_copy, left, out);
+  return out;
+}
+
 
 } // namespace at::native

@@ -1,4 +1,7 @@
+# mypy: allow-untyped-defs
 from contextlib import contextmanager
+from typing import NoReturn
+
 
 try:
     from torch._C import _itt
@@ -6,13 +9,13 @@ except ImportError:
 
     class _ITTStub:
         @staticmethod
-        def _fail(*args, **kwargs):
+        def _fail(*args, **kwargs) -> NoReturn:
             raise RuntimeError(
                 "ITT functions not installed. Are you sure you have a ITT build?"
             )
 
         @staticmethod
-        def is_available():
+        def is_available() -> bool:
             return False
 
         rangePush = _fail

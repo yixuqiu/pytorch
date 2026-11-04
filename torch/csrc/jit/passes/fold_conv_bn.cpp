@@ -10,7 +10,6 @@
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #else
-#include <ATen/ops/empty_like.h>
 #include <ATen/ops/ones_like.h>
 #include <ATen/ops/rsqrt.h>
 #include <ATen/ops/zeros_like.h>
@@ -19,8 +18,7 @@
 #include <stack>
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 std::tuple<at::Tensor, at::Tensor> computeUpdatedConvWeightAndBias(
     const ConvBNParameters& p) {
@@ -105,7 +103,7 @@ void addBiasForConvIfNone(Module& module, const std::string& pattern_name) {
     if (!t->hasAttribute("bias")) {
       auto optional_tensor_type = OptionalType::create(TensorType::get());
       t->addAttribute("bias", std::move(optional_tensor_type), true);
-      auto optional_tensor = c10::optional<at::Tensor>();
+      auto optional_tensor = std::optional<at::Tensor>();
       module.setattr("bias", std::move(optional_tensor));
       replaceConvBiasWithGetAttr(module);
     }
@@ -280,7 +278,7 @@ void FoldConvBatchNormHelper::analyze(
 
       GRAPH_DEBUG("number of Conv-BatchNorm matches: ", matches.size());
       Graph* g = method.graph().get();
-      if (!conv_bn_paths_.count(g)) {
+      if (!conv_bn_paths_.contains(g)) {
         // This is to make sure we don't visit one graph multiple times
         conv_bn_paths_[g] = {};
         for (const Match& match : matches) {
@@ -407,5 +405,4 @@ graph(%self, %input, %conv, %batchnorm):
   return m;
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

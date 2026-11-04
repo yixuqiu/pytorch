@@ -7,6 +7,13 @@ if [[ "$BUILD_ENVIRONMENT" != *win-* ]]; then
     script_dir="$( cd "$(dirname "${BASH_SOURCE[0]}")" || exit ; pwd -P )"
 
     if which sccache > /dev/null; then
+        # Clear SCCACHE_BUCKET and SCCACHE_REGION if they are empty, otherwise
+        # sccache will complain about invalid bucket configuration
+        if [[ -z "${SCCACHE_BUCKET:-}" ]]; then
+          unset SCCACHE_BUCKET
+          unset SCCACHE_REGION
+        fi
+
         # Save sccache logs to file
         sccache --stop-server > /dev/null  2>&1 || true
         rm -f ~/sccache_error.log || true

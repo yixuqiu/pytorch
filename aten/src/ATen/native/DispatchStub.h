@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <utility>
+#include <variant>
 
 // Implements instruction set specific function dispatch.
 //
@@ -18,7 +19,7 @@
 //
 // In native/MyKernel.h:
 //   using fn_type = void(*)(const Tensor& x);
-//   DECLARE_DISPATCH(fn_type, stub);
+//   DECLARE_DISPATCH(fn_type, stub)
 //
 // In native/MyKernel.cpp
 //   DEFINE_DISPATCH(stub);
@@ -35,7 +36,22 @@
 //
 // TODO: CPU instruction set selection should be folded into whatever
 // the main dispatch mechanism is.
-
+//
+// Supported device types for registration:
+//   - CPU: Central Processing Unit
+//   - CUDA: NVIDIA GPUs
+//   - HIP: AMD GPUs
+//   - MPS: Apple Silicon GPUs (Metal Performance Shaders)
+//   - MTIA: Meta Training and Inference Devices
+//   - XPU: Intel GPUs
+//   - HPU: Reserved for HPU (Intel Gaudi) device types
+//   - PrivateUse1: Reserved for private/custom device types
+//
+// If you want to update the list of supported devices, add a new dispatch_ptr
+// member in DispatchStubImpl.h and update the get_call_ptr switch.
+// As well you will need to update the inlined list in 'is_device_supported`
+//
+//
 // ignore warnings about DispatchStub::DEFAULT, AVX, AVX2 defined elsewhere
 C10_CLANG_DIAGNOSTIC_PUSH()
 C10_CLANG_DIAGNOSTIC_IGNORE("-Wundefined-var-template")
@@ -48,12 +64,24 @@ enum class CPUCapability {
   VSX = 1,
 #elif defined(HAVE_ZVECTOR_CPU_DEFINITION)
   ZVECTOR = 1,
+#elif defined(HAVE_SVE_CPU_DEFINITION)
+  SVE256 = 1,
+  SVE128 = 2,
 #else
   AVX2 = 1,
   AVX512 = 2,
 #endif
   NUM_OPTIONS
 };
+
+// Enum for error types
+enum class ErrorType {
+  MissingDeviceKernel,
+  DeviceNotSupported
+};
+
+// Alias for the return type using std::variant
+using DispatchResult = std::variant<void*, ErrorType>;
 
 CPUCapability get_cpu_capability();
 
@@ -67,6 +95,56 @@ struct DispatchStub;
  * number of specialization of the DispatchStub<> class.
  */
 struct TORCH_API DispatchStubImpl {
+
+  // The DispatchStubImpl::try_get_call_ptr() method is used to get the call
+  // pointer for a given device type. If the call pointer is not found,
+  // DispatchStubImpl::try_get_call_ptr() returns an ErrorType.
+  // The main difference between try_get_call_ptr() and get_call_ptr() is that
+  // try_get_call_ptr() will return the ErrorType and not raise an exception.
+  DispatchResult try_get_call_ptr(
+    c10::DeviceType device_type
+    , void *DEFAULT
+#ifdef HAVE_AVX512_CPU_DEFINITION
+      , void *AVX512
+#endif
+#ifdef HAVE_AVX2_CPU_DEFINITION
+      , void *AVX2
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+      , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+      , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , void *SVE128
+      , void *SVE256
+#endif
+  );
+
+  // Analogous to try_get_call_ptr(), but it will return the ErrorType and not
+  // raise an exception.
+  DispatchResult try_choose_cpu_impl(
+    void *DEFAULT
+#ifdef HAVE_AVX512_CPU_DEFINITION
+    , void *AVX512
+#endif
+#ifdef HAVE_AVX2_CPU_DEFINITION
+    , void *AVX2
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+    , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+    , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+    , void *SVE128
+    , void *SVE256
+#endif
+  );
+
+
   void* get_call_ptr(
     c10::DeviceType device_type
     , void *DEFAULT
@@ -81,6 +159,10 @@ struct TORCH_API DispatchStubImpl {
 #endif
 #ifdef HAVE_ZVECTOR_CPU_DEFINITION
       , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , void *SVE128
+      , void *SVE256
 #endif
   );
 
@@ -103,6 +185,10 @@ struct TORCH_API DispatchStubImpl {
 #ifdef HAVE_ZVECTOR_CPU_DEFINITION
     , void *ZVECTOR
 #endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+    , void *SVE128
+    , void *SVE256
+#endif
   );
 
   // Fixing dispatch error in Windows debug builds.
@@ -112,12 +198,22 @@ struct TORCH_API DispatchStubImpl {
     void* cuda_dispatch_ptr;
     void* hip_dispatch_ptr;
     void* mps_dispatch_ptr;
+    void* mtia_dispatch_ptr;
+  #if defined(USE_XPU)
+    void* xpu_dispatch_ptr;
+  #endif
+    void* hpu_dispatch_ptr;
     void* privateuse1_dispatch_ptr;
   #else
     std::atomic<void*> cpu_dispatch_ptr{nullptr};
     void* cuda_dispatch_ptr = nullptr;
     void* hip_dispatch_ptr = nullptr;
     void* mps_dispatch_ptr = nullptr;
+    void* mtia_dispatch_ptr = nullptr;
+  #if defined(USE_XPU)
+    void* xpu_dispatch_ptr = nullptr;
+  #endif
+    void* hpu_dispatch_ptr = nullptr;
     void* privateuse1_dispatch_ptr = nullptr;
   #endif
 };
@@ -131,7 +227,19 @@ struct DispatchStub<rT (*)(Args...), T> {
   DispatchStub& operator=(const DispatchStub&) = delete;
 
 private:
-  FnPtr get_call_ptr(c10::DeviceType device_type) {
+  FnPtr get_call_ptr(const c10::DeviceType device_type) {
+    // NOTE [ DispatchStub CPU fast path ]
+    // CPU is the only device whose kernel is chosen dynamically (by CPU
+    // capability) and cached lazily in cpu_dispatch_ptr; every other device
+    // holds a plain pointer set at registration time. cpu_dispatch_ptr is a
+    // write-once cache: a non-null value is final and points at static code,
+    // so a relaxed load is sufficient. Null (first call) falls through to the
+    // out-of-line slow path, which computes, caches, and does all error checks.
+    if (device_type == c10::DeviceType::CPU) {
+      if (void* fptr = impl.cpu_dispatch_ptr.load(std::memory_order_relaxed)) {
+        return reinterpret_cast<FnPtr>(fptr);
+      }
+    }
     return reinterpret_cast<FnPtr>(
       impl.get_call_ptr(device_type
       , reinterpret_cast<void*>(DEFAULT)
@@ -146,6 +254,10 @@ private:
 #endif
 #ifdef HAVE_ZVECTOR_CPU_DEFINITION
       , reinterpret_cast<void*>(ZVECTOR)
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , reinterpret_cast<void*>(SVE128)
+      , reinterpret_cast<void*>(SVE256)
 #endif
       )
     );
@@ -162,6 +274,16 @@ public:
     impl.cuda_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
   }
 
+  #if defined(USE_XPU)
+  void set_xpu_dispatch_ptr(FnPtr fn_ptr){
+    impl.xpu_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+  #endif
+
+  void set_hpu_dispatch_ptr(FnPtr fn_ptr) {
+    impl.hpu_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
   void set_hip_dispatch_ptr(FnPtr fn_ptr) {
     impl.hip_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
   }
@@ -170,8 +292,40 @@ public:
     impl.mps_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
   }
 
+    void set_mtia_dispatch_ptr(FnPtr fn_ptr) {
+    impl.mtia_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
   void set_privateuse1_dispatch_ptr(FnPtr fn_ptr) {
     impl.privateuse1_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
+  // Returns true if the dispatcher has a kernel registered for this device
+  // type.
+  bool is_device_supported(const c10::DeviceType device_type) {
+    auto result = impl.try_get_call_ptr(device_type
+      , reinterpret_cast<void*>(DEFAULT)
+#ifdef HAVE_AVX512_CPU_DEFINITION
+      , reinterpret_cast<void*>(AVX512)
+#endif
+#ifdef HAVE_AVX2_CPU_DEFINITION
+      , reinterpret_cast<void*>(AVX2)
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+      , reinterpret_cast<void*>(VSX)
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+      , reinterpret_cast<void*>(ZVECTOR)
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , reinterpret_cast<void*>(SVE128)
+      , reinterpret_cast<void*>(SVE256)
+#endif
+      );
+    if (std::holds_alternative<ErrorType>(result)){
+      return false;
+    }
+    return true;
   }
 
   static TORCH_API FnPtr DEFAULT;
@@ -187,6 +341,10 @@ public:
 #ifdef HAVE_ZVECTOR_CPU_DEFINITION
   static TORCH_API FnPtr ZVECTOR;
 #endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+  static TORCH_API FnPtr SVE128;
+  static TORCH_API FnPtr SVE256;
+#endif
 private:
   DispatchStubImpl impl;
 };
@@ -196,6 +354,20 @@ template <typename DispatchStub>
 struct RegisterCUDADispatch {
   RegisterCUDADispatch(DispatchStub &stub, typename DispatchStub::FnPtr value) {
     stub.set_cuda_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterXPUDispatch {
+  RegisterXPUDispatch(DispatchStub &stub, typename DispatchStub::FnPtr value){
+    stub.set_xpu_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterHPUDispatch {
+  RegisterHPUDispatch(DispatchStub &stub, typename DispatchStub::FnPtr value){
+    stub.set_hpu_dispatch_ptr(value);
   }
 };
 
@@ -211,6 +383,13 @@ struct RegisterHIPDispatch {
   RegisterHIPDispatch(DispatchStub &stub, typename DispatchStub::FnPtr value) {
     // TODO: make this point at hip_dispatch_ptr
     stub.set_cuda_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterMTIADispatch {
+  RegisterMTIADispatch(DispatchStub &stub, typename DispatchStub::FnPtr value) {
+    stub.set_mtia_dispatch_ptr(value);
   }
 };
 
@@ -232,6 +411,9 @@ struct RegisterPRIVATEUSE1Dispatch {
     name##_DECLARE_DISPATCH_type() = default;                                              \
     name##_DECLARE_DISPATCH_type(const name##_DECLARE_DISPATCH_type&) = delete;            \
     name##_DECLARE_DISPATCH_type& operator=(const name##_DECLARE_DISPATCH_type&) = delete; \
+    name##_DECLARE_DISPATCH_type(name##_DECLARE_DISPATCH_type&&) = delete;                 \
+    name##_DECLARE_DISPATCH_type& operator=(name##_DECLARE_DISPATCH_type&&) = delete;      \
+    ~name##_DECLARE_DISPATCH_type() = default;                                             \
   };                                                                                       \
   extern TORCH_API struct name##_DECLARE_DISPATCH_type name;
 
@@ -264,6 +446,14 @@ struct RegisterPRIVATEUSE1Dispatch {
 #define REGISTER_ZVECTOR_DISPATCH(name, fn)
 #endif
 
+#ifdef HAVE_SVE_CPU_DEFINITION
+#define REGISTER_SVE128_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, SVE128, fn)
+#define REGISTER_SVE256_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, SVE256, fn)
+#else
+#define REGISTER_SVE128_DISPATCH(name, fn)
+#define REGISTER_SVE256_DISPATCH(name, fn)
+#endif
+
 // Macro to register the same kernel for all CPU arch types. This is useful
 // if a kernel does not benefit from being recompiled across different arch types.
 #define REGISTER_ALL_CPU_DISPATCH(name, fn)                                    \
@@ -271,7 +461,9 @@ struct RegisterPRIVATEUSE1Dispatch {
   REGISTER_AVX512_DISPATCH(name, fn)                                           \
   REGISTER_AVX2_DISPATCH(name, fn)                                             \
   REGISTER_VSX_DISPATCH(name, fn)                                              \
-  REGISTER_ZVECTOR_DISPATCH(name, fn)
+  REGISTER_ZVECTOR_DISPATCH(name, fn)                                          \
+  REGISTER_SVE128_DISPATCH(name, fn)                                           \
+  REGISTER_SVE256_DISPATCH(name, fn)
 
 #define REGISTER_NO_CPU_DISPATCH(name)                                         \
   REGISTER_ALL_CPU_DISPATCH(name, nullptr)
@@ -279,11 +471,20 @@ struct RegisterPRIVATEUSE1Dispatch {
 #define REGISTER_CUDA_DISPATCH(name, fn) \
   static RegisterCUDADispatch<struct name##_DECLARE_DISPATCH_type> name ## __register(name, fn);
 
+#define REGISTER_XPU_DISPATCH(name, fn) \
+  static RegisterXPUDispatch<struct name##_DECLARE_DISPATCH_type> name ## __register(name, fn);
+
+#define REGISTER_HPU_DISPATCH(name, fn) \
+  static RegisterHPUDispatch<struct name##_DECLARE_DISPATCH_type> name ## __register(name, fn);
+
 #define REGISTER_HIP_DISPATCH(name, fn) \
   static RegisterHIPDispatch<struct name##_DECLARE_DISPATCH_type> name ## __register(name, fn);
 
 #define REGISTER_MPS_DISPATCH(name, fn) \
   static RegisterMPSDispatch<struct name##_DECLARE_DISPATCH_type> name ## __register(name, fn);
+
+#define REGISTER_MTIA_DISPATCH(name, fn) \
+  static RegisterMTIADispatch<struct name##_DECLARE_DISPATCH_type> name ## __register(name, fn);
 
 #define REGISTER_PRIVATEUSE1_DISPATCH(name, fn) \
   static RegisterPRIVATEUSE1Dispatch<struct name##_DECLARE_DISPATCH_type> name ## __register(name, fn);
@@ -303,12 +504,15 @@ struct RegisterPRIVATEUSE1Dispatch {
 #elif defined(CPU_CAPABILITY)
 // REGISTER_DISPATCH now dispatches an AVX512 kernel to nullptr but registers other dispatches.
 // ALSO_REGISTER_AVX512_DISPATCH should be used for ensuring AVX512 dispatch, among others.
+// ALSO_REGISTER_SVE256_DISPATCH should be used for ensuring SVE256 dispatch, among others.
 #ifdef CPU_CAPABILITY_AVX512
-#define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, nullptr)
+#define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, ((void*)(fn) ? nullptr : nullptr))
 #else
 #define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
 #endif
 #define ALSO_REGISTER_AVX512_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#define ALSO_REGISTER_SVE128_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#define ALSO_REGISTER_SVE256_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
 #endif
 } // namespace at::native
 

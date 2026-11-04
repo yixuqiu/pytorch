@@ -4,28 +4,22 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/MemoryOverlap.h>
 #include <ATen/TensorUtils.h>
-#include <ATen/WrapDimUtils.h>
 #include <ATen/native/Sorting.h>
-#include <ATen/native/Resize.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/arange.h>
-#include <ATen/ops/empty_like.h>
 #include <ATen/ops/empty_strided.h>
 #include <ATen/ops/sort_native.h>
-#include <ATen/ops/zeros.h>
 #endif
-
-#include <limits>
 
 namespace at::native {
 
 std::vector<int64_t> infer_dense_strides_dim_last(const Tensor & self, int64_t dim);
 
-void fillSliceWithIndex(const Tensor& t, int dim) {
+void fillSliceWithIndex(const Tensor& t, int64_t dim) {
   if (t.numel()) {
     auto sizes = DimVector(t.dim(), 1);
     sizes[dim] = t.sizes()[dim];
@@ -55,19 +49,21 @@ void sort_cuda_kernel(
 
   // Converting TensorBase into Tensor.
   // We will need Tensor's methods from this point onwards.
-  TOTENSOR(self_base, self);
+  TOTENSOR(self_base, self_in);
   TOTENSOR(values_base, values);
   TOTENSOR(indices_base, indices);
 
-  TORCH_CHECK(self.sizes()[dim] <= std::numeric_limits<int>::max(),
-    "The dimension being sorted can not have more than INT_MAX elements.");
-
-  const auto self_dtype = self.dtype();
-  // FIXME: remove this check once cub sort supports bool
-  TORCH_CHECK(self_dtype != ScalarType::Bool,
-    "Sort currently does not support bool dtype on CUDA.");
-  TORCH_CHECK(self_dtype != ScalarType::ComplexFloat && self_dtype != ScalarType::ComplexDouble,
+  const auto self_dtype = self_in.dtype();
+  TORCH_CHECK_TYPE(self_dtype != ScalarType::ComplexFloat && self_dtype != ScalarType::ComplexDouble,
     "Sort currently does not support complex dtypes on CUDA.");
+#if defined(USE_ROCM)
+  // ROCm has undefined behavior for non-standard bools. Sort a standard-bool copy built from the raw
+  // bytes instead of normalizing the input in place, which would write to the caller's tensor and
+  // fails when the input has overlapping (e.g. expanded) memory.
+  const Tensor self = self_dtype == ScalarType::Bool ? self_in.view(at::kByte).ne(0) : self_in;
+#else
+  const Tensor& self = self_in;
+#endif
 
   // use inplace algorithm for smaller input sizes without stable=True
   if (should_use_small_sort(self, dim)) {
@@ -122,6 +118,6 @@ void sort_cuda_kernel(
 // TODO: we should handle this accordingly when we start using REGISTER_HIP_DISPATCH,
 // since REGISTER_DISPATCH won't work in this cpp file.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-REGISTER_CUDA_DISPATCH(sort_stub, &sort_cuda_kernel);
+REGISTER_CUDA_DISPATCH(sort_stub, &sort_cuda_kernel)
 
 }  // namespace at::native

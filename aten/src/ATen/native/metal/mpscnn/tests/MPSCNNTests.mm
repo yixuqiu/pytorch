@@ -104,7 +104,7 @@ typedef bool (^Func)(void);
 bool TEST(const std::vector<int64_t>& sizes, std::string name, Func block) {
   std::stringstream ss;
   std::copy(sizes.begin(), sizes.end(), std::ostream_iterator<int>(ss, " "));
-  __block std::string str1 = ss.str();
+  __block std::string str1 = std::move(ss).str();
   c10::InferenceMode guard;
   bool b = block();
   void (^print)(NSString*) = ^(NSString* result) {
@@ -120,7 +120,7 @@ void PRINT_TENSOR(std::string name, const at::Tensor& tensor) {
     for (int i = 0; i < t.numel(); ++i) {
       NSString* sf =
           [NSString stringWithFormat:@"%.2f", t.data_ptr<float>()[i]];
-      str += sf.UTF8String;
+      str += sf.UTF8String ?: "";
       str += ", ";
     }
     std::cout << str << std::endl;
@@ -841,13 +841,13 @@ bool test_upsampling_nearest2d_vec() {
     auto X1 = at::rand(size, at::TensorOptions(at::kCPU).dtype(at::kFloat));
     auto Y1 = at::upsample_nearest2d(
         X1,
-        c10::optional<at::IntArrayRef>({}),
-        c10::optional<at::ArrayRef<double>>({2, 2}));
+        std::optional<at::IntArrayRef>({}),
+        std::optional<at::ArrayRef<double>>({2, 2}));
     auto X2 = X1.metal();
     auto Y2 = at::upsample_nearest2d(
                   X2,
-                  c10::optional<at::IntArrayRef>({}),
-                  c10::optional<at::ArrayRef<double>>({2, 2}))
+                  std::optional<at::IntArrayRef>({}),
+                  std::optional<at::ArrayRef<double>>({2, 2}))
                   .cpu();
     return almostEqual(Y1, Y2);
   });
@@ -859,13 +859,13 @@ bool test_upsampling_nearest2d_vec2() {
     auto X1 = at::rand(size, at::TensorOptions(at::kCPU).dtype(at::kFloat));
     auto Y1 = at::upsample_nearest2d(
         X1,
-        c10::optional<at::IntArrayRef>({}),
-        c10::optional<at::ArrayRef<double>>({2, 2}));
+        std::optional<at::IntArrayRef>({}),
+        std::optional<at::ArrayRef<double>>({2, 2}));
     auto X2 = X1.metal();
     auto Y2 = at::upsample_nearest2d(
                   X2,
-                  c10::optional<at::IntArrayRef>({}),
-                  c10::optional<at::ArrayRef<double>>({2, 2}))
+                  std::optional<at::IntArrayRef>({}),
+                  std::optional<at::ArrayRef<double>>({2, 2}))
                   .cpu();
     return almostEqual(Y1, Y2);
   });

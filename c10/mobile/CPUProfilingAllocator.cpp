@@ -1,5 +1,6 @@
 #include <c10/core/impl/alloc_cpu.h>
 #include <c10/mobile/CPUProfilingAllocator.h>
+#include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 
 #include <map>
@@ -33,7 +34,7 @@ struct MemEvent {
 bool overlaps(const MemBlock& a, const MemBlock& b) {
   // two blocks dont overlap if
   // |---a--------|--------------b--------|
-  // strat_a     end_a <= start_b       end_b
+  // start_a     end_a <= start_b       end_b
   return !(
       (a.end_offset <= b.start_offset) || (b.end_offset <= a.start_offset));
 }
@@ -69,12 +70,12 @@ bool validate_allocation_plan(
     } else if (event.type == EventType::Free) {
       auto it = allocations.find(mem_block);
       TORCH_CHECK(
-          (*it).end_offset == end_offset,
-          "Enf offset of allocation being freed must match the one recorded.");
-      TORCH_CHECK(
           it != allocations.end(),
           "ProfilingAllocator: Allocate event "
           "must have preceded deallocate event.");
+      TORCH_CHECK(
+          (*it).end_offset == end_offset,
+          "End offset of allocation being freed must match the one recorded.");
       allocations.erase(it);
     } else {
       TORCH_CHECK(false, "ProfilingAllocator: Invalid event type.");
@@ -87,7 +88,7 @@ std::vector<MemEvent> create_and_sort_mem_events(
     const std::vector<uint64_t>& allocation_sizes,
     const std::vector<uint64_t>& allocation_lifetimes) {
   std::vector<MemEvent> events;
-  for (uint64_t i = 0; i < allocation_sizes.size(); ++i) {
+  for (const auto i : c10::irange(allocation_sizes.size())) {
     // If observed allocation are freed outside the scope of
     // observation, then allocations are not managed by the
     // AllocationPlan.
@@ -151,10 +152,8 @@ std::vector<uint64_t> formulate_greedy_allocation_plan(
       create_and_sort_mem_events(allocation_sizes, allocation_lifetimes);
   uint64_t max_offset{0};
   for (const auto& mem_event : mem_events) {
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    uint64_t alloc_offset;
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    uint64_t new_offset, new_size;
+    uint64_t alloc_offset = 0;
+    uint64_t new_offset = 0, new_size = 0;
     if (mem_event.type == EventType::Allocate) {
       auto it = free_size_to_offset.lower_bound(mem_event.size);
       if (it == free_size_to_offset.end()) {

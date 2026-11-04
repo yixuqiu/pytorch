@@ -1,5 +1,4 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
-#include <ATen/Config.h>
 #include <ATen/mkl/Sparse.h>
 #include <ATen/native/mkl/SparseBlasImpl.h>
 #include <ATen/native/sparse/SparseBlasImpl.h>
@@ -7,7 +6,7 @@
 
 // Required for checking whether Triton kernels are available
 #include <ATen/core/dispatch/Dispatcher.h>
-
+#include <c10/util/Exception.h>
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
@@ -23,11 +22,15 @@
 #include <ATen/Parallel.h>
 #endif
 
+#if AT_USE_EIGEN_SPARSE()
+#include <ATen/native/sparse/eigen/SparseBlasImpl.h>
+#endif
 
 namespace at::native::sparse::impl {
 
 namespace {
 
+#ifndef USE_ROCM
 bool operands_support_triton_mm_kernel(const Tensor& compressed, const Tensor& strided) {
   // Triton works only with blocksizes which are powers of 2.
   const auto is_power_of_2 = [](int64_t v) -> bool {
@@ -49,7 +52,7 @@ bool operands_support_triton_mm_kernel(const Tensor& compressed, const Tensor& s
                && strided.size(-1) % blocksize[0] == 0);
      });
 }
-
+#endif
 }
 
 Tensor& _compressed_row_strided_mm_out(const Tensor& compressed, const Tensor& strided, Tensor& result) {
@@ -244,10 +247,7 @@ Tensor& _compressed_row_strided_addmm_out(
         try {
           return triton_kernel.call(self, mat1, mat2, beta, alpha, result);
         } catch (std::runtime_error& e) {
-          const std::string msg = e.what();
-          if (msg != std::string("Unable to cast NotImplemented to Tensor")) {
-            throw std::runtime_error(msg);
-          }
+          TORCH_CHECK(e.what() == std::string("Unable to cast NotImplemented to Tensor"), e.what());
         } /* else triton_kernel returned NotImplemented, continue
              with the generic method below */
       }
@@ -364,28 +364,28 @@ void addmv_out_sparse_csr(
     const Tensor& result) {
   auto cont_values = mat.values().contiguous();
   if (mat.layout() == kSparseBsr) {
-    addmv_sparse_bsr(cont_values.data_ptr<scalar_t>(),
-        mat.crow_indices().data_ptr<idx_t>(),
-        mat.col_indices().data_ptr<idx_t>(),
+    addmv_sparse_bsr(cont_values.const_data_ptr<scalar_t>(),
+        mat.crow_indices().const_data_ptr<idx_t>(),
+        mat.col_indices().const_data_ptr<idx_t>(),
         mat.size(0),
         mat.values().size(1),
         mat.values().size(2),
-        vec.data_ptr<scalar_t>(),
+        vec.const_data_ptr<scalar_t>(),
         vec.stride(0),
         alpha.to<scalar_t>(),
         beta.to<scalar_t>(),
-        result.data_ptr<scalar_t>(),
+        result.mutable_data_ptr<scalar_t>(),
         result.stride(0));
   } else {
-    addmv_sparse_csr(cont_values.data_ptr<scalar_t>(),
-        mat.crow_indices().data_ptr<idx_t>(),
-        mat.col_indices().data_ptr<idx_t>(),
+    addmv_sparse_csr(cont_values.const_data_ptr<scalar_t>(),
+        mat.crow_indices().const_data_ptr<idx_t>(),
+        mat.col_indices().const_data_ptr<idx_t>(),
         mat.size(0),
-        vec.data_ptr<scalar_t>(),
+        vec.const_data_ptr<scalar_t>(),
         vec.stride(0),
         alpha.to<scalar_t>(),
         beta.to<scalar_t>(),
-        result.data_ptr<scalar_t>(),
+        result.mutable_data_ptr<scalar_t>(),
         result.stride(0));
   }
 }
@@ -410,6 +410,9 @@ void addmv_out_sparse_csr(
     const Tensor& result) {
 #if !AT_USE_MKL_SPARSE()
   TORCH_CHECK(mat.layout() == kSparseBsr || mat.layout() == kSparseCsr, "Unexpected layout", mat.layout());
+  if (beta.toComplexDouble() == 0.) {
+    result.zero_();
+  }
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
       result.scalar_type(), "addmv_out_sparse_csr_impl_reference", [&] {
         if (mat.crow_indices().scalar_type() == kLong) {
@@ -438,13 +441,15 @@ void add_out_sparse_csr(
     const Tensor& mat2,
     const Scalar& alpha,
     const Tensor& result) {
-#if !AT_MKL_ENABLED()
-  TORCH_CHECK(
-      false,
-      "Calling add on a sparse CPU tensor requires compiling PyTorch with MKL. ",
-      "Please use PyTorch built MKL support.");
-#else
+#if AT_USE_MKL_SPARSE()
   sparse::impl::mkl::add_out_sparse_csr(mat1, mat2, alpha, result);
+#elif AT_USE_EIGEN_SPARSE()
+  sparse::impl::eigen::add_out_sparse(mat1, mat2, alpha, result);
+#else
+  TORCH_CHECK(
+    false,
+    "Calling add on a sparse CPU tensor requires compiling PyTorch with MKL. ",
+    "Please use PyTorch built MKL support.");
 #endif
 }
 
@@ -455,7 +460,7 @@ void triangular_solve_out_sparse_csr(
     bool upper,
     bool transpose,
     bool unitriangular) {
-#if !AT_MKL_ENABLED()
+#if !AT_USE_MKL_SPARSE()
   TORCH_CHECK(
       false,
       "Calling triangular_solve on a sparse CPU tensor requires compiling PyTorch with MKL. ",

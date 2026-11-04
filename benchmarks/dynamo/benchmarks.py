@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
+
 import argparse
 import os
 import sys
 
-from typing import Set
+
+# Run only this selected group of models, leave this empty to run everything
+TORCHBENCH_ONLY_MODELS = [
+    m.strip() for m in os.getenv("TORCHBENCH_ONLY_MODELS", "").split(",") if m.strip()
+]
 
 
 # Note - hf and timm have their own version of this, torchbench does not
-# TOOD(voz): Someday, consolidate all the files into one runner instead of a shim like this...
-def model_names(filename: str) -> Set[str]:
+# TODO(voz): Someday, consolidate all the files into one runner instead of a shim like this...
+def model_names(filename: str) -> set[str]:
     names = set()
     with open(filename) as fh:
         lines = fh.readlines()
@@ -18,6 +23,8 @@ def model_names(filename: str) -> Set[str]:
             if len(line_parts) == 1:
                 line_parts = line.split(",")
             model_name = line_parts[0]
+            if TORCHBENCH_ONLY_MODELS and model_name not in TORCHBENCH_ONLY_MODELS:
+                continue
             names.add(model_name)
     return names
 
@@ -28,16 +35,27 @@ TIMM_MODEL_NAMES = model_names(
 HF_MODELS_FILE_NAME = model_names(
     os.path.join(os.path.dirname(__file__), "huggingface_models_list.txt")
 )
+# stable_diffusion_text_encoder / stable_diffusion_unet are deliberately absent:
+# both are skipped in torchbench.yaml (#167895).
 TORCHBENCH_MODELS_FILE_NAME = model_names(
     os.path.join(os.path.dirname(__file__), "all_torchbench_models_list.txt")
 )
 
 # timm <> HF disjoint
-assert TIMM_MODEL_NAMES.isdisjoint(HF_MODELS_FILE_NAME)
+if not TIMM_MODEL_NAMES.isdisjoint(HF_MODELS_FILE_NAME):
+    raise AssertionError(
+        f"TIMM and HF model names overlap: {TIMM_MODEL_NAMES & HF_MODELS_FILE_NAME}"
+    )
 # timm <> torch disjoint
-assert TIMM_MODEL_NAMES.isdisjoint(TORCHBENCH_MODELS_FILE_NAME)
+if not TIMM_MODEL_NAMES.isdisjoint(TORCHBENCH_MODELS_FILE_NAME):
+    raise AssertionError(
+        f"TIMM and TorchBench model names overlap: {TIMM_MODEL_NAMES & TORCHBENCH_MODELS_FILE_NAME}"
+    )
 # torch <> hf disjoint
-assert TORCHBENCH_MODELS_FILE_NAME.isdisjoint(HF_MODELS_FILE_NAME)
+if not TORCHBENCH_MODELS_FILE_NAME.isdisjoint(HF_MODELS_FILE_NAME):
+    raise AssertionError(
+        f"TorchBench and HF model names overlap: {TORCHBENCH_MODELS_FILE_NAME & HF_MODELS_FILE_NAME}"
+    )
 
 
 def parse_args(args=None):

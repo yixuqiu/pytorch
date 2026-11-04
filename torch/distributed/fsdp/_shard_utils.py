@@ -1,10 +1,11 @@
+# mypy: allow-untyped-defs
 import copy
 import itertools
 import math
-from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch._utils import _get_device_module
 from torch.distributed import distributed_c10d
 from torch.distributed._shard.sharded_tensor import (
     Shard,
@@ -13,12 +14,14 @@ from torch.distributed._shard.sharded_tensor import (
     TensorProperties,
 )
 from torch.distributed._shard.sharding_spec import ShardMetadata
-from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard as DShard
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard as DShard
 
 
 def _get_remote_device_str(rank, device_type, num_devices_per_node):
     if device_type.lower() == "cpu":
         return f"rank:{rank}/{device_type}"
+    elif device_type.lower() == "hpu":
+        return f"rank:{rank}/{device_type}:{_get_device_module(device_type).current_device()}"
     else:
         return f"rank:{rank}/{device_type}:{rank % num_devices_per_node}"
 
@@ -29,10 +32,10 @@ def _create_chunk_sharded_tensor(
     world_size: int,
     num_devices_per_node: int,
     pg: dist.ProcessGroup,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> ShardedTensor:
     """
-    Shard a tensor to chunks along the first dimension. The local rank will gets its
+    Shard a tensor to chunks along the first dimension. The local rank will get its
     corresponding chunk as the local shard to create a ShardedTensor.
     """
     chunks = tensor.chunk(world_size, dim=0)
@@ -64,7 +67,11 @@ def _create_chunk_sharded_tensor(
         )
         for r in range(len(chunk_sizes))
     ]
-    assert len(chunk_sizes) == len(chunk_offsets) == len(placements)
+    if len(chunk_sizes) != len(chunk_offsets) or len(chunk_sizes) != len(placements):
+        raise AssertionError(
+            f"Expected chunk_sizes, chunk_offsets, and placements to have the same length, "
+            f"got {len(chunk_sizes)}, {len(chunk_offsets)}, {len(placements)}"
+        )
     shard_metadata = [
         ShardMetadata(offset, size, placement)
         for offset, size, placement in zip(chunk_offsets, chunk_sizes, placements)
@@ -91,11 +98,11 @@ def _create_chunk_dtensor(
     device_mesh: DeviceMesh,
 ) -> DTensor:
     """
-    Shard a tensor to chunks along the first dimension. The local rank will gets its
+    Shard a tensor to chunks along the first dimension. The local rank will get its
     corresponding chunk as the local tensor to create a DTensor.
     """
     # We need to explicitly call .detach() to return a new tensor detached from the current graph.
-    tensor = tensor.clone().detach()
+    tensor = tensor.detach().clone()
 
     # FSDP placements: [Shard(0)]
     # HSDP placements: [Replicate(), Shard(0)]
@@ -112,12 +119,13 @@ def _create_chunk_dtensor(
 
 def _all_gather_dtensor(
     tensor: DTensor,
-    parent_mesh: Optional[DeviceMesh],
+    root_mesh: DeviceMesh | None,
 ) -> torch.Tensor:
     """
     All gather a DTensor in its sharded dimension and return the local tensor.
     """
-    assert parent_mesh is None
+    if root_mesh != tensor.device_mesh:
+        raise AssertionError("The device mesh of a tensor should be a root mesh.")
 
     placements = list(copy.deepcopy(tensor.placements))
     # FSDP placements: [Shard(0)] -> [Replicate()]

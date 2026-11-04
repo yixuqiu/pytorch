@@ -35,7 +35,7 @@ c10::IValue preprocess(
     for (const auto& node : graph->nodes()) {
       switch (node->kind()) {
         case prim::Constant:
-          ss << node->kind().toDisplayString() << "#"
+          ss << node->kind().toDisplayString() << '#'
              << toIValue(node->output()).value();
           ss << "<debug_handle>" << node_debug_handles[node];
           break;
@@ -55,11 +55,10 @@ c10::IValue preprocess(
               node->kind().toQualString(),
               " is not supported in this compiler. Source code: ",
               node->sourceRange().str());
-          break;
       }
-      ss << ",";
+      ss << ',';
     }
-    std::string blob = ss.str();
+    std::string blob = std::move(ss).str();
     if (!blob.empty()) {
       blob.pop_back();
     }

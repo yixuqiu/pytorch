@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 """Adds docstrings to Tensor functions"""
 
 import torch._C
@@ -5,7 +6,7 @@ from torch._C import _add_docstr as add_docstr
 from torch._torch_docs import parse_kwargs, reproducibility_notes
 
 
-def add_docstr_all(method, docstr):
+def add_docstr_all(method: str, docstr: str) -> None:
     add_docstr(getattr(torch._C.TensorBase, method), docstr)
 
 
@@ -56,9 +57,9 @@ By default, the returned Tensor has the same :class:`torch.dtype` and
 .. warning::
 
     When data is a tensor `x`, :func:`new_tensor()` reads out 'the data' from whatever it is passed,
-    and constructs a leaf variable. Therefore ``tensor.new_tensor(x)`` is equivalent to ``x.clone().detach()``
-    and ``tensor.new_tensor(x, requires_grad=True)`` is equivalent to ``x.clone().detach().requires_grad_(True)``.
-    The equivalents using ``clone()`` and ``detach()`` are recommended.
+    and constructs a leaf variable. Therefore ``tensor.new_tensor(x)`` is equivalent to ``x.detach().clone()``
+    and ``tensor.new_tensor(x, requires_grad=True)`` is equivalent to ``x.detach().clone().requires_grad_(True)``.
+    The equivalents using ``detach()`` and ``clone()`` are recommended.
 
 Args:
     data (array_like): The returned Tensor copies :attr:`data`.
@@ -78,9 +79,7 @@ Example::
     tensor([[ 0,  1],
             [ 2,  3]], dtype=torch.int8)
 
-""".format(
-        **new_common_args
-    ),
+""".format(**new_common_args),
 )
 
 add_docstr_all(
@@ -113,9 +112,7 @@ Example::
             [ 3.1416,  3.1416,  3.1416,  3.1416],
             [ 3.1416,  3.1416,  3.1416,  3.1416]], dtype=torch.float64)
 
-""".format(
-        **new_common_args
-    ),
+""".format(**new_common_args),
 )
 
 add_docstr_all(
@@ -148,9 +145,7 @@ Example::
     tensor([[ 5.8182e-18,  4.5765e-41, -1.0545e+30],
             [ 3.0949e-41,  4.4842e-44,  0.0000e+00]])
 
-""".format(
-        **new_common_args
-    ),
+""".format(**new_common_args),
 )
 
 add_docstr_all(
@@ -183,9 +178,7 @@ Example::
     tensor([[ 5.8182e-18,  4.5765e-41, -1.0545e+30],
             [ 3.0949e-41,  4.4842e-44,  0.0000e+00]])
 
-""".format(
-        **new_common_args
-    ),
+""".format(**new_common_args),
 )
 
 add_docstr_all(
@@ -218,9 +211,7 @@ Example::
     tensor([[ 1,  1,  1],
             [ 1,  1,  1]], dtype=torch.int32)
 
-""".format(
-        **new_common_args
-    ),
+""".format(**new_common_args),
 )
 
 add_docstr_all(
@@ -253,9 +244,7 @@ Example::
     tensor([[ 0.,  0.,  0.],
             [ 0.,  0.,  0.]], dtype=torch.float64)
 
-""".format(
-        **new_common_args
-    ),
+""".format(**new_common_args),
 )
 
 add_docstr_all(
@@ -516,55 +505,6 @@ add_docstr_all(
 addr_(vec1, vec2, *, beta=1, alpha=1) -> Tensor
 
 In-place version of :meth:`~Tensor.addr`
-""",
-)
-
-add_docstr_all(
-    "align_as",
-    r"""
-align_as(other) -> Tensor
-
-Permutes the dimensions of the :attr:`self` tensor to match the dimension order
-in the :attr:`other` tensor, adding size-one dims for any new names.
-
-This operation is useful for explicit broadcasting by names (see examples).
-
-All of the dims of :attr:`self` must be named in order to use this method.
-The resulting tensor is a view on the original tensor.
-
-All dimension names of :attr:`self` must be present in ``other.names``.
-:attr:`other` may contain named dimensions that are not in ``self.names``;
-the output tensor has a size-one dimension for each of those new names.
-
-To align a tensor to a specific order, use :meth:`~Tensor.align_to`.
-
-Examples::
-
-    # Example 1: Applying a mask
-    >>> mask = torch.randint(2, [127, 128], dtype=torch.bool).refine_names('W', 'H')
-    >>> imgs = torch.randn(32, 128, 127, 3, names=('N', 'H', 'W', 'C'))
-    >>> imgs.masked_fill_(mask.align_as(imgs), 0)
-
-
-    # Example 2: Applying a per-channel-scale
-    >>> def scale_channels(input, scale):
-    >>>    scale = scale.refine_names('C')
-    >>>    return input * scale.align_as(input)
-
-    >>> num_channels = 3
-    >>> scale = torch.randn(num_channels, names=('C',))
-    >>> imgs = torch.rand(32, 128, 128, num_channels, names=('N', 'H', 'W', 'C'))
-    >>> more_imgs = torch.rand(32, num_channels, 128, 128, names=('N', 'C', 'H', 'W'))
-    >>> videos = torch.randn(3, num_channels, 128, 128, 128, names=('N', 'C', 'H', 'W', 'D'))
-
-    # scale_channels is agnostic to the dimension order of the input
-    >>> scale_channels(imgs, scale)
-    >>> scale_channels(more_imgs, scale)
-    >>> scale_channels(videos, scale)
-
-.. warning::
-    The named tensor API is experimental and subject to change.
-
 """,
 )
 
@@ -1111,15 +1051,6 @@ In-place version of :meth:`~Tensor.ceil`
 )
 
 add_docstr_all(
-    "cholesky",
-    r"""
-cholesky(upper=False) -> Tensor
-
-See :func:`torch.cholesky`
-""",
-)
-
-add_docstr_all(
     "cholesky_solve",
     r"""
 cholesky_solve(input2, upper=False) -> Tensor
@@ -1179,9 +1110,7 @@ add_docstr_all(
 clone(*, memory_format=torch.preserve_format) -> Tensor
 
 See :func:`torch.clone`
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -1226,11 +1155,21 @@ The :attr:`src` tensor must be :ref:`broadcastable <broadcasting-semantics>`
 with the :attr:`self` tensor. It may be of a different data type or reside on a
 different device.
 
+See :ref:`cuda-device-to-host-copies` for guidance on repeated CUDA-to-CPU
+transfers and reusing CPU buffers.
+
 Args:
     src (Tensor): the source tensor to copy from
-    non_blocking (bool): if ``True`` and this copy is between CPU and GPU,
+    non_blocking (bool, optional): if ``True`` and this copy is between CPU and GPU,
         the copy may occur asynchronously with respect to the host. For other
-        cases, this argument has no effect.
+        cases, this argument has no effect. Default: ``False``
+
+.. note::
+
+    When :attr:`non_blocking` is ``True`` and the copy is issued on a
+    non-default CUDA stream, the caller is responsible for proper
+    cross-stream synchronization. See :ref:`cuda-stream-semantics` for
+    the required pattern.
 """,
 )
 
@@ -1340,15 +1279,16 @@ cpu(memory_format=torch.preserve_format) -> Tensor
 
 Returns a copy of this object in CPU memory.
 
-If this object is already in CPU memory and on the correct device,
+If this object is already in CPU memory,
 then no copy is performed and the original object is returned.
+
+See :ref:`cuda-device-to-host-copies` for guidance on repeated CUDA-to-CPU
+transfers and reusing CPU buffers.
 
 Args:
     {memory_format}
 
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -1398,15 +1338,33 @@ If this object is already in CUDA memory and on the correct device,
 then no copy is performed and the original object is returned.
 
 Args:
-    device (:class:`torch.device`): The destination GPU device.
+    device (:class:`torch.device`, optional): The destination GPU device.
         Defaults to the current CUDA device.
-    non_blocking (bool): If ``True`` and the source is in pinned memory,
+    non_blocking (bool, optional): If ``True`` and the source is in pinned memory,
         the copy will be asynchronous with respect to the host.
         Otherwise, the argument has no effect. Default: ``False``.
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
+)
+
+add_docstr_all(
+    "mtia",
+    r"""
+mtia(device=None, non_blocking=False, memory_format=torch.preserve_format) -> Tensor
+
+Returns a copy of this object in MTIA memory.
+
+If this object is already in MTIA memory and on the correct device,
+then no copy is performed and the original object is returned.
+
+Args:
+    device (:class:`torch.device`, optional): The destination MTIA device.
+        Defaults to the current MTIA device.
+    non_blocking (bool, optional): If ``True`` and the source is in pinned memory,
+        the copy will be asynchronous with respect to the host.
+        Otherwise, the argument has no effect. Default: ``False``.
+    {memory_format}
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -1420,15 +1378,13 @@ If this object is already in IPU memory and on the correct device,
 then no copy is performed and the original object is returned.
 
 Args:
-    device (:class:`torch.device`): The destination IPU device.
+    device (:class:`torch.device`, optional): The destination IPU device.
         Defaults to the current IPU device.
-    non_blocking (bool): If ``True`` and the source is in pinned memory,
+    non_blocking (bool, optional): If ``True`` and the source is in pinned memory,
         the copy will be asynchronous with respect to the host.
         Otherwise, the argument has no effect. Default: ``False``.
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -1442,15 +1398,13 @@ If this object is already in XPU memory and on the correct device,
 then no copy is performed and the original object is returned.
 
 Args:
-    device (:class:`torch.device`): The destination XPU device.
+    device (:class:`torch.device`, optional): The destination XPU device.
         Defaults to the current XPU device.
-    non_blocking (bool): If ``True`` and the source is in pinned memory,
+    non_blocking (bool, optional): If ``True`` and the source is in pinned memory,
         the copy will be asynchronous with respect to the host.
         Otherwise, the argument has no effect. Default: ``False``.
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -1517,11 +1471,36 @@ In-place version of :meth:`~Tensor.cumsum`
 )
 
 add_docstr_all(
+    "const_data_ptr",
+    r"""
+const_data_ptr() -> int
+
+Returns the address of the first element of :attr:`self` tensor.
+
+Unlike :meth:`data_ptr`, this is guaranteed to be a read-only access
+that will not trigger copy-on-write materialization. For regular
+(non-COW) tensors, the return value is identical to :meth:`data_ptr`.
+
+.. warning::
+
+    The returned pointer must not be used to mutate the tensor data.
+    Use :meth:`data_ptr` when write access is needed.
+""",
+)
+
+add_docstr_all(
     "data_ptr",
     r"""
 data_ptr() -> int
 
 Returns the address of the first element of :attr:`self` tensor.
+
+.. note::
+
+    If the tensor is a copy-on-write tensor (e.g. created via
+    :meth:`_lazy_clone`), calling this method will materialize the
+    copy. Use :meth:`const_data_ptr` if you only need read-only access
+    to the data pointer.
 """,
 )
 
@@ -1613,7 +1592,7 @@ This function modifies the input tensor in-place, and returns the input tensor.
 
 Arguments:
     fill_value (Scalar): the fill value
-    wrap (bool): the diagonal 'wrapped' after N columns for tall matrices.
+    wrap (bool, optional): the diagonal 'wrapped' after N columns for tall matrices. Default: ``False``
 
 Example::
 
@@ -2320,13 +2299,6 @@ In-place version of :meth:`~Tensor.greater`.
 )
 
 add_docstr_all(
-    "has_names",
-    r"""
-Is ``True`` if any of this tensor's dimensions are named. Otherwise, is ``False``.
-""",
-)
-
-add_docstr_all(
     "hardshrink",
     r"""
 hardshrink(lambd=0.5) -> Tensor
@@ -2396,7 +2368,7 @@ Note:
 
 Args:
     dim (int): dimension along which to index
-    index (Tensor): indices of ``source`` to select from,
+    index (Tensor): indices of :attr:`self` to add to,
             should have dtype either `torch.int64` or `torch.int32`
     source (Tensor): the tensor containing values to add
 
@@ -2420,9 +2392,7 @@ Example::
             [  1.,   1.,   1.],
             [  1.,   1.,   1.],
             [  1.,   1.,   1.]])
-""".format(
-        **reproducibility_notes
-    ),
+""".format(**reproducibility_notes),
 )
 
 add_docstr_all(
@@ -2477,6 +2447,7 @@ Args:
     value (float): the value to fill with
 
 Example::
+
     >>> x = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
     >>> index = torch.tensor([0, 2])
     >>> x.index_fill_(1, index, -1)
@@ -2528,7 +2499,7 @@ using the reduction given by the ``reduce`` argument. For example, if ``dim == 0
 row of ``source`` is multiplied by the ``j``\ th row of :attr:`self`. If
 :obj:`include_self="True"`, the values in the :attr:`self` tensor are included
 in the reduction, otherwise, rows in the :attr:`self` tensor that are accumulated
-to are treated as if they were filled with the reduction identites.
+to are treated as if they were filled with the reduction identities.
 
 The :attr:`dim`\ th dimension of ``source`` must have the same size as the
 length of :attr:`index` (which must be a vector), and all other dimensions must
@@ -2554,7 +2525,7 @@ Note:
 
 Args:
     dim (int): dimension along which to index
-    index (Tensor): indices of ``source`` to select from,
+    index (Tensor): indices of :attr:`self` to accumulate into,
         should have dtype either `torch.int64` or `torch.int32`
     source (FloatTensor): the tensor containing values to accumulate
     reduce (str): the reduction operation to apply
@@ -2582,9 +2553,7 @@ Example::
             [ 7.,  8.,  9.],
             [ 2.,  2.,  2.],
             [ 4.,  5.,  6.]])
-""".format(
-        **reproducibility_notes
-    ),
+""".format(**reproducibility_notes),
 )
 
 add_docstr_all(
@@ -2754,6 +2723,7 @@ add_docstr_all(
     "is_pinned",
     r"""
 Returns true if this tensor resides in pinned memory.
+By default, the device pinned memory on will be the current :ref:`accelerator<accelerators>`.
 """,
 )
 
@@ -3167,7 +3137,10 @@ Args:
 Example:
 
     >>> self = torch.tensor([[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]])
-    >>> mask = torch.tensor([[0, 0, 0, 1, 1], [1, 1, 0, 1, 1]], dtype=torch.bool)
+    >>> mask = torch.tensor(
+    ...     [[0, 0, 0, 1, 1], [1, 1, 0, 1, 1]],
+    ...     dtype=torch.bool,
+    ... )
     >>> source = torch.tensor([[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]])
     >>> self.masked_scatter_(mask, source)
     tensor([[0, 0, 0, 0, 1],
@@ -3627,52 +3600,9 @@ See :func:`torch.nonzero`
 add_docstr_all(
     "nonzero_static",
     r"""
-nonzero_static(input, *, size, fill_value=-1) -> Tensor
+nonzero_static(*, size, fill_value=-1) -> LongTensor
 
-Returns a 2-D tensor where each row is the index for a non-zero value.
-The returned Tensor has the same `torch.dtype` as `torch.nonzero()`.
-
-Args:
-    input (Tensor): the input tensor to count non-zero elements.
-
-Keyword args:
-    size (int): the size of non-zero elements expected to be included in the out
-        tensor. Pad the out tensor with `fill_value` if the `size` is larger
-        than total number of non-zero elements, truncate out tensor if `size`
-        is smaller. The size must be a non-negative integer.
-    fill_value (int): the value to fill the output tensor with when `size` is larger
-        than the total number of non-zero elements. Default is `-1` to represent
-        invalid index.
-
-Example:
-
-    # Example 1: Padding
-    >>> input_tensor = torch.tensor([[1, 0], [3, 2]])
-    >>> static_size = 4
-    >>> t = torch.nonzero_static(input_tensor, size = static_size)
-    tensor([[  0,   0],
-            [  1,   0],
-            [  1,   1],
-            [  -1, -1]], dtype=torch.int64)
-
-    # Example 2: Truncating
-    >>> input_tensor = torch.tensor([[1, 0], [3, 2]])
-    >>> static_size = 2
-    >>> t = torch.nonzero_static(input_tensor, size = static_size)
-    tensor([[  0,   0],
-            [  1,   0]], dtype=torch.int64)
-
-    # Example 3: 0 size
-    >>> input_tensor = torch.tensor([10])
-    >>> static_size = 0
-    >>> t = torch.nonzero_static(input_tensor, size = static_size)
-    tensor([], size=(0, 1), dtype=torch.int64)
-
-    # Example 4: 0 rank input
-    >>> input_tensor = torch.tensor(10)
-    >>> static_size = 2
-    >>> t = torch.nonzero_static(input_tensor, size = static_size)
-    tensor([], size=(2, 0), dtype=torch.int64)
+See :func:`torch.nonzero_static`
 """,
 )
 
@@ -3753,7 +3683,17 @@ add_docstr_all(
     r"""
 permute(*dims) -> Tensor
 
-See :func:`torch.permute`
+Returns a view of the tensor with its dimensions permuted.
+
+Args:
+    dims (torch.Size, int..., tuple of int or list of int): the desired ordering of dimensions.
+
+Example:
+    >>> x = torch.randn(2, 3, 5)
+    >>> x.size()
+    torch.Size([2, 3, 5])
+    >>> x.permute(2, 0, 1).size()
+    torch.Size([5, 2, 3])
 """,
 )
 
@@ -3848,7 +3788,7 @@ contain duplicate elements.
 Args:
     index (LongTensor): the indices into self
     source (Tensor): the tensor containing values to copy from
-    accumulate (bool): whether to accumulate into self
+    accumulate (bool, optional): whether to accumulate into self. Default: ``False``
 
 Example::
 
@@ -3867,15 +3807,6 @@ put(input, index, source, accumulate=False) -> Tensor
 
 Out-of-place version of :meth:`torch.Tensor.put_`.
 `input` corresponds to `self` in :meth:`torch.Tensor.put_`.
-""",
-)
-
-add_docstr_all(
-    "qr",
-    r"""
-qr(some=True) -> (Tensor, Tensor)
-
-See :func:`torch.qr`
 """,
 )
 
@@ -4158,7 +4089,7 @@ In-place version of :meth:`~Tensor.renorm`
 add_docstr_all(
     "repeat",
     r"""
-repeat(*sizes) -> Tensor
+repeat(*repeats) -> Tensor
 
 Repeats this tensor along the specified dimensions.
 
@@ -4167,14 +4098,13 @@ Unlike :meth:`~Tensor.expand`, this function copies the tensor's data.
 .. warning::
 
     :meth:`~Tensor.repeat` behaves differently from
-    `numpy.repeat <https://docs.scipy.org/doc/numpy/reference/generated/numpy.repeat.html>`_,
+    `numpy.repeat <https://numpy.org/doc/stable/reference/generated/numpy.repeat.html>`_,
     but is more similar to
-    `numpy.tile <https://docs.scipy.org/doc/numpy/reference/generated/numpy.tile.html>`_.
+    `numpy.tile <https://numpy.org/doc/stable/reference/generated/numpy.tile.html>`_.
     For the operator similar to `numpy.repeat`, see :func:`torch.repeat_interleave`.
 
 Args:
-    sizes (torch.Size or int...): The number of times to repeat this tensor along each
-        dimension
+    repeat (torch.Size, int..., tuple of int or list of int): The number of times to repeat this tensor along each dimension
 
 Example::
 
@@ -4395,11 +4325,12 @@ For a 3-D tensor, :attr:`self` is updated as::
 
 This is the reverse operation of the manner described in :meth:`~Tensor.gather`.
 
-:attr:`self`, :attr:`index` and :attr:`src` (if it is a Tensor) should all have
-the same number of dimensions. It is also required that
+It is also required that
 ``index.size(d) <= src.size(d)`` for all dimensions ``d``, and that
 ``index.size(d) <= self.size(d)`` for all dimensions ``d != dim``.
-Note that ``index`` and ``src`` do not broadcast.
+Note that ``input`` and ``index`` do not broadcast against each other for NPUs,
+so when running on NPUs, :attr:`input` and :attr:`index` must have the same number of dimensions.
+Standard broadcasting occurs in all other cases.
 
 Moreover, as for :meth:`~Tensor.gather`, the values of :attr:`index` must be
 between ``0`` and ``self.size(dim) - 1`` inclusive.
@@ -4526,6 +4457,8 @@ For a 3-D tensor, :attr:`self` is updated as::
 dimensions. It is also required that ``index.size(d) <= src.size(d)`` for all
 dimensions ``d``, and that ``index.size(d) <= self.size(d)`` for all dimensions
 ``d != dim``. Note that ``index`` and ``src`` do not broadcast.
+When :attr:`index` is empty, we always return the original tensor
+without further error checking.
 
 Note:
     {forward_reproducibility_note}
@@ -4555,9 +4488,7 @@ Example::
             [0., 2., 0., 0., 0.],
             [0., 0., 2., 1., 1.]])
 
-""".format(
-        **reproducibility_notes
-    ),
+""".format(**reproducibility_notes),
 )
 
 add_docstr_all(
@@ -4623,9 +4554,7 @@ Example::
     tensor([3., 6., 5., 2.])
 
 
-""".format(
-        **reproducibility_notes
-    ),
+""".format(**reproducibility_notes),
 )
 
 add_docstr_all(
@@ -5199,12 +5128,22 @@ to(*args, **kwargs) -> Tensor
 Performs Tensor dtype and/or device conversion. A :class:`torch.dtype` and :class:`torch.device` are
 inferred from the arguments of ``self.to(*args, **kwargs)``.
 
+See :ref:`cuda-device-to-host-copies` for guidance on repeated CUDA-to-CPU
+transfers and reusing CPU buffers.
+
 .. note::
 
     If the ``self`` Tensor already
     has the correct :class:`torch.dtype` and :class:`torch.device`, then ``self`` is returned.
     Otherwise, the returned tensor is a copy of ``self`` with the desired
     :class:`torch.dtype` and :class:`torch.device`.
+
+.. note::
+
+    If ``self`` requires gradients (``requires_grad=True``) but the target
+    ``dtype`` specified is an integer type, the returned tensor will implicitly
+    set ``requires_grad=False``. This is because only tensors with
+    floating-point or complex dtypes can require gradients.
 
 Here are the ways to call ``to``:
 
@@ -5216,14 +5155,23 @@ Here are the ways to call ``to``:
     Args:
         {memory_format}
 
+.. note::
+
+    According to `C++ type conversion rules <https://en.cppreference.com/w/cpp/language/implicit_conversion.html>`_,
+    converting floating point value to integer type will truncate the fractional part.
+    If the truncated value cannot fit into the target type (e.g., casting ``torch.inf`` to ``torch.long``),
+    the behavior is undefined and the result may vary across platforms.
+
 .. method:: to(device=None, dtype=None, non_blocking=False, copy=False, memory_format=torch.preserve_format) -> Tensor
    :noindex:
 
     Returns a Tensor with the specified :attr:`device` and (optional)
     :attr:`dtype`. If :attr:`dtype` is ``None`` it is inferred to be ``self.dtype``.
-    When :attr:`non_blocking`, tries to convert asynchronously with respect to
-    the host if possible, e.g., converting a CPU Tensor with pinned memory to a
-    CUDA Tensor.
+    When :attr:`non_blocking` is set to ``True``, the function attempts to perform
+    the conversion asynchronously with respect to the host, if possible. This
+    asynchronous behavior applies to both pinned and pageable memory. However,
+    caution is advised when using this feature. For more information, refer to the
+    `tutorial on good usage of non_blocking and pin_memory <https://pytorch.org/tutorials/intermediate/pinmem_nonblock.html>`__.
     When :attr:`copy` is set, a new Tensor is created even when the Tensor
     already matches the desired conversion.
 
@@ -5234,11 +5182,21 @@ Here are the ways to call ``to``:
    :noindex:
 
     Returns a Tensor with same :class:`torch.dtype` and :class:`torch.device` as
-    the Tensor :attr:`other`. When :attr:`non_blocking`, tries to convert
-    asynchronously with respect to the host if possible, e.g., converting a CPU
-    Tensor with pinned memory to a CUDA Tensor.
+    the Tensor :attr:`other`.
+    When :attr:`non_blocking` is set to ``True``, the function attempts to perform
+    the conversion asynchronously with respect to the host, if possible. This
+    asynchronous behavior applies to both pinned and pageable memory. However,
+    caution is advised when using this feature. For more information, refer to the
+    `tutorial on good usage of non_blocking and pin_memory <https://pytorch.org/tutorials/intermediate/pinmem_nonblock.html>`__.
     When :attr:`copy` is set, a new Tensor is created even when the Tensor
     already matches the desired conversion.
+
+.. note::
+
+    When :attr:`non_blocking` is ``True`` and the conversion is issued on
+    a non-default CUDA stream, the caller is responsible for proper
+    cross-stream synchronization. See :ref:`cuda-stream-semantics` for
+    the required pattern.
 
 Example::
 
@@ -5260,9 +5218,7 @@ Example::
     >>> tensor.to(other, non_blocking=True)
     tensor([[-0.5044,  0.0005],
             [ 0.3310, -0.0584]], dtype=torch.float64, device='cuda:0')
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5274,9 +5230,7 @@ byte(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5288,9 +5242,7 @@ bool(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5302,9 +5254,7 @@ char(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5315,9 +5265,7 @@ bfloat16(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5329,9 +5277,7 @@ double(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5343,9 +5289,7 @@ float(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5357,9 +5301,7 @@ cdouble(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5371,9 +5313,7 @@ cfloat(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5385,9 +5325,7 @@ chalf(memory_format=torch.preserve_format) -> Tensor
 
 Args:
      {memory_format}
- """.format(
-        **common_args
-    ),
+ """.format(**common_args),
 )
 
 add_docstr_all(
@@ -5399,9 +5337,7 @@ half(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5413,9 +5349,7 @@ int(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5439,9 +5373,7 @@ long(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -5453,9 +5385,7 @@ short(memory_format=torch.preserve_format) -> Tensor
 
 Args:
     {memory_format}
-""".format(
-        **common_args
-    ),
+""".format(**common_args),
 )
 
 add_docstr_all(
@@ -6207,6 +6137,17 @@ If any of the above conditions are not met, an error is thrown.
     This overload is not supported by TorchScript, and using it in a Torchscript
     program will cause undefined behavior.
 
+.. warning::
+
+    Viewing a tensor as ``torch.bool`` reinterprets its bytes without
+    converting them. A ``torch.bool`` tensor must only contain the byte values
+    ``0`` (``False``) and ``1`` (``True``). If any byte of the viewed data has
+    another value, the behavior of operations on the returned tensor is
+    undefined: depending on the operation, device and memory layout, such bytes
+    may be preserved as-is or normalized to ``1``, and eager mode and
+    :func:`torch.compile` may give different results. To convert values to
+    booleans, use :meth:`~Tensor.bool` (or ``self != 0``) instead.
+
 
 Args:
     dtype (:class:`torch.dtype`): the desired dtype
@@ -6277,7 +6218,7 @@ Args:
 add_docstr_all(
     "expand",
     r"""
-expand(*sizes) -> Tensor
+expand(*size) -> Tensor
 
 Returns a new view of the :attr:`self` tensor with singleton dimensions expanded
 to a larger size.
@@ -6295,8 +6236,14 @@ expanded to a larger size by setting the ``stride`` to 0. Any dimension
 of size 1 can be expanded to an arbitrary value without allocating new
 memory.
 
+.. note::
+
+    Operations on an expanded view may still allocate memory if they need to
+    materialize the expanded values. For example, changing dtype after
+    :meth:`expand` can allocate memory for the full expanded shape.
+
 Args:
-    *sizes (torch.Size or int...): the desired expanded size
+    *size (torch.Size or int...): the desired expanded size
 
 .. warning::
 
@@ -6435,7 +6382,8 @@ See :func:`torch.dsplit`
 add_docstr_all(
     "stft",
     r"""
-stft(frame_length, hop, fft_size=None, return_onesided=True, window=None, pad_end=0) -> Tensor
+stft(frame_length, hop, fft_size=None, return_onesided=True, window=None,
+ pad_end=0, align_to_window=None) -> Tensor
 
 See :func:`torch.stft`
 """,
@@ -6503,6 +6451,7 @@ add_docstr_all(
 pin_memory() -> Tensor
 
 Copies the tensor to pinned memory, if it's not already pinned.
+By default, the device pinned memory on will be the current :ref:`accelerator<accelerators>`.
 """,
 )
 
@@ -6584,7 +6533,10 @@ Out-of-place version of :meth:`torch.Tensor.masked_scatter_`
 Example:
 
     >>> self = torch.tensor([0, 0, 0, 0, 0])
-    >>> mask = torch.tensor([[0, 0, 0, 1, 1], [1, 1, 0, 1, 1]], dtype=torch.bool)
+    >>> mask = torch.tensor(
+    ...     [[0, 0, 0, 1, 1], [1, 1, 0, 1, 1]],
+    ...     dtype=torch.bool,
+    ... )
     >>> source = torch.tensor([[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]])
     >>> self.masked_scatter(mask, source)
     tensor([[0, 0, 0, 0, 1],
@@ -6627,6 +6579,37 @@ This attribute is ``None`` by default and becomes a Tensor the first time a call
 :func:`backward` computes gradients for ``self``.
 The attribute will then contain the gradients computed and future calls to
 :func:`backward` will accumulate (add) gradients into it.
+""",
+)
+
+add_docstr_all(
+    "grad_dtype",
+    r"""
+The allowed dtype of :attr:``grad`` for this tensor.
+
+:attr:``grad_dtype`` can be set to a specific dtype or ``None``. By default,
+``t.grad_dtype == t.dtype``. When not None, the autograd engine casts
+incoming gradients to this dtype. This attribute is readable for both leaf and
+non-leaf tensors, but can only be set for leaf tensors. For a non-leaf tensor,
+it reports the gradient dtype declared by the Function that produced the tensor.
+
+.. warning::
+    Use with caution. Diverging the dtypes of a tensor and its gradient may
+    break downstream systems that assume they match.
+
+Example::
+
+    >>> x = torch.tensor([1.0, 2.0], requires_grad=True)
+    >>> x.grad_dtype
+    torch.float32
+
+    >>> x.grad_dtype = torch.float16
+    >>> x.grad_dtype
+    torch.float16
+
+    >>> # Allow any gradient dtype
+    >>> x.grad_dtype = None
+    >>> x.grad_dtype
 """,
 )
 
@@ -6699,26 +6682,6 @@ Example::
     True
     # f requires grad, has no operation creating it
 
-
-""",
-)
-
-add_docstr_all(
-    "names",
-    r"""
-Stores names for each of this tensor's dimensions.
-
-``names[idx]`` corresponds to the name of tensor dimension ``idx``.
-Names are either a string if the dimension is named or ``None`` if the
-dimension is unnamed.
-
-Dimension names may contain characters or underscore. Furthermore, a dimension
-name must be a valid Python variable name (i.e., does not start with underscore).
-
-Tensors may not have two named dimensions with the same name.
-
-.. warning::
-    The named tensor API is experimental and subject to change.
 
 """,
 )
@@ -6833,7 +6796,7 @@ If ``n`` is the number of dimensions in ``x``,
 ``x.T`` is equivalent to ``x.permute(n-1, n-2, ..., 0)``.
 
 .. warning::
-    The use of :func:`Tensor.T` on tensors of dimension other than 2 to reverse their shape
+    The use of :attr:`Tensor.T` on tensors of dimension other than 2 to reverse their shape
     is deprecated and it will throw an error in a future release. Consider :attr:`~.Tensor.mT`
     to transpose batches of matrices or `x.permute(*torch.arange(x.ndim - 1, -1, -1))` to reverse
     the dimensions of a tensor.
@@ -6885,9 +6848,10 @@ add_docstr_all(
 Returns a new tensor containing real values of the :attr:`self` tensor for a complex-valued input tensor.
 The returned tensor and :attr:`self` share the same underlying storage.
 
-Returns :attr:`self` if :attr:`self` is a real-valued tensor tensor.
+Returns :attr:`self` if :attr:`self` is a real-valued tensor.
 
 Example::
+
     >>> x=torch.randn(4, dtype=torch.cfloat)
     >>> x
     tensor([(0.3100+0.3553j), (-0.5445-0.7896j), (-1.6492-0.0633j), (-0.0638-0.8119j)])
@@ -6907,6 +6871,7 @@ The returned tensor and :attr:`self` share the same underlying storage.
     :func:`imag` is only supported for tensors with complex dtypes.
 
 Example::
+
     >>> x=torch.randn(4, dtype=torch.cfloat)
     >>> x
     tensor([(0.3100+0.3553j), (-0.5445-0.7896j), (-1.6492-0.0633j), (-0.0638-0.8119j)])
@@ -6940,6 +6905,7 @@ matrix multiplication, it is necessary to use ``int32`` indexing in order
 to avoid downcasting and potentially losing information.
 
 Example::
+
     >>> csr = torch.eye(5,5).to_sparse_csr()
     >>> csr.crow_indices()
     tensor([0, 1, 2, 3, 4, 5], dtype=torch.int32)
@@ -6960,6 +6926,7 @@ matrix multiplication, it is necessary to use ``int32`` indexing in order
 to avoid downcasting and potentially losing information.
 
 Example::
+
     >>> csr = torch.eye(5,5).to_sparse_csr()
     >>> csr.col_indices()
     tensor([0, 1, 2, 3, 4], dtype=torch.int32)

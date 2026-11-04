@@ -14,7 +14,7 @@
 #include <c10/macros/Macros.h>
 #include <c10/util/ArrayRef.h>
 #include <c10/util/Exception.h>
-#include <c10/util/Optional.h>
+#include <optional>
 
 namespace c10 {
 
@@ -73,9 +73,9 @@ struct Type;
 struct SharedType;
 
 // Use this to customize how a Type is printed using `annotation_str()`. If
-// c10::nullopt is returned, `annotation_str()` falls through to its default
+// std::nullopt is returned, `annotation_str()` falls through to its default
 // implementation.
-using TypePrinter = std::function<c10::optional<std::string>(const Type&)>;
+using TypePrinter = std::function<std::optional<std::string>(const Type&)>;
 
 namespace detail {
 template <typename T>
@@ -87,29 +87,29 @@ struct IsSingletonType : public std::integral_constant<bool, false> {};
   template <> struct IsSingletonType<Type> : public std::integral_constant<bool, true> {}; \
   }
 
-TORCH_DECLARE_SINGLETON(AnyType);
-TORCH_DECLARE_SINGLETON(AnyEnumType);
-TORCH_DECLARE_SINGLETON(NumberType);
-TORCH_DECLARE_SINGLETON(FloatType);
-TORCH_DECLARE_SINGLETON(ComplexType);
-TORCH_DECLARE_SINGLETON(IntType);
-TORCH_DECLARE_SINGLETON(BoolType);
-TORCH_DECLARE_SINGLETON(StringType);
-TORCH_DECLARE_SINGLETON(StorageType);
-TORCH_DECLARE_SINGLETON(NoneType);
-TORCH_DECLARE_SINGLETON(GeneratorType);
-TORCH_DECLARE_SINGLETON(QuantizerType);
-TORCH_DECLARE_SINGLETON(QSchemeType);
-TORCH_DECLARE_SINGLETON(DeviceObjType);
-TORCH_DECLARE_SINGLETON(StreamObjType);
-TORCH_DECLARE_SINGLETON(CapsuleType);
-TORCH_DECLARE_SINGLETON(PyObjectType);
-TORCH_DECLARE_SINGLETON(ScalarTypeType);
-TORCH_DECLARE_SINGLETON(LayoutType);
-TORCH_DECLARE_SINGLETON(MemoryFormatType);
-TORCH_DECLARE_SINGLETON(AnyListType);
-TORCH_DECLARE_SINGLETON(AnyTupleType);
-TORCH_DECLARE_SINGLETON(AnyClassType);
+TORCH_DECLARE_SINGLETON(AnyType)
+TORCH_DECLARE_SINGLETON(AnyEnumType)
+TORCH_DECLARE_SINGLETON(NumberType)
+TORCH_DECLARE_SINGLETON(FloatType)
+TORCH_DECLARE_SINGLETON(ComplexType)
+TORCH_DECLARE_SINGLETON(IntType)
+TORCH_DECLARE_SINGLETON(BoolType)
+TORCH_DECLARE_SINGLETON(StringType)
+TORCH_DECLARE_SINGLETON(StorageType)
+TORCH_DECLARE_SINGLETON(NoneType)
+TORCH_DECLARE_SINGLETON(GeneratorType)
+TORCH_DECLARE_SINGLETON(QuantizerType)
+TORCH_DECLARE_SINGLETON(QSchemeType)
+TORCH_DECLARE_SINGLETON(DeviceObjType)
+TORCH_DECLARE_SINGLETON(StreamObjType)
+TORCH_DECLARE_SINGLETON(CapsuleType)
+TORCH_DECLARE_SINGLETON(PyObjectType)
+TORCH_DECLARE_SINGLETON(ScalarTypeType)
+TORCH_DECLARE_SINGLETON(LayoutType)
+TORCH_DECLARE_SINGLETON(MemoryFormatType)
+TORCH_DECLARE_SINGLETON(AnyListType)
+TORCH_DECLARE_SINGLETON(AnyTupleType)
+TORCH_DECLARE_SINGLETON(AnyClassType)
 
 namespace detail {
 template <typename T, typename Enable = void>
@@ -185,11 +185,11 @@ struct TORCH_API Type {
         : repr_(nullptr) {}
 
     /* implicit */ SingletonOrSharedTypePtr(SingletonTypePtr<T> p)
-        : repr_(p) {}
+        : repr_(makeSingletonSharedPtr(p.get())) {}
 
     template <typename U, std::enable_if_t<std::is_convertible_v<U*, T*>, bool> = true>
     /* implicit */ SingletonOrSharedTypePtr(SingletonTypePtr<U> p)
-        : repr_(SingletonTypePtr<T>(p.get())) {}
+        : repr_(makeSingletonSharedPtr(static_cast<T*>(p.get()))) {}
 
 
     // We need to support construction from T* for pybind. The problem
@@ -202,8 +202,8 @@ struct TORCH_API Type {
     // Case 2: if T is exactly Type, we need to do a dynamic_cast to
     // check if it's a SharedType and do the right thing.
     //
-    // Case 3: Otherwise, T is not a SharedType. (debug-check this
-    // assumption!) Use a singleton pointer.
+    // Case 3: Otherwise, T is not a SharedType. Use a singleton
+    // pointer.
 
     template <typename U = T, std::enable_if_t<std::is_base_of_v<SharedType, U>, bool> = true>
     /* implicit */ SingletonOrSharedTypePtr(T* p) : SingletonOrSharedTypePtr(static_cast<typename detail::as_shared_type<U>::type>(p)->shared_from_this()) {}
@@ -211,15 +211,15 @@ struct TORCH_API Type {
     template <typename U = T, std::enable_if_t<std::is_same_v<Type, U>, bool> = true>
     /* implicit */ SingletonOrSharedTypePtr(T* p) {
       if (auto* shared_p = dynamic_cast<typename detail::as_shared_type<U>::type>(p)) {
-        repr_ = Repr(shared_p->shared_from_this());
+        repr_ = shared_p->shared_from_this();
       } else {
-        repr_ = Repr(p);
+        repr_ = makeSingletonSharedPtr(p);
       }
     }
 
     template <typename U = T, std::enable_if_t<!std::is_same_v<Type, U> && !std::is_base_of_v<SharedType, U>, bool> = true>
     /* implicit */ SingletonOrSharedTypePtr(T* p)
-        : repr_(p) {
+        : repr_(makeSingletonSharedPtr(p)) {
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(dynamic_cast<typename detail::as_shared_type<U>::type>(p) == nullptr);
     }
 
@@ -227,21 +227,22 @@ struct TORCH_API Type {
     SingletonOrSharedTypePtr(SingletonOrSharedTypePtr&&) noexcept = default;
     SingletonOrSharedTypePtr& operator=(const SingletonOrSharedTypePtr&) = default;
     SingletonOrSharedTypePtr& operator=(SingletonOrSharedTypePtr&&) noexcept = default;
+    ~SingletonOrSharedTypePtr() = default;
 
     T* get() const {
-      return repr_.isSharedAndNonNull() ? repr_.shared_.repr_.get() : static_cast<T*>(repr_.rawRepr().first);
+      return repr_.get();
     }
 
     operator bool() const {
-      return repr_.isNonNull();
+      return repr_ != nullptr;
     }
 
     bool operator==(std::nullptr_t) const {
-      return !repr_.isNonNull();
+      return repr_ == nullptr;
     }
 
     bool operator!=(std::nullptr_t) const {
-      return repr_.isNonNull();
+      return repr_ != nullptr;
     }
 
     template <typename U = T, std::enable_if_t<!std::is_same_v<std::remove_const_t<U>, void>, bool> = true>
@@ -254,138 +255,14 @@ struct TORCH_API Type {
     }
 
   private:
-    // NOTE: SharedPtrWrapper exists to work around a baffling bug in
-    // nvcc; see comment in destroy() below.
-    struct SharedPtrWrapper {
-      SharedPtrWrapper(std::shared_ptr<T> &&x)
-          : repr_(std::move(x)) {}
-      std::shared_ptr<T> repr_;
-    };
-    union Repr {
-      Repr() : Repr(nullptr) {}
+    // Use shared_ptr's aliasing constructor to create a non-owning pointer
+    // to a singleton. The lifetime is tied to the null shared_ptr, so there's
+    // no reference counting overhead for the singleton itself.
+    static std::shared_ptr<T> makeSingletonSharedPtr(T* ptr) {
+      return std::shared_ptr<T>(std::shared_ptr<T>(), ptr);
+    }
 
-      explicit Repr(std::shared_ptr<T> x)
-          : shared_(std::move(x)) {}
-
-      explicit Repr(std::nullptr_t)
-          : singletonRepr_(nullptr) {}
-
-      explicit Repr(SingletonTypePtr<T> p)
-          : singletonRepr_(p.get()) {}
-
-      ~Repr() {
-        destroy();
-      }
-
-      // NOTE: the only non-UB way to access our null state is through
-      // rawRepr(), because our copy operation doesn't preserve which
-      // union member is active for null pointers.
-      Repr(const Repr& rhs) {
-        if (rhs.isSharedAndNonNull()) {
-          new (&shared_) SharedPtrWrapper(rhs.shared_);
-        } else {
-          singletonRepr_.singleton_ = static_cast<T*>(rhs.rawRepr().first);
-          TORCH_INTERNAL_ASSERT_DEBUG_ONLY(rhs.singletonRepr_.unused_ == nullptr);
-          singletonRepr_.unused_ = nullptr;
-        }
-      }
-
-      Repr(Repr&& rhs) noexcept {
-        if (rhs.isSharedAndNonNull()) {
-          new (&shared_) SharedPtrWrapper(std::move(rhs.shared_));
-        } else {
-          singletonRepr_.singleton_ = static_cast<T*>(rhs.rawRepr().first);
-          TORCH_INTERNAL_ASSERT_DEBUG_ONLY(rhs.singletonRepr_.unused_ == nullptr);
-          singletonRepr_.unused_ = nullptr;
-        }
-      }
-
-      Repr& operator=(const Repr& rhs) {
-        if (&rhs == this) {
-          return *this;
-        }
-        if (rhs.isSharedAndNonNull()) {
-          if (isSharedAndNonNull()) {
-            shared_ = rhs.shared_;
-          } else {
-            new (&shared_) SharedPtrWrapper(rhs.shared_);
-          }
-        } else {
-          if (isSharedAndNonNull()) {
-            destroy();
-          }
-          singletonRepr_.singleton_ = static_cast<T*>(rhs.rawRepr().first);
-          TORCH_INTERNAL_ASSERT_DEBUG_ONLY(rhs.rawRepr().nullIfSingleton_ == nullptr);
-          singletonRepr_.unused_ = nullptr;
-        }
-        return *this;
-      }
-
-      Repr& operator=(Repr&& rhs) noexcept {
-        if (&rhs == this) {
-          return *this;
-        }
-        if (rhs.isSharedAndNonNull()) {
-          if (isSharedAndNonNull()) {
-            shared_ = std::move(rhs.shared_);
-          } else {
-            new (&shared_) SharedPtrWrapper(std::move(rhs.shared_));
-          }
-        } else {
-          if (isSharedAndNonNull()) {
-            destroy();
-          }
-          singletonRepr_.singleton_ = static_cast<T*>(rhs.rawRepr().first);
-          TORCH_INTERNAL_ASSERT_DEBUG_ONLY(rhs.rawRepr().nullIfSingleton_ == nullptr);
-          singletonRepr_.unused_ = nullptr;
-        }
-        return *this;
-      }
-
-      SharedPtrWrapper shared_;
-
-      struct SingletonRepr {
-        explicit SingletonRepr(T* s) : singleton_(s) {}
-        T* singleton_;
-        void* unused_ = nullptr;
-      } singletonRepr_;
-      struct RawRepr {
-        void* first;
-        void* nullIfSingleton_;
-      };
-
-      // It is UB to read the singleton part of Repr if it was
-      // constructed as a shared_ptr and vice versa, but memcpying out
-      // the representation is always OK, so here's an accessor to obey
-      // the letter of the law.
-      RawRepr rawRepr() const {
-        RawRepr repr{};
-        memcpy(&repr, reinterpret_cast<const char *>(this), sizeof(RawRepr));
-        return repr;
-      }
-
-      bool isNonNull() const {
-        auto repr = rawRepr();
-        TORCH_INTERNAL_ASSERT_DEBUG_ONLY(repr.nullIfSingleton_ == nullptr || repr.first != nullptr);
-        return repr.first != nullptr;
-      }
-
-      bool isSharedAndNonNull() const {
-        return rawRepr().nullIfSingleton_ != nullptr;
-      }
-
-     private:
-      void destroy() {
-        if (isSharedAndNonNull()) {
-          // Without SharedPtrWrapper, this line would read
-          // `shared_.~shared_ptr()` and nvcc would complain with
-          // "error: expected primary-expression before '>' token"
-          // referring to the "t" in "shared_ptr". SharedPtrWrapper
-          // exists to work around this compiler bug.
-          shared_.~SharedPtrWrapper();
-        }
-      }
-    } repr_;
+    std::shared_ptr<T> repr_;
   };
 
   using TypePtr = SingletonOrSharedTypePtr<Type>;
@@ -455,7 +332,7 @@ struct TORCH_API Type {
   // this method.
   std::string annotation_str(const TypePrinter& printer) const {
     if (printer) {
-      // the printer can return nullopt to fall through to the default impl
+      // the printer can return std::nullopt to fall through to the default impl
       if (auto renamed = printer(*this)) {
         return *renamed;
       }
@@ -585,7 +462,7 @@ struct TORCH_API Type {
   virtual TypePtr createWithContained(
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
       std::vector<TypePtr> /*contained_types*/) const {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "type with contained types did not overload createWithContained: ",
         str());
   }
@@ -676,7 +553,7 @@ inline TypePtr Type::withContained(std::vector<TypePtr> contained_types) {
 }
 
 
-TORCH_API inline bool operator==(const Type& lhs, const Type& rhs) {
+inline bool operator==(const Type& lhs, const Type& rhs) {
   if (C10_UNLIKELY(!rhs.symmetric())) {
     return rhs.equals(lhs);
   }
@@ -688,7 +565,7 @@ using NamedTypePtr = std::shared_ptr<NamedType>;
 using ConstNamedTypePtr = std::shared_ptr<const NamedType>;
 
 struct TORCH_API NamedType : public SharedType {
-  NamedType(TypeKind tk, c10::optional<QualifiedName> name)
+  NamedType(TypeKind tk, std::optional<QualifiedName> name)
       : SharedType(tk), name_(std::move(name)) {
     TORCH_INTERNAL_ASSERT(
         tk == TypeKind::TupleType || tk == TypeKind::FunctionType ||
@@ -700,12 +577,12 @@ struct TORCH_API NamedType : public SharedType {
 
   // Fully qualified name of type
   // Looks like: "foo.bar.Baz".
-  const c10::optional<QualifiedName>& name() const {
+  const std::optional<QualifiedName>& name() const {
     return name_;
   }
 
  private:
-  c10::optional<QualifiedName> name_;
+  std::optional<QualifiedName> name_;
 };
 
 } // namespace c10

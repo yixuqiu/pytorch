@@ -1,9 +1,10 @@
-# Owner(s): ["oncall: package/deploy"]
+# Owner(s): ["module: package/deploy"]
 
 from io import BytesIO
 
 from torch.package import PackageExporter
-from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.common_utils import HardwareClassification, run_tests
+
 
 try:
     from .common import PackageTestCase
@@ -17,6 +18,8 @@ class TestDependencyHooks(PackageTestCase):
     - register_mock_hook()
     - register_extern_hook()
     """
+
+    hw_classification = HardwareClassification.GENERIC
 
     def test_single_hook(self):
         buffer = BytesIO()

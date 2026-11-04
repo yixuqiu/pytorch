@@ -16,7 +16,6 @@
 #include <ATen/core/Tensor.h>
 #include <functional>
 
-#include <ATen/core/LegacyTypeDispatch.h>
 
 #include <algorithm>
 
@@ -251,7 +250,7 @@ TEST(OperatorRegistrationTest, whenRegisteringCPUTensorType_thenCanOnlyCallUnbox
   callOpUnboxedWithPrecomputedDispatchKeySet<void, Tensor>(*op, c10::DispatchKeySet(c10::DispatchKey::CPU), dummyTensor(c10::DispatchKey::CUDA));
   EXPECT_TRUE(called_kernel_cpu);
 
-  // Ensure that disptach key from tensor is not used here.
+  // Ensure that dispatch key from tensor is not used here.
   called_kernel_cpu = false;
   expectThrows<c10::Error>([&] {
     callOpUnboxedWithPrecomputedDispatchKeySet<void, Tensor>(*op, c10::DispatchKeySet(c10::DispatchKey::CUDA), dummyTensor(c10::DispatchKey::CPU));
@@ -307,7 +306,6 @@ void stackBasedKernel(const OperatorHandle&, c10::Stack* stack) {
 }
 
 TEST(OperatorRegistrationTest, whenRegisteringMultipleKernelsByNameAndNoneCanInferSchema_thenFails) {
-  bool called_kernel = false;
   expectThrows<c10::Error>([&] {
     auto registrar1 = c10::RegisterOperators().op("_test::dummy", c10::RegisterOperators::options()
       .kernel<&stackBasedKernel>(c10::DispatchKey::CPU)
@@ -882,56 +880,56 @@ TEST(OperatorRegistrationTest, testAvailableArgTypes) {
 
 
   // optional types (with has_value() == true)
-  testArgTypes<c10::optional<double>>::test(
-    c10::optional<double>(1.5), [] (const c10::optional<double>& v) {EXPECT_EQ(1.5, v.value());},
-    c10::optional<double>(2.5), [] (const IValue& v) {EXPECT_EQ(2.5, v.toDouble());},
+  testArgTypes<std::optional<double>>::test(
+    std::optional<double>(1.5), [] (const std::optional<double>& v) {EXPECT_EQ(1.5, v.value());},
+    std::optional<double>(2.5), [] (const IValue& v) {EXPECT_EQ(2.5, v.toDouble());},
     "(float? a) -> float?");
-  testArgTypes<c10::optional<int64_t>>::test(
-    c10::optional<int64_t>(1), [] (const c10::optional<int64_t>& v) {EXPECT_EQ(1, v.value());},
-    c10::optional<int64_t>(2), [] (const IValue& v) {EXPECT_EQ(2, v.toInt());},
+  testArgTypes<std::optional<int64_t>>::test(
+    std::optional<int64_t>(1), [] (const std::optional<int64_t>& v) {EXPECT_EQ(1, v.value());},
+    std::optional<int64_t>(2), [] (const IValue& v) {EXPECT_EQ(2, v.toInt());},
     "(int? a) -> int?");
-  testArgTypes<c10::optional<bool>>::test(
-    c10::optional<bool>(true), [] (const c10::optional<bool>& v) {EXPECT_EQ(true, v.value());},
-    c10::optional<bool>(false), [] (const IValue& v) {EXPECT_EQ(false, v.toBool());},
+  testArgTypes<std::optional<bool>>::test(
+    std::optional<bool>(true), [] (const std::optional<bool>& v) {EXPECT_EQ(true, v.value());},
+    std::optional<bool>(false), [] (const IValue& v) {EXPECT_EQ(false, v.toBool());},
     "(bool? a) -> bool?");
-  testArgTypes<c10::optional<bool>>::test(
-    c10::optional<bool>(false), [] (const c10::optional<bool>& v) {EXPECT_EQ(false, v.value());},
-    c10::optional<bool>(true), [] (const IValue& v) {EXPECT_EQ(true, v.toBool());},
+  testArgTypes<std::optional<bool>>::test(
+    std::optional<bool>(false), [] (const std::optional<bool>& v) {EXPECT_EQ(false, v.value());},
+    std::optional<bool>(true), [] (const IValue& v) {EXPECT_EQ(true, v.toBool());},
     "(bool? a) -> bool?");
-  testArgTypes<c10::optional<std::string>>::test(
-    c10::optional<std::string>("string1"), [] (const c10::optional<std::string>& v) {EXPECT_EQ("string1", v.value());},
-    c10::optional<std::string>("string2"), [] (const IValue& v) {EXPECT_EQ("string2", v.toStringRef());},
+  testArgTypes<std::optional<std::string>>::test(
+    std::optional<std::string>("string1"), [] (const std::optional<std::string>& v) {EXPECT_EQ("string1", v.value());},
+    std::optional<std::string>("string2"), [] (const IValue& v) {EXPECT_EQ("string2", v.toStringRef());},
     "(str? a) -> str?");
-  testArgTypes<c10::optional<Tensor>>::test(
-    c10::optional<Tensor>(dummyTensor(c10::DispatchKey::CPU)), [] (const c10::optional<Tensor>& v) {EXPECT_EQ(c10::DispatchKey::CPU, extractDispatchKey(v.value()));},
-    c10::optional<Tensor>(dummyTensor(c10::DispatchKey::CUDA)), [] (const IValue& v) {EXPECT_EQ(c10::DispatchKey::CUDA, extractDispatchKey(v.toTensor()));},
+  testArgTypes<std::optional<Tensor>>::test(
+    std::optional<Tensor>(dummyTensor(c10::DispatchKey::CPU)), [] (const std::optional<Tensor>& v) {EXPECT_EQ(c10::DispatchKey::CPU, extractDispatchKey(v.value()));},
+    std::optional<Tensor>(dummyTensor(c10::DispatchKey::CUDA)), [] (const IValue& v) {EXPECT_EQ(c10::DispatchKey::CUDA, extractDispatchKey(v.toTensor()));},
     "(Tensor? a) -> Tensor?");
 
 
   // optional types (with has_value() == false)
-  testArgTypes<c10::optional<double>>::test(
-    c10::optional<double>(c10::nullopt), [] (const c10::optional<double>& v) {EXPECT_FALSE(v.has_value());},
-    c10::optional<double>(c10::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
+  testArgTypes<std::optional<double>>::test(
+    std::optional<double>(std::nullopt), [] (const std::optional<double>& v) {EXPECT_FALSE(v.has_value());},
+    std::optional<double>(std::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
     "(float? a) -> float?");
-  testArgTypes<c10::optional<int64_t>>::test(
-    c10::optional<int64_t>(c10::nullopt), [] (const c10::optional<int64_t>& v) {EXPECT_FALSE(v.has_value());},
-    c10::optional<int64_t>(c10::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
+  testArgTypes<std::optional<int64_t>>::test(
+    std::optional<int64_t>(std::nullopt), [] (const std::optional<int64_t>& v) {EXPECT_FALSE(v.has_value());},
+    std::optional<int64_t>(std::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
     "(int? a) -> int?");
-  testArgTypes<c10::optional<bool>>::test(
-    c10::optional<bool>(c10::nullopt), [] (const c10::optional<bool>& v) {EXPECT_FALSE(v.has_value());},
-    c10::optional<bool>(c10::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
+  testArgTypes<std::optional<bool>>::test(
+    std::optional<bool>(std::nullopt), [] (const std::optional<bool>& v) {EXPECT_FALSE(v.has_value());},
+    std::optional<bool>(std::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
     "(bool? a) -> bool?");
-  testArgTypes<c10::optional<bool>>::test(
-    c10::optional<bool>(c10::nullopt), [] (const c10::optional<bool>& v) {EXPECT_FALSE(v.has_value());},
-    c10::optional<bool>(c10::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
+  testArgTypes<std::optional<bool>>::test(
+    std::optional<bool>(std::nullopt), [] (const std::optional<bool>& v) {EXPECT_FALSE(v.has_value());},
+    std::optional<bool>(std::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
     "(bool? a) -> bool?");
-  testArgTypes<c10::optional<std::string>>::test(
-    c10::optional<std::string>(c10::nullopt), [] (const c10::optional<std::string>& v) {EXPECT_FALSE(v.has_value());},
-    c10::optional<std::string>(c10::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
+  testArgTypes<std::optional<std::string>>::test(
+    std::optional<std::string>(std::nullopt), [] (const std::optional<std::string>& v) {EXPECT_FALSE(v.has_value());},
+    std::optional<std::string>(std::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
     "(str? a) -> str?");
-  testArgTypes<c10::optional<Tensor>>::test(
-    c10::optional<Tensor>(c10::nullopt), [] (const c10::optional<Tensor>& v) {EXPECT_FALSE(v.has_value());},
-    c10::optional<Tensor>(c10::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
+  testArgTypes<std::optional<Tensor>>::test(
+    std::optional<Tensor>(std::nullopt), [] (const std::optional<Tensor>& v) {EXPECT_FALSE(v.has_value());},
+    std::optional<Tensor>(std::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
     "(Tensor? a) -> Tensor?");
 
 
@@ -1136,21 +1134,21 @@ TEST(OperatorRegistrationTest, testAvailableArgTypes) {
     "(Tensor[] a) -> Tensor[]");
 
   // Test optional of list (with nullopt)
-  testArgTypes<c10::optional<c10::List<int64_t>>>::test(
-    c10::optional<c10::List<int64_t>>(c10::nullopt), [] (const c10::optional<c10::List<int64_t>>& v) {EXPECT_FALSE(v.has_value());},
-    c10::optional<c10::List<int64_t>>(c10::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
+  testArgTypes<std::optional<c10::List<int64_t>>>::test(
+    std::optional<c10::List<int64_t>>(std::nullopt), [] (const std::optional<c10::List<int64_t>>& v) {EXPECT_FALSE(v.has_value());},
+    std::optional<c10::List<int64_t>>(std::nullopt), [] (const IValue& v) {EXPECT_TRUE(v.isNone());},
     "(int[]? a) -> int[]?");
 
   // Test optional of list (with empty list)
-  testArgTypes<c10::optional<c10::List<int64_t>>>::test(
-    c10::optional<c10::List<int64_t>>(c10::List<int64_t>({})), [] (const c10::optional<c10::List<int64_t>>& v) {EXPECT_EQ(0, v.value().size());},
-    c10::optional<c10::List<int64_t>>(c10::List<int64_t>({})), [] (const IValue& v) {EXPECT_EQ(0, v.to<c10::List<int64_t>>().size());},
+  testArgTypes<std::optional<c10::List<int64_t>>>::test(
+    std::optional<c10::List<int64_t>>(c10::List<int64_t>({})), [] (const std::optional<c10::List<int64_t>>& v) {EXPECT_EQ(0, v.value().size());},
+    std::optional<c10::List<int64_t>>(c10::List<int64_t>({})), [] (const IValue& v) {EXPECT_EQ(0, v.to<c10::List<int64_t>>().size());},
     "(int[]? a) -> int[]?");
 
   // Test optional of list (with values)
-  testArgTypes<c10::optional<c10::List<int64_t>>>::test(
-    c10::optional<c10::List<int64_t>>(c10::List<int64_t>({1, 2})), [] (const c10::optional<c10::List<int64_t>>& v) {expectListEquals({1, 2}, v.value());},
-    c10::optional<c10::List<int64_t>>(c10::List<int64_t>({3, 4})), [] (const IValue& v) {expectListEquals({3, 4}, v.to<c10::List<int64_t>>());},
+  testArgTypes<std::optional<c10::List<int64_t>>>::test(
+    std::optional<c10::List<int64_t>>(c10::List<int64_t>({1, 2})), [] (const std::optional<c10::List<int64_t>>& v) {expectListEquals({1, 2}, v.value());},
+    std::optional<c10::List<int64_t>>(c10::List<int64_t>({3, 4})), [] (const IValue& v) {expectListEquals({3, 4}, v.to<c10::List<int64_t>>());},
     "(int[]? a) -> int[]?");
 
   // Test list of optional (with empty list)
@@ -1161,8 +1159,8 @@ TEST(OperatorRegistrationTest, testAvailableArgTypes) {
 
   // Test list of optional (with values)
   testArgTypes<c10::List<::std::optional<int64_t>>>::test(
-    c10::List<::std::optional<int64_t>>(c10::List<::std::optional<int64_t>>({3, c10::nullopt, 2})), [] (const c10::List<::std::optional<int64_t>>& v) {expectListEquals<c10::optional<int64_t>>({3, c10::nullopt, 2}, v);},
-    c10::List<::std::optional<int64_t>>(c10::List<::std::optional<int64_t>>({3, c10::nullopt, 2})), [] (const IValue& v) {expectListEquals<c10::optional<int64_t>>({3, c10::nullopt, 2}, v.to<c10::List<::std::optional<int64_t>>>());},
+    c10::List<::std::optional<int64_t>>(c10::List<::std::optional<int64_t>>({3, std::nullopt, 2})), [] (const c10::List<::std::optional<int64_t>>& v) {expectListEquals<std::optional<int64_t>>({3, std::nullopt, 2}, v);},
+    c10::List<::std::optional<int64_t>>(c10::List<::std::optional<int64_t>>({3, std::nullopt, 2})), [] (const IValue& v) {expectListEquals<std::optional<int64_t>>({3, std::nullopt, 2}, v.to<c10::List<::std::optional<int64_t>>>());},
     "(int?[] a) -> int?[]");
 
   // dict types
@@ -1788,8 +1786,7 @@ TEST(NewOperatorRegistrationTest, dispatchAutogradPrecedence) {
 }
 
 TEST(NewOperatorRegistrationTest, throwsWhenRegisterToBackendMapsToAutogradOther) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  bool fpga_called, math_called = false;
+  bool fpga_called = false, math_called = false;
   auto m = MAKE_TORCH_LIBRARY(test);
   m.def("fn", torch::dispatch(c10::DispatchKey::FPGA, [&](const Tensor& x) { fpga_called = true; return x; }));
   m.impl("fn", c10::DispatchKey::CompositeImplicitAutograd, [&](const Tensor& x) { math_called = true; return x; });
@@ -2032,7 +2029,7 @@ TEST(NewOperatorRegistrationTest, testImplNoDefGetsCaught) {
       if (op_name.overload_name != "") {
           error_str += "." + op_name.overload_name;
       }
-      error_str += "\n";
+      error_str += '\n';
   }
   ASSERT_EQ(danglingImpls.size(), 0) << error_str;
 }
@@ -2142,7 +2139,7 @@ TEST(OperatorRegistrationTest, callKernelsWithDispatchKeySetConvention_mixedCall
 
 TEST(OperatorRegistrationTest, getRegistrationsForDispatchKey) {
   // should return every registered op
-  auto all_ops = Dispatcher::singleton().getRegistrationsForDispatchKey(c10::nullopt);
+  auto all_ops = Dispatcher::singleton().getRegistrationsForDispatchKey(std::nullopt);
   // should return every registered op with a cpu kernel
   auto cpu_ops = Dispatcher::singleton().getRegistrationsForDispatchKey(c10::DispatchKey::CPU);
   ASSERT_TRUE(all_ops.size() > 0);
@@ -2211,6 +2208,24 @@ Tensor symint_op3(const Tensor& self, const c10::SymInt& length) {
   return self.clone();
 }
 
+Tensor symint_array_ref_op(
+    const Tensor& self,
+    const c10::SymIntArrayRef& sizes) {
+  return self.clone();
+}
+
+Tensor optional_symint_op(
+    const Tensor& self,
+    const std::optional<c10::SymInt>& length) {
+  return self.clone();
+}
+
+Tensor optional_symint_array_ref_op(
+    const Tensor& self,
+    const at::OptionalSymIntArrayRef& sizes) {
+  return self.clone();
+}
+
 TEST(OperatorRegistrationTest, TestSymSymRefCompatibility) {
   auto m = MAKE_TORCH_LIBRARY(_test);
   m.def("_test::symint_op(Tensor self, SymInt length) -> Tensor");
@@ -2219,6 +2234,46 @@ TEST(OperatorRegistrationTest, TestSymSymRefCompatibility) {
   expectThrows<c10::Error>([&] {
     m_cpu.impl("symint_op", c10::DispatchKey::CPU, TORCH_FN(symint_op3));
   }, "doesn't match the expected function schema");
+}
+
+TEST(OperatorRegistrationTest, TestSymIntArrayRefErrorExplainsSupportedSignature) {
+  auto m = MAKE_TORCH_LIBRARY(_test);
+  m.def("_test::symint_array_ref_op(Tensor self, SymInt[] sizes) -> Tensor");
+  auto m_cpu = MAKE_TORCH_LIBRARY_IMPL(_test, CPU);
+
+  expectThrows<c10::Error>([&] {
+    m_cpu.impl(
+        "symint_array_ref_op",
+        c10::DispatchKey::CPU,
+        TORCH_FN(symint_array_ref_op));
+  }, "pass SymInt and std::optional<SymInt> by value, and SymIntArrayRef and OptionalSymIntArrayRef directly (not as const references)");
+}
+
+TEST(OperatorRegistrationTest, TestOptionalSymIntErrorExplainsSupportedSignature) {
+  auto m = MAKE_TORCH_LIBRARY(_test);
+  m.def("_test::optional_symint_op(Tensor self, SymInt? length) -> Tensor");
+  auto m_cpu = MAKE_TORCH_LIBRARY_IMPL(_test, CPU);
+
+  expectThrows<c10::Error>([&] {
+    m_cpu.impl(
+        "optional_symint_op",
+        c10::DispatchKey::CPU,
+        TORCH_FN(optional_symint_op));
+  }, "std::optional<SymInt> by value");
+}
+
+TEST(OperatorRegistrationTest, TestOptionalSymIntArrayRefErrorExplainsSupportedSignature) {
+  auto m = MAKE_TORCH_LIBRARY(_test);
+  m.def(
+      "_test::optional_symint_array_ref_op(Tensor self, SymInt[]? sizes) -> Tensor");
+  auto m_cpu = MAKE_TORCH_LIBRARY_IMPL(_test, CPU);
+
+  expectThrows<c10::Error>([&] {
+    m_cpu.impl(
+        "optional_symint_array_ref_op",
+        c10::DispatchKey::CPU,
+        TORCH_FN(optional_symint_array_ref_op));
+  }, "OptionalSymIntArrayRef directly");
 }
 
 }

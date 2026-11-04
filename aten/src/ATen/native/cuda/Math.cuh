@@ -5,8 +5,7 @@
 #include <c10/macros/Macros.h>
 #include <ATen/native/cuda/jit_utils.h>
 
-namespace at {
-namespace native {
+namespace at::native {
 // See note [Jiterator]
 // TODO: elaborate in this comment on the structure of math.cuh
 #if AT_USE_JITERATOR()
@@ -232,7 +231,7 @@ const auto lcm_string = jiterator_stringify(
 const auto digamma_string = jiterator_stringify(
   template <typename T>
   T digamma(T x) {
-    static const double PI_f64 = 3.14159265358979323846;
+    static constexpr double PI_f64 = 3.14159265358979323846;
 
     // Short-circuits if x is +/- 0 and returns -/+ ∞ per the C++ standard
     if (x == 0) {
@@ -759,16 +758,15 @@ const auto sinc_string = jiterator_stringify(
   T sinc(T a) {
     if (a == T(0)) {
       return T(1);
-    } else {
-      constexpr T pi = T(3.14159265358979323846L);
-      T product = pi * a;
-      return std::sin(product) / product;
     }
+    constexpr T pi = T(3.14159265358979323846L);
+    T product = pi * a;
+    return std::sin(product) / product;
   }
 ); // sinc_string
 
 const auto erfcx_string = jiterator_stringify(
-  /* The next function is taken from http://ab-initio.mit.edu/Faddeev */
+  /* The next function is taken from http://ab-initio.mit.edu/faddeeva */
 
   /* Copyright (c) 2012 Massachusetts Institute of Technology
   *
@@ -818,7 +816,7 @@ const auto erfcx_string = jiterator_stringify(
     with the usual checks for overflow etcetera.
 
     Performance-wise, it seems to be substantially faster than either
-    the SLATEC DERFC function [or an erfcx function derived therefrom]
+    the SLATEC DERFC function [or an erfcx function derived there from]
     or Cody's CALERF function (from netlib.org/specfun), while
     retaining near machine precision in accuracy.
   */
@@ -1946,9 +1944,9 @@ const auto chebyshev_polynomial_t_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x;
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x) * q - p;
             p = q;
             q = r;
@@ -1996,9 +1994,9 @@ const auto chebyshev_polynomial_u_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x + x;
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x) * q - p;
             p = q;
             q = r;
@@ -2054,9 +2052,9 @@ const auto chebyshev_polynomial_v_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x + x - T(1.0);
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x) * q - p;
             p = q;
             q = r;
@@ -2116,9 +2114,9 @@ const auto chebyshev_polynomial_w_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x + x + T(1.0);
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x) * q - p;
             p = q;
             q = r;
@@ -2135,6 +2133,17 @@ const auto chebyshev_polynomial_w_string = jiterator_stringify(
 
 const auto hermite_polynomial_h_string = jiterator_stringify(
     template<typename T>
+    unsigned short getHermitianLimit() {
+        if (sizeof(T) <= sizeof(float)) {
+            return 128;
+        } else if (sizeof(T) <= sizeof(double)) {
+            return 512;
+        } else {
+            return 1024;
+        }
+    }
+
+    template<typename T>
     T hermite_polynomial_h_forward(T x, int64_t n) {
         if (n < 0) {
             return T(0.0);
@@ -2146,6 +2155,10 @@ const auto hermite_polynomial_h_string = jiterator_stringify(
 
         if (n == 1) {
             return x + x;
+        }
+
+        if (n > getHermitianLimit<T>()) {
+            return NAN;
         }
 
         T p = T(1.0);
@@ -2169,6 +2182,17 @@ const auto hermite_polynomial_h_string = jiterator_stringify(
 
 const auto hermite_polynomial_he_string = jiterator_stringify(
     template<typename T>
+    unsigned short getHermitianLimit() {
+        if (sizeof(T) <= sizeof(float)) {
+            return 128;
+        } else if (sizeof(T) <= sizeof(double)) {
+            return 512;
+        } else {
+            return 1024;
+        }
+    }
+
+    template<typename T>
     T hermite_polynomial_he_forward(T x, int64_t n) {
         if (n < 0) {
             return T(0.0);
@@ -2180,6 +2204,10 @@ const auto hermite_polynomial_he_string = jiterator_stringify(
 
         if (n == 1) {
             return x;
+        }
+
+        if (n > getHermitianLimit<T>()) {
+            return NAN;
         }
 
         T p = T(1.0);
@@ -2224,7 +2252,7 @@ const auto laguerre_polynomial_l_string = jiterator_stringify(
         T q = T(1.0) - x;
         T r;
 
-        for (int64_t k = 1; k < n; k++) {
+        for (int64_t k = 1; (k < n) && !isnan(q); k++) {
             r = (((k + k) + (T(1.0) - x)) * q - k * p) / (k + 1);
             p = q;
             q = r;
@@ -2266,7 +2294,7 @@ const auto legendre_polynomial_p_string = jiterator_stringify(
         T q = x;
         T r;
 
-        for (int64_t k = 1; k < n; k++) {
+        for (int64_t k = 1; (k < n) && !isnan(q); k++) {
             r = ((k + k + 1) * x * q - k * p) / (k + 1);
             p = q;
             q = r;
@@ -2821,9 +2849,9 @@ const auto shifted_chebyshev_polynomial_t_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x + x - T(1.0);
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x - T(1.0) + (x + x - T(1.0))) * q - p;
             p = q;
             q = r;
@@ -2875,9 +2903,9 @@ const auto shifted_chebyshev_polynomial_u_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x + x - T(1.0) + (x + x - T(1.0));
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x - T(1.0) + (x + x - T(1.0))) * q - p;
             p = q;
             q = r;
@@ -2933,9 +2961,9 @@ const auto shifted_chebyshev_polynomial_v_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x + x - T(1.0) + (x + x - T(1.0)) - T(1.0);
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x - T(1.0) + (x + x - T(1.0))) * q - p;
             p = q;
             q = r;
@@ -2991,9 +3019,9 @@ const auto shifted_chebyshev_polynomial_w_string = jiterator_stringify(
 
         T p = T(1.0);
         T q = x + x - T(1.0) + (x + x - T(1.0)) + T(1.0);
-        T r;
+        T r = q;
 
-        for (int64_t k = 2; k <= n; k++) {
+        for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
             r = (x + x - T(1.0) + (x + x - T(1.0))) * q - p;
             p = q;
             q = r;
@@ -3044,9 +3072,9 @@ template <typename scalar_t>
 static inline C10_HOST_DEVICE scalar_t calc_digamma(scalar_t in) {
   // [C++ Standard Reference: Gamma Function] https://en.cppreference.com/w/cpp/numeric/math/tgamma
   using accscalar_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
-  static const double PI_f64 = 3.14159265358979323846;
-  const accscalar_t PSI_10 = 2.25175258906672110764;
-  const accscalar_t A[] = {
+  static constexpr double PI_f64 = 3.14159265358979323846;
+  constexpr accscalar_t PSI_10 = 2.25175258906672110764;
+  constexpr accscalar_t A[] = {
       8.33333333333333333333E-2,
       -2.10927960927960927961E-2,
       7.57575757575757575758E-3,
@@ -3211,22 +3239,18 @@ static inline C10_HOST_DEVICE scalar_t calc_i0(scalar_t _x) {
   scalar_t x = ::abs(_x);
 
   if (x <= scalar_t{8.0}) {
-    auto coeff_pair = chebyshev_coefficients_i0e_A<scalar_t>();
-    auto A = std::get<0>(coeff_pair);
-    auto len = std::get<1>(coeff_pair);
+    auto [A, len] = chebyshev_coefficients_i0e_A<scalar_t>();
     scalar_t y = (x / scalar_t{2.0}) - scalar_t{2.0};
     return (::exp(x) * chbevl(y, A, len));
   }
 
-  auto coeff_pair = chebyshev_coefficients_i0e_B<scalar_t>();
-  auto B = std::get<0>(coeff_pair);
-  auto len = std::get<1>(coeff_pair);
+  auto [B, len] = chebyshev_coefficients_i0e_B<scalar_t>();
   return (::exp(x) * chbevl(scalar_t{32.0} / x - scalar_t{2.0}, B, len) / ::sqrt(x));
 }
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<double, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_A() {
   /* Chebyshev coefficients for exp(-x) I1(x)
    * in the interval [0,8].
@@ -3255,7 +3279,7 @@ C10_HOST_DEVICE inline
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<float, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_A() {
   /* Chebyshev coefficients for exp(-x) I1(x)
    * in the interval [0,8].
@@ -3285,7 +3309,7 @@ C10_HOST_DEVICE inline
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<double, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_B() {
   /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
@@ -3312,7 +3336,7 @@ C10_HOST_DEVICE inline
 
 template <typename T>
 C10_HOST_DEVICE inline
-    typename std::enable_if<std::is_same<float, T>::value, std::tuple<const T*, size_t>>::type
+    typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
     chebyshev_coefficients_i1e_B() {
   /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
@@ -3335,17 +3359,13 @@ template <typename scalar_t>
 static inline C10_HOST_DEVICE scalar_t calc_i1(scalar_t _x) {
   const auto x = ::abs(_x);
   if (x <= scalar_t{8.0}) {
-    auto coeff_pair = chebyshev_coefficients_i1e_A<scalar_t>();
-    auto A = std::get<0>(coeff_pair);
-    auto len = std::get<1>(coeff_pair);
+    auto [A, len] = chebyshev_coefficients_i1e_A<scalar_t>();
     scalar_t y = x / scalar_t{2.0} - scalar_t{2.0};
     const scalar_t out = ::exp(x) * x * chbevl(y, A, len);
     return (_x < scalar_t{0.0}) ? -out : out;
   }
 
-  auto coeff_pair = chebyshev_coefficients_i1e_B<scalar_t>();
-  auto B = std::get<0>(coeff_pair);
-  auto len = std::get<1>(coeff_pair);
+  auto [B, len] = chebyshev_coefficients_i1e_B<scalar_t>();
   const scalar_t out = (::exp(x) * chbevl(scalar_t{32.0} / x - scalar_t{2.0}, B, len)) / ::sqrt(x);
   return (_x < scalar_t{0.0}) ? -out : out;
 }
@@ -3354,22 +3374,17 @@ template <typename scalar_t>
 static inline C10_HOST_DEVICE scalar_t calc_i1e(scalar_t _x) {
   const auto x = ::abs(_x);
   if (x <= scalar_t{8.0}) {
-    auto coeff_pair = chebyshev_coefficients_i1e_A<scalar_t>();
-    auto A = std::get<0>(coeff_pair);
-    auto len = std::get<1>(coeff_pair);
+    auto [A, len] = chebyshev_coefficients_i1e_A<scalar_t>();
     const scalar_t y = x / scalar_t{2.0} - scalar_t{2.0};
     const scalar_t out = chbevl(y, A, len) * x;
     return (_x < scalar_t{0.0}) ? -out : out;
   }
 
-  auto coeff_pair = chebyshev_coefficients_i1e_B<scalar_t>();
-  auto B = std::get<0>(coeff_pair);
-  auto len = std::get<1>(coeff_pair);
+  auto [B, len] = chebyshev_coefficients_i1e_B<scalar_t>();
   const scalar_t out = chbevl(scalar_t{32.0} / x - scalar_t{2.0}, B, len) / ::sqrt(x);
   return (_x < scalar_t{0.0}) ? -out : out;
 }
 
 #endif // AT_USE_JITERATOR() (this closes the "else" branch of a if/else preprocessor directive)
 
-} // namespace native
-} // namespace at
+} // namespace at::native

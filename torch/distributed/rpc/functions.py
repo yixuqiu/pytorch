@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import functools
 
 
@@ -23,7 +24,7 @@ def async_execution(fn):
         However, this does not mean this decorator has to be outmost one when
         defining a function. For example, when combined with ``@staticmethod``
         or ``@classmethod``, ``@rpc.functions.async_execution`` needs to be the
-        inner decorator to allow the target function be recognized as a static
+        inner decorator to allow the target function to be recognized as a static
         or class function. This target function can still execute asynchronously
         because, when accessed, the static or class method preserves attributes
         installed by ``@rpc.functions.async_execution``.
@@ -158,9 +159,11 @@ def async_execution(fn):
         >>> ret = rref.remote().static_async_add("worker2", torch.ones(2), 1, 2).to_here()
         >>> print(ret)  # prints tensor([4., 4.])
     """
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         return fn(*args, **kwargs)
+
     # Can't declare and use attributes of function objects (mypy#2087)
     wrapper._wrapped_async_rpc_function = fn  # type: ignore[attr-defined]
     return wrapper

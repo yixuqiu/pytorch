@@ -5,13 +5,10 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-#include <ATen/FunctionalTensorWrapper.h>
 #include <ATen/Operators.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/functorch/BatchRulesHelper.h>
 #include <ATen/functorch/BatchedFallback.h>
-#include <ATen/functorch/DynamicLayer.h>
-#include <ATen/functorch/PlumbingHelper.h>
 
 namespace at::functorch {
 
@@ -23,6 +20,9 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchVmapMode, m) {
   OP_DECOMPOSE(dropout_);
   OP_DECOMPOSE(feature_alpha_dropout_);
   OP_DECOMPOSE(feature_dropout_);
+  OP_DECOMPOSE(dropout);
+  OP_DECOMPOSE(_scaled_dot_product_attention_math);
+  OP_DECOMPOSE(scaled_dot_product_attention);
 }
 
 static void unsupportedData(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
@@ -48,6 +48,7 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatchedDecomposition, m) {
   OP_DECOMPOSE(arctan2);
   OP_DECOMPOSE(arctan2_);
   OP_DECOMPOSE(argsort);
+  OP_DECOMPOSE2(argsort, stable);
   OP_DECOMPOSE(avg_pool1d);
   OP_DECOMPOSE(adaptive_max_pool1d);
   OP_DECOMPOSE(adaptive_avg_pool1d);
@@ -154,7 +155,7 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatchedDecomposition, m) {
   OP_DECOMPOSE(kron);
   OP_DECOMPOSE(l1_loss);
   m.impl("layer_norm", native::layer_norm_symint);
-  OP_DECOMPOSE2(ldexp, Tensor);
+  m.impl("_fused_rms_norm", native::rms_norm_composite);
   OP_DECOMPOSE2(less_equal, Tensor );
   OP_DECOMPOSE2(less, Tensor );
   OP_DECOMPOSE(linear);
@@ -189,6 +190,7 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatchedDecomposition, m) {
   OP_DECOMPOSE(_lu_with_info);
   OP_DECOMPOSE(matmul);
   OP_DECOMPOSE(matrix_H);
+  OP_DECOMPOSE(matrix_exp);
   OP_DECOMPOSE(matrix_power);
   OP_DECOMPOSE2(max, other );
   OP_DECOMPOSE(max_pool1d);
@@ -219,14 +221,13 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatchedDecomposition, m) {
   OP_DECOMPOSE(pinverse);
   OP_DECOMPOSE(poisson_nll_loss);
   OP_DECOMPOSE(positive);
-  OP_DECOMPOSE(qr);
   OP_DECOMPOSE(ravel);
   m.impl("repeat_interleave.self_int", static_cast<decltype(&ATEN_FN2(repeat_interleave, self_int))>(native::repeat_interleave_symint));
   m.impl("repeat_interleave.self_Tensor", static_cast<decltype(&ATEN_FN2(repeat_interleave, self_Tensor))>(native::repeat_interleave_symint));
   m.impl("reshape", native::reshape_symint);
   OP_DECOMPOSE(resolve_conj);
   OP_DECOMPOSE(resolve_neg);
-  OP_DECOMPOSE(rms_norm);
+  m.impl("rms_norm", native::rms_norm_symint);
   OP_DECOMPOSE(row_stack);
   OP_DECOMPOSE(rrelu);
   OP_DECOMPOSE(rrelu_);
@@ -234,7 +235,6 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatchedDecomposition, m) {
   OP_DECOMPOSE(relu6_);
   OP_DECOMPOSE(prelu);
   OP_DECOMPOSE2(softmax, int);
-  OP_DECOMPOSE(scaled_dot_product_attention);
   OP_DECOMPOSE(special_gammainc);
   OP_DECOMPOSE(special_gammaincc);
   OP_DECOMPOSE(special_logit);
@@ -324,6 +324,8 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatchedDecomposition, m) {
   OP_DECOMPOSE(type_as);
   OP_DECOMPOSE(linalg_diagonal);
   OP_DECOMPOSE(diagonal_copy);
+  OP_DECOMPOSE(alias_copy);
+  m.impl("as_strided_copy", native::as_strided_copy_symint);
   m.impl("pad", native::pad_symint);
   m.impl("_pad_circular", native::_pad_circular_symint);
   OP_DECOMPOSE(swapdims_);
@@ -382,6 +384,11 @@ TORCH_LIBRARY_IMPL(aten, FuncTorchBatchedDecomposition, m) {
   OP_DECOMPOSE2(to, dtype);
   OP_DECOMPOSE2(to, dtype_layout);
   OP_DECOMPOSE2(to, other);
+
+  // Random ops that are also registered here
+  OP_DECOMPOSE(dropout);
+  OP_DECOMPOSE(_scaled_dot_product_attention_math);
+  OP_DECOMPOSE(scaled_dot_product_attention);
 }
 
 } // namespace at::functorch

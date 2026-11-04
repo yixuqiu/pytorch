@@ -1,8 +1,7 @@
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Literal, TypeAlias
 
 from torch._C import device, dtype, layout
-from typing_extensions import TypeAlias
 
 # defined in torch/csrc/profiler/python/init.cpp
 
@@ -19,11 +18,12 @@ class RecordScope(Enum):
     STATIC_RUNTIME_MODEL = ...
 
 class ProfilerState(Enum):
-    Disable = ...
+    Disabled = ...
     CPU = ...
     CUDA = ...
     NVTX = ...
     ITT = ...
+    PRIVATEUSE1 = ...
     KINETO = ...
     KINETO_GPU_FALLBACK = ...
     KINETO_PRIVATEUSE1_FALLBACK = ...
@@ -35,12 +35,14 @@ class ActiveProfilerType(Enum):
     KINETO = ...
     NVTX = ...
     ITT = ...
+    PRIVATEUSE1 = ...
 
 class ProfilerActivity(Enum):
     CPU = ...
     CUDA = ...
     XPU = ...
     MTIA = ...
+    HPU = ...
     PrivateUse1 = ...
 
 class _EventType(Enum):
@@ -55,12 +57,19 @@ class _EventType(Enum):
 class _ExperimentalConfig:
     def __init__(
         self,
-        profiler_metrics: List[str] = ...,
-        profiler_measure_per_kernel: bool = ...,
         verbose: bool = ...,
-        performance_events: List[str] = ...,
+        performance_events: list[str] = ...,
         enable_cuda_sync_events: bool = ...,
+        disable_external_correlation: bool = ...,
+        profile_all_threads: bool = ...,
+        capture_overload_names: bool = ...,
+        record_python_gc_info: bool = ...,
+        expose_kineto_event_metadata: bool = ...,
+        custom_profiler_config: str = ...,
+        adjust_timestamps: bool = ...,
+        trace_only: bool = ...,
     ) -> None: ...
+    trace_only: bool
 
 class ProfilerConfig:
     def __init__(
@@ -72,44 +81,47 @@ class ProfilerConfig:
         with_flops: bool,
         with_modules: bool,
         experimental_config: _ExperimentalConfig,
+        trace_id: str | None = None,
     ) -> None: ...
 
 class _ProfilerEvent:
     start_tid: int
     start_time_ns: int
-    children: List[_ProfilerEvent]
+    children: list[_ProfilerEvent]
 
     # TODO(robieta): remove in favor of `self.typed`
-    extra_fields: Union[
-        _ExtraFields_TorchOp,
-        _ExtraFields_Backend,
-        _ExtraFields_Allocation,
-        _ExtraFields_OutOfMemory,
-        _ExtraFields_PyCall,
-        _ExtraFields_PyCCall,
-        _ExtraFields_Kineto,
-    ]
+    extra_fields: (
+        _ExtraFields_TorchOp
+        | _ExtraFields_Backend
+        | _ExtraFields_Allocation
+        | _ExtraFields_OutOfMemory
+        | _ExtraFields_PyCall
+        | _ExtraFields_PyCCall
+        | _ExtraFields_Kineto
+    )
 
     @property
     def typed(
         self,
-    ) -> Union[
-        Tuple[Literal[_EventType.TorchOp], _ExtraFields_TorchOp],
-        Tuple[Literal[_EventType.Backend], _ExtraFields_Backend],
-        Tuple[Literal[_EventType.Allocation], _ExtraFields_Allocation],
-        Tuple[Literal[_EventType.OutOfMemory], _ExtraFields_OutOfMemory],
-        Tuple[Literal[_EventType.PyCall], _ExtraFields_PyCall],
-        Tuple[Literal[_EventType.PyCCall], _ExtraFields_PyCCall],
-        Tuple[Literal[_EventType.Kineto], _ExtraFields_Kineto],
-    ]: ...
+    ) -> (
+        tuple[Literal[_EventType.TorchOp], _ExtraFields_TorchOp]
+        | tuple[Literal[_EventType.Backend], _ExtraFields_Backend]
+        | tuple[Literal[_EventType.Allocation], _ExtraFields_Allocation]
+        | tuple[Literal[_EventType.OutOfMemory], _ExtraFields_OutOfMemory]
+        | tuple[Literal[_EventType.PyCall], _ExtraFields_PyCall]
+        | tuple[Literal[_EventType.PyCCall], _ExtraFields_PyCCall]
+        | tuple[Literal[_EventType.Kineto], _ExtraFields_Kineto]
+    ): ...
     @property
     def name(self) -> str: ...
+    @property
+    def overload_name(self) -> str: ...
     @property
     def tag(self) -> _EventType: ...
     @property
     def id(self) -> int: ...
     @property
-    def parent(self) -> Optional[_ProfilerEvent]: ...
+    def parent(self) -> _ProfilerEvent | None: ...
     @property
     def correlation_id(self) -> int: ...
     @property
@@ -118,12 +130,12 @@ class _ProfilerEvent:
     def duration_time_ns(self) -> int: ...
 
 class _TensorMetadata:
-    impl_ptr: Optional[int]
-    storage_data_ptr: Optional[int]
-    id: Optional[int]
+    impl_ptr: int | None
+    storage_data_ptr: int | None
+    id: int | None
 
     @property
-    def allocation_id(self) -> Optional[int]: ...
+    def allocation_id(self) -> int | None: ...
     @property
     def layout(self) -> layout: ...
     @property
@@ -131,12 +143,12 @@ class _TensorMetadata:
     @property
     def dtype(self) -> dtype: ...
     @property
-    def sizes(self) -> List[int]: ...
+    def sizes(self) -> list[int]: ...
     @property
-    def strides(self) -> List[int]: ...
+    def strides(self) -> list[int]: ...
 
-Scalar: TypeAlias = Union[int, float, bool, complex]
-Input: TypeAlias = Optional[Union[_TensorMetadata, List[_TensorMetadata], Scalar]]
+Scalar: TypeAlias = int | float | bool | complex
+Input: TypeAlias = _TensorMetadata | list[_TensorMetadata] | Scalar | None
 
 class _ExtraFields_TorchOp:
     name: str
@@ -144,7 +156,7 @@ class _ExtraFields_TorchOp:
     allow_tf32_cublas: bool
 
     @property
-    def inputs(self) -> List[Input]: ...
+    def inputs(self) -> list[Input]: ...
     @property
     def scope(self) -> RecordScope: ...
 
@@ -152,13 +164,13 @@ class _ExtraFields_Backend: ...
 
 class _ExtraFields_Allocation:
     ptr: int
-    id: Optional[int]
+    id: int | None
     alloc_size: int
     total_allocated: int
     total_reserved: int
 
     @property
-    def allocation_id(self) -> Optional[int]: ...
+    def allocation_id(self) -> int | None: ...
     @property
     def device(self) -> device: ...
 
@@ -181,22 +193,22 @@ class _NNModuleInfo:
     @property
     def parameters(
         self,
-    ) -> List[Tuple[str, _TensorMetadata, Optional[_TensorMetadata]]]: ...
+    ) -> list[tuple[str, _TensorMetadata, _TensorMetadata | None]]: ...
 
 class _OptimizerInfo:
     @property
     def parameters(
         self,
-    ) -> List[
-        Tuple[
+    ) -> list[
+        tuple[
             # Parameter
             _TensorMetadata,
             #
             # Gradient (if present during optimizer.step())
-            Optional[_TensorMetadata],
+            _TensorMetadata | None,
             #
             # Optimizer state for Parameter as (name, tensor) pairs
-            List[Tuple[str, _TensorMetadata]],
+            list[tuple[str, _TensorMetadata]],
         ]
     ]: ...
 
@@ -210,9 +222,9 @@ class _ExtraFields_PyCall:
     @property
     def caller(self) -> _PyFrameState: ...
     @property
-    def module(self) -> Optional[_NNModuleInfo]: ...
+    def module(self) -> _NNModuleInfo | None: ...
     @property
-    def optimizer(self) -> Optional[_OptimizerInfo]: ...
+    def optimizer(self) -> _OptimizerInfo | None: ...
 
 class _ExtraFields_Kineto: ...
 
@@ -224,21 +236,113 @@ def _set_record_concrete_inputs_enabled_val(val: bool) -> None: ...
 def _set_fwd_bwd_enabled_val(val: bool) -> None: ...
 def _set_cuda_sync_enabled_val(val: bool) -> None: ...
 
+# Approximate-clock helpers used by Cuspy (experimental).
+class _ApproximateClockToUnixTimeConverter:
+    def __init__(self) -> None: ...
+    def to_unix_ns(self, t: int) -> int: ...
+
+def _get_approximate_time() -> int: ...
+
+# GIL-free Cuspy buffer pool (torch/csrc/profiler/cuspy/cuspy_native).
+# Exposed as the torch._C._profiler._cuspy submodule.
+class _CuspyModule:
+    @staticmethod
+    def approximate_time_callback_address() -> int: ...
+    @staticmethod
+    def configure_buffers(buffer_size: int) -> None: ...
+    @staticmethod
+    def buffer_request_callback_address() -> int: ...
+    @staticmethod
+    def buffer_complete_callback_address() -> int: ...
+    @staticmethod
+    def get_completed() -> (
+        tuple[int, int, int, int, list[tuple[int, int, list[tuple[int, int, int]]]]]
+        | None
+    ): ...
+    @staticmethod
+    def return_buffer(ptr: int) -> None: ...
+    @staticmethod
+    def pending_buffers() -> int: ...
+    @staticmethod
+    def allocated_buffers() -> int: ...
+    @staticmethod
+    def shutdown_buffers() -> None: ...
+    @staticmethod
+    def reset_buffers() -> None: ...
+    @staticmethod
+    def configure_decoder(
+        subscriber: int,
+        get_next_record_fn: int,
+        fence_kind: int = 0,
+        fence_end_field: int = -1,
+        self_flush: bool = False,
+        flush_period_ns: int = 0,
+        flush_fn: int = 0,
+    ) -> None: ...
+    @staticmethod
+    def start_decoder() -> None: ...
+    @staticmethod
+    def stop_decoder() -> None: ...
+    @staticmethod
+    def decoder_max_sync_ns() -> int: ...
+    @staticmethod
+    def decoder_buffers_decoded() -> int: ...
+    @staticmethod
+    def decoder_valid_bytes() -> int: ...
+    @staticmethod
+    def drain_decoded() -> tuple[list, dict[int, str]]: ...
+    @staticmethod
+    def bench_decode(
+        buffer_addr: int,
+        valid_size: int,
+        record_layouts: list[tuple[int, int, list[tuple[int, int, int]]]],
+        iters: int,
+    ) -> float: ...
+    @staticmethod
+    def note_external_push(external_id: int) -> None: ...
+    @staticmethod
+    def note_external_pop() -> int: ...
+    @staticmethod
+    def current_external_id() -> int: ...
+    @staticmethod
+    def metadata_put_external(blob: str, external_id: int = 0) -> None: ...
+    # groups: each a tuple (ts, end, track_uuid, name_iid, int_annos, str_annos,
+    #   arr_annos, json_annos, flow, gpu_corr, cat_iid) where gpu_corr is a
+    #   (int32_offsets, int64_ids) CSR of per-slice render-stage event_ids or None.
+    # render: (gpu_specs, gfx_contexts, stage_cols, extra, launch, tables, const_extra)
+    #   where stage_cols = (ts, dur, event_id, gpu_id, hw_queue_iid, stage_iid,
+    #   context, name_iid, event_wait) and event_wait is a (int32_offsets, uint64_ids)
+    #   CSR of per-stage event_wait_ids (graph node->node dependency arrows).
+    @staticmethod
+    def encode_pftrace(
+        base_ns: int,
+        tracks: list[tuple[int, int, bool, int, int, str]],
+        name_table: list[str],
+        category_table: list[str],
+        groups: list[tuple],
+        render: tuple | None = None,
+        counters: tuple | None = None,
+        compression_level: int = 1,
+        metadata: list[tuple[str, str]] = ...,
+    ) -> bytes: ...
+
+_cuspy: _CuspyModule
+
 class CapturedTraceback: ...
 
 def gather_traceback(python: bool, script: bool, cpp: bool) -> CapturedTraceback: ...
 
 # The Dict has name, filename, line
 def symbolize_tracebacks(
-    to_symbolize: List[CapturedTraceback],
-) -> List[List[Dict[str, str]]]: ...
+    to_symbolize: list[CapturedTraceback],
+) -> list[list[dict[str, str]]]: ...
 
 class _RecordFunctionFast:
     def __init__(
         self,
         name: str,
-        input_values: Optional[Union[list, tuple]] = None,
-        keyword_values: Optional[dict] = None,
+        input_values: list | tuple | None = None,
+        keyword_values: dict | None = None,
     ) -> None: ...
     def __enter__(self) -> None: ...
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None: ...
+    def __exit__(self, *exc_info: object) -> None: ...

@@ -1,10 +1,8 @@
 #include <torch/csrc/jit/runtime/profiling_graph_executor_impl.h>
 
-#include <c10/util/Optional.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/add_if_then_else.h>
-#include <torch/csrc/jit/passes/bailout_graph.h>
 #include <torch/csrc/jit/passes/batch_mm.h>
 #include <torch/csrc/jit/passes/canonicalize_graph_fuser_ops.h>
 #include <torch/csrc/jit/passes/check_strict_fusion.h>
@@ -17,11 +15,9 @@
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/decompose_ops.h>
 #include <torch/csrc/jit/passes/graph_fuser.h>
-#include <torch/csrc/jit/passes/guard_elimination.h>
 #include <torch/csrc/jit/passes/inline_autodiff_subgraphs.h>
 #include <torch/csrc/jit/passes/inliner.h>
 #include <torch/csrc/jit/passes/inplace_check.h>
-#include <torch/csrc/jit/passes/insert_guards.h>
 #include <torch/csrc/jit/passes/loop_unrolling.h>
 #include <torch/csrc/jit/passes/lower_grad_of.h>
 #include <torch/csrc/jit/passes/lower_tuples.h>
@@ -37,36 +33,45 @@
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <chrono>
 #include <mutex>
+#include <optional>
 
+// clang-format off
 C10_DEFINE_bool(
     torch_jit_enable_new_executor,
     true,
-    "If this flag is set to false TorchScript will be using the legacy/original executor");
+    "If this flag is set to false TorchScript will be using the legacy/original executor")
 
 C10_DEFINE_bool(
     torch_jit_disable_warning_prints,
     false,
-    "Disables warning.warn prints in TorchScript graph");
+    "Disables warning.warn prints in TorchScript graph")
 
 C10_DEFINE_bool(
     torch_jit_static_then_dynamic,
     false,
-    "fuse on two static compilations then 10 dynamic");
+    "fuse on two static compilations then 10 dynamic")
 
 C10_DEFINE_bool(
     torch_jit_always_dynamic,
     false,
-    "fuse on 12 dynamic compilations");
+    "fuse on 12 dynamic compilations")
+
+C10_DEFINE_bool(
+    torch_jit_input_independent_optimization,
+    false,
+    "If set, getPlanFor will use input-independent optimization passes only, "
+    "skipping profiling-based specializations that require runtime type/shape "
+    "information. Useful for predictor nets and AOT compilation scenarios.")
 
 C10_DEFINE_bool(
     torch_jit_release_profiling_graph_after_optimization,
     false,
-    "After getOptimizedPlanFor release the optimization record for reduction of memory in inference. This is aggressive memory saving, and please be cautious!");
+    "After getOptimizedPlanFor release the optimization record for reduction of memory in inference. This is aggressive memory saving, and please be cautious!")
 
 C10_DEFINE_int32(
     torch_jit_release_profiling_graph_delay_in_seconds,
     60,
-    "How long to wait before releasing the profiling graph after optimizaiton is done. Only used if torch_jit_release_profiling_graph_after_optimization is set to true.");
+    "How long to wait before releasing the profiling graph after optimization is done. Only used if torch_jit_release_profiling_graph_after_optimization is set to true.")
 
 constexpr size_t kDefaultNumProfiledRuns = 1;
 constexpr size_t kDefaultBailoutDepth = 20;
@@ -74,11 +79,11 @@ constexpr size_t kDefaultBailoutDepth = 20;
 C10_DEFINE_int64(
     torch_jit_num_profiled_runs,
     kDefaultNumProfiledRuns,
-    "Number of profiling runs");
+    "Number of profiling runs")
 C10_DEFINE_int64(
     torch_jit_bailout_depth,
     kDefaultBailoutDepth,
-    "Number of re-specializations");
+    "Number of re-specializations")
 
 namespace torch::jit {
 
@@ -113,16 +118,17 @@ static FusionStrategy getInitialStrategy() {
 // TODO remove ifdef
 #ifdef FBCODE_CAFFE2
   return {{FusionBehavior::STATIC, 20}};
-#endif
+#else
   return mixed;
+#endif
 }
 
 // defer initial value so that we can load in gflags
-static c10::optional<FusionStrategy> fusion_strategy = c10::nullopt;
+static std::optional<FusionStrategy> fusion_strategy = std::nullopt;
 
 FusionStrategy getFusionStrategy() {
   std::lock_guard<std::mutex> guard(fusion_strategy_lock);
-  if (fusion_strategy == c10::nullopt) {
+  if (fusion_strategy == std::nullopt) {
     fusion_strategy = getInitialStrategy();
   }
   return *fusion_strategy;
@@ -130,7 +136,7 @@ FusionStrategy getFusionStrategy() {
 
 FusionStrategy setFusionStrategy(FusionStrategy& strategy) {
   std::lock_guard<std::mutex> guard(fusion_strategy_lock);
-  if (fusion_strategy == c10::nullopt) {
+  if (fusion_strategy == std::nullopt) {
     fusion_strategy = getInitialStrategy();
   }
   FusionStrategy old_strategy = *fusion_strategy;
@@ -198,7 +204,7 @@ static bool needsGradientInProfilingMode(Block* b) {
 // differentiable graph. Autodiff will inspect these properties and prune
 // off gradients that aren't required
 // `requires_grad` properties from `dnode->outputs()` will also be transferred
-static C10_UNUSED void setRequiresGradOnDiffGraph(Node* dnode) {
+[[maybe_unused]] static void setRequiresGradOnDiffGraph(Node* dnode) {
   auto gi = dnode->g(attr::Subgraph)->inputs();
   for (size_t i = 0; i < dnode->inputs().size(); i++) {
     if (auto ty = dnode->input(i)->type()->cast<TensorType>()) {
@@ -320,7 +326,7 @@ static bool guardDifferentiableGraph(Node* dnode) {
     // we inline the differentiable graph as a fallback
     // ideally we would set this up for re-profiling
     UpdateDifferentiableGraphRequiresGrad(
-        dnode->g(attr::Subgraph), c10::nullopt);
+        dnode->g(attr::Subgraph), std::nullopt);
     SubgraphUtils::unmergeSubgraph(dnode);
     return false;
   }
@@ -613,7 +619,7 @@ size_t ProfilingGraphExecutorImpl::getInstantiatedBailoutDepth() {
 
 const ExecutionPlan& ProfilingGraphExecutorImpl::getOptimizedPlanFor(
     Stack& stack,
-    c10::optional<size_t> remaining_bailout_depth) {
+    std::optional<size_t> remaining_bailout_depth) {
   GRAPH_DEBUG("Running ProfilingGraphExecutorImpl ", this);
 
   // TODO: instantiate simple executor when getProfilingMode() is false
@@ -700,7 +706,7 @@ const ExecutionPlan& ProfilingGraphExecutorImpl::getOptimizedPlanFor(
 
 const ExecutionPlan& ProfilingGraphExecutorImpl::getPlanFor(
     Stack& stack,
-    c10::optional<size_t> remaining_bailout_depth) {
+    std::optional<size_t> remaining_bailout_depth) {
   std::lock_guard<std::mutex> lock(compile_mutex);
 
   // IMPORTANT: This is a hot path of calling a torchscript function. Try not to
@@ -716,8 +722,57 @@ const ExecutionPlan& ProfilingGraphExecutorImpl::getPlanFor(
     }
     return *optimized_plan_;
   }
+  if (FLAGS_torch_jit_input_independent_optimization) {
+    return getInputIndependentPlanImpl();
+  }
   // if depth is not set, use
   return getOptimizedPlanFor(stack, remaining_bailout_depth);
+}
+
+const ExecutionPlan& ProfilingGraphExecutorImpl::getInputIndependentPlan() {
+  std::lock_guard<std::mutex> lock(compile_mutex);
+  return getInputIndependentPlanImpl();
+}
+
+const ExecutionPlan&
+ProfilingGraphExecutorImpl::getInputIndependentPlanImpl() {
+  if (optimized_plan_) {
+    return *optimized_plan_;
+  }
+
+  auto copy = graph->copy();
+  if (!getGraphExecutorOptimize() || !getProfilingMode()) {
+    LowerGradOf(*copy);
+    RemoveExpands(copy);
+  } else {
+    // Run all input-independent optimizations. This includes
+    // runProfilingInsensitiveOptimizations (inlining, constant propagation,
+    // CSE, peephole, etc.) followed by runPreAutodiffPassPipeline which adds
+    // loop unrolling, list mutation removal, and additional rounds of
+    // peephole + constant propagation. Profiling-dependent passes (type
+    // specialization, fusion, autodiff guards) are skipped since they
+    // require runtime type/shape information from actual inputs.
+    runProfilingInsensitiveOptimizations(copy);
+    runPreAutodiffPassPipeline(copy);
+
+    // Run additional input-independent passes from runNoGradOptimizations
+    // and runFinalOptimizations. These operate on graph structure (node
+    // patterns, alias analysis) and do not require profiled type/shape info.
+    // Skipped: RemoveProfileNodesAndSpecializeTypes, FuseTensorExprs,
+    // FuseGraph (these need profiled tensor types for specialization/fusion).
+    for (const auto& passPair : getCustomPrePasses()) {
+      passPair.first(copy);
+    }
+    BatchMM(copy);
+    for (const auto& passPair : getCustomPostPasses()) {
+      passPair.first(copy);
+    }
+    AddIfThenElseOp(copy);
+    EliminateDeadCode(copy);
+  }
+  optimized_plan_ = ExecutionPlan(copy, function_name_);
+  time_optimized_plan_created_ = getNowInSecs();
+  return *optimized_plan_;
 }
 
 GraphExecutorState ProfilingGraphExecutorImpl::getDebugState() {

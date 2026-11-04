@@ -7,8 +7,7 @@
 
 #include <torch/csrc/lazy/core/hash.h>
 
-namespace torch {
-namespace lazy {
+namespace torch::lazy {
 namespace {
 
 hash_t LoadHash(const uint8_t** data, const uint8_t* top) {
@@ -21,7 +20,7 @@ hash_t LoadHash(const uint8_t** data, const uint8_t* top) {
   }
   union {
     hash_t h;
-    std::array<uint8_t, sizeof(hash_t)> b;
+    std::array<uint8_t, sizeof(hash_t)> b{};
 #ifdef _MSC_VER
     // MSVC (or some versions we use) doesn't support C99 union field init
     // but it initializes the first member of the union.
@@ -88,7 +87,7 @@ std::string HashToString(const hash_t& a) {
   std::stringstream ss;
   ss << std::hex << c10::Uint128High64(a) << std::setfill('0') << std::setw(16)
      << Uint128Low64(a);
-  return ss.str();
+  return std::move(ss).str();
 }
 
 hash_t Hash(const std::vector<bool>& values) {
@@ -108,5 +107,4 @@ hash_t Hash(const std::vector<bool>& values) {
   return h;
 }
 
-} // namespace lazy
-} // namespace torch
+} // namespace torch::lazy

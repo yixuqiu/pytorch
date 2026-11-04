@@ -7,8 +7,7 @@
 #include <c10/macros/Export.h>
 #include <torch/csrc/jit/frontend/source_range.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 /**
  * SourceRef does two things:
@@ -16,7 +15,7 @@ namespace jit {
  *   2. Serves as lookup key to the owned Source in associative containers, for
  *      runtime data aggregation.
  * We don't want to use std::shared_ptr<Source> directly because we want to
- * support heteogeneous lookup, and also shared_ptr is an implementation detail
+ * support heterogeneous lookup, and also shared_ptr is an implementation detail
  * which should be encapsulated.
  */
 class TORCH_API SourceRef : public CustomClassHolder {
@@ -33,7 +32,7 @@ class TORCH_API SourceRef : public CustomClassHolder {
     return &other < self.source_view_.get();
   }
   bool operator<(const SourceRef& other) const {
-    return *this < *other.source_view_.get();
+    return *this < *other.source_view_;
   }
   const Source* operator->() const {
     return source_view_.get();
@@ -43,5 +42,4 @@ class TORCH_API SourceRef : public CustomClassHolder {
   std::shared_ptr<Source> source_view_;
 };
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

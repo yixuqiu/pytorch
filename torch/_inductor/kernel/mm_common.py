@@ -1,272 +1,138 @@
-import functools
+# mypy: allow-untyped-defs
 import logging
-from typing import cast, List, Tuple
-
-import sympy
+from collections.abc import Sequence
+from functools import partial
+from pathlib import Path
+from typing import Any
 
 import torch
-from torch._inductor.select_algorithm import realize_inputs
+from torch._inductor.select_algorithm import realize_inputs, SymbolicGridFn
+from torch._inductor.utils import get_current_backend, is_bf16x9_matmul, sympy_product
 from torch._inductor.virtualized import V
+from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
 
-from .. import config as inductor_config
-from ..runtime.runtime_utils import next_power_of_2
-from ..utils import ceildiv as cdiv
+from .. import config
+from ..codegen.triton_utils import use_block_ptr_enabled
+from ..codegen.wrapper import PythonWrapperCodegen
+from ..ir import _IntLike, Layout, TensorBox
+from ..utils import load_template, triton_type
+
 
 log = logging.getLogger(__name__)
 
 
-def triton_config(num_stages, num_warps, **kwargs):
-    from triton import Config
-
-    return Config(kwargs, num_stages=num_stages, num_warps=num_warps)
-
-
-def filtered_configs(
-    m: int,
-    n: int,
-    k: int,
-    configs: List[Tuple[int, int, int, int, int]],
-    has_int8_tensor=False,
-):
-    """Heuristic to shrink configs when they are bigger than the input size"""
-
-    # According to https://github.com/openai/triton/issues/2156#issuecomment-1695897424
-    # it's safer to use at least [32, 32] block size for int8/uint8
-    # tensors
-    min_block_size = 32 if has_int8_tensor else 16
-    m = max(
-        next_power_of_2(
-            V.graph.sizevars.size_hint(
-                m, fallback=torch._inductor.config.unbacked_symint_fallback  # type: ignore[arg-type]
-            )
-        ),
-        min_block_size,
-    )
-    n = max(
-        next_power_of_2(
-            V.graph.sizevars.size_hint(
-                n, fallback=torch._inductor.config.unbacked_symint_fallback  # type: ignore[arg-type]
-            )
-        ),
-        min_block_size,
-    )
-    k = max(
-        next_power_of_2(
-            V.graph.sizevars.size_hint(
-                k, fallback=torch._inductor.config.unbacked_symint_fallback  # type: ignore[arg-type]
-            )
-        ),
-        min_block_size,
-    )
-    used = set()
-    for block_m, block_n, block_k, num_stages, num_warps in configs:
-        # shrink configs for small sizes
-        block_m = max(min(block_m, m), min_block_size)
-        block_n = max(min(block_n, n), min_block_size)
-        block_k = max(min(block_k, k), min_block_size)
-        # each warp computes 16x16 tile = 256
-        num_warps = min(num_warps, block_m * block_n // 256)
-        if torch.version.hip:
-            for matrix_instr_nonkdim in [0, 16]:
-                if matrix_instr_nonkdim != 0 and (
-                    block_m % matrix_instr_nonkdim != 0
-                    or block_n % matrix_instr_nonkdim != 0
-                ):
-                    #  block_m and block_n must be a multiple of matrix_instr_nonkdim
-                    continue
-                if (
-                    block_m,
-                    block_n,
-                    block_k,
-                    num_stages,
-                    num_warps,
-                    matrix_instr_nonkdim,
-                ) not in used:
-                    used.add(
-                        (
-                            block_m,
-                            block_n,
-                            block_k,
-                            num_stages,
-                            num_warps,
-                            matrix_instr_nonkdim,
-                        )
-                    )
-                    yield triton_config(
-                        BLOCK_M=block_m,
-                        BLOCK_N=block_n,
-                        BLOCK_K=block_k,
-                        num_stages=num_stages,
-                        num_warps=num_warps,
-                        matrix_instr_nonkdim=matrix_instr_nonkdim,
-                    )
-        else:
-            if (block_m, block_n, block_k, num_stages, num_warps, 0) not in used:
-                used.add((block_m, block_n, block_k, num_stages, num_warps, 0))
-                yield triton_config(
-                    BLOCK_M=block_m,
-                    BLOCK_N=block_n,
-                    BLOCK_K=block_k,
-                    num_stages=num_stages,
-                    num_warps=num_warps,
-                )
-
-
-# List of dictionaries to store the kernel configs. Configs that evaluate to true
-# will be utilised on the target platform
-mm_kernel_configs = [
-    # "BLOCK_M", "BLOCK_N", "BLOCK_K", "num_stages", "num_warps"
-    {"config": (16, 32, 16, 3, 2), "cond": True},
-    {"config": (16, 32, 32, 4, 2), "cond": True},
-    {"config": (16, 32, 32, 5, 2), "cond": True},
-    {"config": (32, 32, 16, 1, 2), "cond": True},
-    {"config": (32, 32, 128, 2, 4), "cond": torch.version.hip is None},
-    {"config": (32, 64, 32, 5, 8), "cond": True},
-    {"config": (64, 32, 32, 5, 8), "cond": True},
-    {"config": (64, 32, 128, 5, 4), "cond": True},
-    {"config": (64, 64, 16, 2, 4), "cond": True},
-    {"config": (64, 64, 32, 2, 4), "cond": True},
-    {"config": (64, 64, 64, 3, 8), "cond": True},
-    {"config": (64, 64, 128, 3, 4), "cond": True},
-    {"config": (64, 64, 128, 5, 4), "cond": True},
-    {"config": (64, 128, 32, 3, 4), "cond": True},
-    {"config": (64, 128, 32, 4, 8), "cond": True},
-    {"config": (64, 128, 64, 4, 4), "cond": True},
-    {"config": (64, 128, 128, 4, 4), "cond": True},
-    {"config": (128, 64, 32, 2, 2), "cond": True},
-    {"config": (128, 64, 32, 3, 4), "cond": True},
-    {"config": (128, 64, 32, 4, 8), "cond": True},
-    {"config": (128, 64, 64, 3, 8), "cond": True},
-    {"config": (128, 64, 128, 4, 8), "cond": True},
-    {"config": (128, 128, 32, 2, 8), "cond": True},
-    {"config": (128, 128, 32, 3, 4), "cond": True},
-    {"config": (128, 128, 32, 4, 4), "cond": True},
-    {"config": (128, 128, 64, 3, 4), "cond": True},
-    {"config": (128, 128, 64, 3, 8), "cond": True},
-    {"config": (128, 128, 64, 5, 4), "cond": True},
-    {"config": (128, 128, 64, 5, 8), "cond": True},
-]
-
-int8_mm_kernel_configs = [
-    {"config": (64, 64, 32, 2, 4), "cond": True},
-    {"config": (64, 128, 32, 3, 4), "cond": True},
-    {"config": (128, 64, 32, 3, 4), "cond": True},
-    {"config": (64, 128, 32, 4, 8), "cond": True},
-    {"config": (128, 64, 32, 4, 8), "cond": True},
-    {"config": (64, 32, 32, 5, 8), "cond": True},
-    {"config": (32, 64, 32, 5, 8), "cond": True},
-    {"config": (128, 128, 32, 2, 8), "cond": True},
-    {"config": (64, 64, 64, 3, 8), "cond": True},
-    # {"config": (32, 32, 128, 2, 4), "cond": True},
-    # {"config": (64, 64, 16, 2, 4), "cond": True},
-    # {"config": (32, 32, 16, 1, 2), "cond": True},
-    {"config": (128, 256, 128, 3, 8), "cond": torch.version.hip is None},
-    {"config": (256, 128, 128, 3, 8), "cond": torch.version.hip is None},
-]
-
-# Create filtered list of configs based on cond evaluation
-
-
-mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in mm_kernel_configs
-    if config["cond"]
-)
-int8_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in int8_mm_kernel_configs
-    if config["cond"]
-)
-
-# On ROCm convert num_stages to 1 as pipelining provides no benefit
-if torch.version.hip:
-    mm_platform_configs = tuple(
-        (config[0], config[1], config[2], 1, config[4])
-        for config in mm_platform_configs
-    )
-    int8_platform_configs = tuple(
-        (config[0], config[1], config[2], 1, config[4])
-        for config in mm_platform_configs
-    )
-
-mm_configs = functools.partial(
-    filtered_configs,
-    configs=mm_platform_configs,
-)
-
-int8_mm_configs = functools.partial(
-    filtered_configs,
-    configs=int8_platform_configs,
-)
-
-
-def mm_grid(m, n, meta):
+@SymbolicGridFn
+def mm_grid(m, n, meta, *, cdiv):
     """
     The CUDA grid size for matmul triton templates.
     """
     return (cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), 1, 1)
 
 
+@SymbolicGridFn
+def persistent_mm_grid(M: int, N: int, meta: dict[str, Any], *, cdiv, min):
+    """Defines the grid for persistent kernels."""
+    return (
+        min(meta["NUM_SMS"], cdiv(M, meta["BLOCK_M"]) * cdiv(N, meta["BLOCK_N"])),
+        1,
+        1,
+    )
+
+
+@SymbolicGridFn
+def blackwell_persistent_mm_grid(M: int, N: int, meta: dict[str, Any], *, cdiv, min):
+    """Like persistent_mm_grid, with cluster-aligned 2CTA tiles and launch grid.
+
+    The heuristic also rounds ``NUM_SMS`` down to even because the template uses
+    it as the persistent-loop stride.
+    """
+    num_pid_m = cdiv(M, meta["BLOCK_M"])
+    if meta.get("TWO_CTAS", False):
+        num_pid_m = (num_pid_m + 1) // 2 * 2
+    num_tiles = num_pid_m * cdiv(N, meta["BLOCK_N"])
+    grid_size = min(meta["NUM_SMS"], num_tiles)
+    if meta.get("TWO_CTAS", False):
+        grid_size = (grid_size // 2) * 2
+    return (grid_size, 1, 1)
+
+
+@SymbolicGridFn
+def persistent_grouped_mm_grid(*args):
+    meta = args[-1]
+    return (meta["NUM_SMS"], 1, 1)
+
+
 def acc_type(dtype):
     if dtype in (torch.float16, torch.bfloat16):
         return "tl.float32"
-    return f"tl.{dtype}".replace("torch.", "")
+    if dtype.is_floating_point and dtype.itemsize == 1:  # fp8 dtypes
+        return "tl.float32"
+    return triton_type(dtype)
 
 
-def mm_options(config, sym_m, sym_n, sym_k, layout, b_prologue_cast_type=None):
-    """
-    Common options to matmul triton templates.
-    """
-    even_k_symbolic = (
-        # it isn't worth guarding on this
-        sympy.gcd(sym_k, config.kwargs["BLOCK_K"])
-        == config.kwargs["BLOCK_K"]
-    )
-    allow_tf32 = torch.backends.cuda.matmul.allow_tf32 and (
-        not inductor_config.force_same_precision
-        or ((sym_m % 16) == 0 and (sym_n % 16) == 0 and (sym_k % 8) == 0)
-    )
-    return dict(
-        GROUP_M=8,
-        EVEN_K=even_k_symbolic,
-        ALLOW_TF32=allow_tf32,
-        ACC_TYPE=acc_type(layout.dtype),
-        B_PROLOGUE_CAST_TYPE=b_prologue_cast_type,
-        num_stages=config.num_stages,
-        num_warps=config.num_warps,
-        **config.kwargs,
-    )
-
-
-def mm_args(mat1, mat2, *others, layout=None, out_dtype=None, use_4x2_dim=False):
+def mm_args(
+    mat1,
+    mat2,
+    *others,
+    layout=None,
+    out_dtype=None,
+    use_4x2_dim=False,
+    mat2_transposed=False,
+):
     """
     Common arg processing for mm,bmm,addmm,etc
     """
     mat1, mat2 = realize_inputs(mat1, mat2)
     *b1, m, k1 = mat1.get_size()
-    *b2, k2, n = mat2.get_size()
-    b = [V.graph.sizevars.guard_equals(a, b) for a, b in zip(b1, b2)]
+    if mat2_transposed:
+        *b2, n, k2 = mat2.get_size()
+    else:
+        *b2, k2, n = mat2.get_size()
+    b = [V.graph.sizevars.check_equals_and_simplify(a, b) for a, b in zip(b1, b2)]
     if use_4x2_dim:
         k2 = k2 * 2
-    k = V.graph.sizevars.guard_equals(k1, k2)
+    k = V.graph.sizevars.check_equals_and_simplify(k1, k2)
     if layout is None:
         from torch._inductor.ir import FixedLayout
 
         if out_dtype is None:
             out_dtype = mat1.get_dtype()
+
         layout = FixedLayout(
             mat1.get_device(),
             out_dtype,
             [*b, m, n],
         )
     else:
-        assert out_dtype is None, "out_dtype is ignored if layout is specified."
-
+        if out_dtype is not None:
+            raise AssertionError("out_dtype is ignored if layout is specified.")
     from ..lowering import expand
 
     others = [realize_inputs(expand(x, layout.size)) for x in others]
 
     return [m, n, k, layout, mat1, mat2, *others]
+
+
+def zero_addmm_input(inp, mat1, mat2):
+    """
+    addmm and baddbmm ignore their input when beta == 0, NaN and inf included,
+    but GEMM templates compute beta * input, so the lowerings give them zeros
+    instead. Each choice still scales its accumulator by alpha as eager does,
+    whereas alpha * mm rounds to fp16 first and can overflow.
+    """
+    from ..lowering import lowerings
+
+    torch._check(
+        inp.get_dtype() == mat1.get_dtype() and inp.get_dtype() == mat2.get_dtype(),
+        lambda: "input dtypes must be the same",
+    )
+    torch._check(
+        inp.get_device() == mat1.get_device() and inp.get_device() == mat2.get_device(),
+        lambda: "all inputs must be on the same device",
+    )
+    return lowerings[torch.ops.aten.full](
+        [mat2.get_size()[-1]], 0, dtype=mat1.get_dtype(), device=mat1.get_device()
+    )
 
 
 def addmm_epilogue(dtype, alpha, beta):
@@ -278,3 +144,209 @@ def addmm_epilogue(dtype, alpha, beta):
         return V.ops.add(acc, bias)
 
     return epilogue
+
+
+def scale_mm_epilogue():
+    """
+    Create an epilogue function that applies scaling to matrix multiplication result
+    using the given scale factors.
+
+    Args:
+        dtype: The data type of the output
+        scale_a: Scale factor for matrix A
+        scale_b: Scale factor for matrix B
+
+    Returns:
+        Epilogue function that takes the accumulator and applies scaling
+    """
+
+    def epilogue(acc, inv_a_scale, inv_b_scale, bias=None):
+        # The epilogue function receives the accumulator (result of mat1 @ mat2)
+        # and applies the scaling factors
+        # In the original scaled_mm, we use inverse scales, so we multiply by them
+        mul_scales = V.ops.mul(inv_a_scale, inv_b_scale)
+        mul_acc = V.ops.mul(acc, mul_scales)
+        if bias is not None:
+            return V.ops.add(mul_acc, bias)
+        else:
+            return mul_acc
+
+    return epilogue
+
+
+def use_native_matmul(mat1, mat2):
+    if (
+        is_bf16x9_matmul(mat1.get_device().type, mat1.get_dtype())
+        or not config.triton.native_matmul
+    ):
+        return False
+
+    # If tma matmul is on, don't do native matmul
+    if (
+        config.triton.enable_persistent_tma_matmul
+        and torch.utils._triton.has_triton_tma_device()
+    ):
+        raise AssertionError("native matmul doesn't support tma codegen yet")
+
+    # Currently only enable native matmul for default indexing.
+    # TODO: support block ptr
+    if use_block_ptr_enabled():
+        raise AssertionError("native matmul doesn't support block_ptr codegen yet")
+
+    # Currently only enable native matmul for triton on GPU.
+    device_type = mat1.get_device().type
+    if not (
+        device_type in ("cuda", "xpu") and get_current_backend(device_type) == "triton"
+    ):
+        return False
+
+    # Currently, tl.dot only supports following dtypes
+    triton_supported_dtype = [
+        torch.int8,
+        torch.uint8,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ]
+    if mat1.dtype not in triton_supported_dtype:
+        return False
+    if mat2.dtype not in triton_supported_dtype:
+        return False
+
+    # (..., M, K) @ (..., K, N)
+    m, k, n = mat1.get_size()[-2], mat1.get_size()[-1], mat2.get_size()[-1]
+
+    # If the shape has unbacked symbols, don't do native matmul.
+    # This is related to the behavior of statically_known_multiple_of on unbacked symints.
+    # Since statically_known_multiple_of just returns False for unbacked symbols
+    # due to the expensive cost, codegen fails when there is an unbacked symbol.
+    # In particular, it fails at _split_iteration_ranges in codegen/simd.py.
+    # See this : https://github.com/pytorch/pytorch/pull/131649
+    if any(map(has_free_unbacked_symbols, [m, k, n])):
+        return False
+
+    # Consider the shape (m,k,n) > 1
+    # TODO : support when size = 1
+    if (
+        V.graph.sizevars.statically_known_leq(m, 1)
+        or V.graph.sizevars.statically_known_leq(k, 1)
+        or V.graph.sizevars.statically_known_leq(n, 1)
+    ):
+        return False
+
+    return True
+
+
+def _use_small_mm_pointwise(
+    m, k, n, device_type: str, statically_known_true=None
+) -> bool:
+    """Check if mm should be lowered to pointwise ops for small K and N.
+
+    For very small inner dimensions (K < 5 and N < 5) with M >= 64,
+    cuBLAS launch overhead dominates and a fused pointwise kernel is
+    faster (1.2-4.8x on H200).  M >= 64 excludes tiny matrices where
+    pointwise kernel launch overhead negates the benefit.  K,N < 5
+    avoids shapes where Triton codegen quality is unstable (K=5 regresses
+    at large M due to reduction-dimension alignment).  Disabled under
+    max_autotune to preserve template selection.
+    See https://github.com/pytorch/pytorch/issues/186348
+
+    ``statically_known_true`` lets callers that run before the inductor
+    ``GraphLowering`` is active (e.g. the pad_mm joint-graph pass, where
+    ``V.graph`` is unavailable) supply their own predicate.
+    """
+    if config.max_autotune or config.max_autotune_gemm:
+        return False
+    if device_type in ("cpu", "mps"):
+        return False
+    skt = statically_known_true or V.graph.sizevars.statically_known_true
+    return skt(m >= 64) and skt(k < 5) and skt(n < 5)
+
+
+def _fits_int32_buffer_span(
+    rows: int, row_stride: int | None, cols: int, itemsize: int
+) -> bool:
+    # Descriptor fields are signed int32, but AMD buffer voffset is an unsigned
+    # 32-bit byte offset.
+    int32_max = (1 << 31) - 1
+    uint32_max = (1 << 32) - 1
+    return (
+        0 < rows <= int32_max
+        and 0 < cols <= int32_max
+        and row_stride is not None
+        and 0 <= row_stride <= int32_max
+        and ((rows - 1) * row_stride + cols) * itemsize <= uint32_max
+    )
+
+
+def _is_static_problem(layout: Layout) -> tuple[bool, bool]:
+    """
+    Check if input tensors and output layout have static shapes and non-zero sizes.
+
+    Args:
+        layout: Output layout object with a 'size' attribute.
+
+    Returns:
+        Tuple[bool, bool]: (is_static, is_nonzero)
+            is_static: True if all shapes are statically known
+            is_nonzero: True if all dimensions are non-zero
+    """
+    static_shape = True
+    static_size = PythonWrapperCodegen.statically_known_list_of_ints_or_none(
+        layout.size
+    )
+    if static_size is None:
+        nonzero = True
+        for s in layout.size:
+            sz = PythonWrapperCodegen.statically_known_int_or_none(s)
+            if sz is not None and sz == 0:
+                nonzero = False
+                break
+        return False, nonzero
+    numel = 1
+    for dim in static_size:
+        numel *= dim
+    nonzero = numel > 0
+    return static_shape, nonzero
+
+
+def check_supported_striding(mat_a: TensorBox, mat_b: TensorBox) -> None:
+    def is_row_major(stride: Sequence[_IntLike]) -> bool:
+        return stride[-1] == 1
+
+    def is_col_major(stride: Sequence[_IntLike]) -> bool:
+        return stride[-2] == 1
+
+    def has_zero_dim(size: Sequence[_IntLike]) -> bool:
+        return bool(size[0] == 0 or size[1] == 0)
+
+    # Check mat_a (self) stride requirements
+    torch._check(
+        is_row_major(mat_a.get_stride()) or has_zero_dim(mat_a.get_size()),
+        lambda: f"mat_a must be row_major, got stride {mat_a.get_stride()}",
+    )
+
+    # Check mat_b stride requirements
+    torch._check(
+        is_col_major(mat_b.get_stride()) or has_zero_dim(mat_b.get_size()),
+        lambda: f"mat_b must be col_major, got stride {mat_b.get_stride()}",
+    )
+
+
+def is_batch_stride_largest_or_zero(mat1, mat2, layout) -> bool:
+    """
+    Checking if the batch stride is the largest in the stride.
+    """
+    sizes = [mat1.get_size(), mat2.get_size(), layout.size]
+    strides = [mat1.get_stride(), mat2.get_stride(), layout.stride]
+    for size, stride in zip(sizes, strides):
+        if not (len(size) == len(stride) == 3):
+            raise AssertionError("Expect 3D tensors")
+        if stride[0] != 0 and stride[0] != sympy_product(size[1:]):
+            return False
+
+    return True
+
+
+_KERNEL_TEMPLATE_DIR = Path(__file__).parent / "templates"
+load_kernel_template = partial(load_template, template_dir=_KERNEL_TEMPLATE_DIR)

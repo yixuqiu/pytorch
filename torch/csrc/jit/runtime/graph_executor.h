@@ -9,9 +9,9 @@
 #include <torch/csrc/jit/runtime/interpreter.h>
 #include <torch/csrc/jit/runtime/variable_tensor_list.h>
 
-C10_DECLARE_bool(torch_jit_enable_new_executor);
+TORCH_DECLARE_bool(torch_jit_enable_new_executor);
 
-C10_DECLARE_bool(torch_jit_execution_plan_reuse_code_graph);
+TORCH_DECLARE_bool(torch_jit_execution_plan_reuse_code_graph);
 
 namespace torch::jit {
 struct GraphExecutorState;
@@ -43,7 +43,6 @@ struct ExecutionPlan {
 // They are only valid only right after you call getDebugState() and should
 // never be used again once another GraphExecutor function is called.
 
-// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 struct GraphExecutorState {
   const Graph* graph = nullptr;
   ExecutionPlan fallback; // XXX: members of this field are optional
@@ -87,7 +86,12 @@ struct TORCH_API GraphExecutor {
   // current global fusion strategy settings.
   const ExecutionPlan& getPlanFor(
       Stack& inputs,
-      c10::optional<size_t> remaining_bailout_depth = c10::nullopt);
+      std::optional<size_t> remaining_bailout_depth = std::nullopt);
+  // Returns an optimized execution plan without requiring input arguments.
+  // Runs input-independent optimization passes (e.g. inlining, constant
+  // propagation, peephole, CSE) but skips profiling-based specializations
+  // that require runtime type/shape information.
+  const ExecutionPlan& getInputIndependentPlan();
   GraphExecutorState getDebugState();
 
   void debugFlushCompilationCache();

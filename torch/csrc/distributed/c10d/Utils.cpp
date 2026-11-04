@@ -1,10 +1,6 @@
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 
-#include <algorithm>
 #include <cstring>
-#include <memory>
-#include <string>
-#include <thread>
 
 namespace c10d {
 
@@ -28,6 +24,41 @@ size_t getTensorsNumel(const std::vector<at::Tensor>& tensors) {
     numel += tensor.numel();
   }
   return numel;
+}
+
+void getGlobalRankStartAndStride(
+    const std::vector<uint64_t>& globalRanksInGroup,
+    int& globalRankStart,
+    int& globalRankStride) {
+  if (globalRanksInGroup.empty()) {
+    globalRankStart = 0;
+  } else {
+    globalRankStart = static_cast<int>(globalRanksInGroup[0]);
+  }
+
+  if (globalRanksInGroup.empty()) {
+    globalRankStride = 1;
+  } else if (globalRanksInGroup.size() == 1) {
+    globalRankStride = 0;
+  } else {
+    bool ranksAreStrided = true;
+    auto startRank = globalRanksInGroup[0];
+    auto stride = globalRanksInGroup[1] - globalRanksInGroup[0];
+    for (std::vector<uint64_t>::size_type i = 0; i < globalRanksInGroup.size();
+         i++) {
+      if (globalRanksInGroup[i] != startRank + i * stride) {
+        ranksAreStrided = false;
+        break;
+      }
+    }
+
+    if (ranksAreStrided) {
+      globalRankStride =
+          static_cast<int>(globalRanksInGroup[1] - globalRanksInGroup[0]);
+    } else {
+      globalRankStride = -1;
+    }
+  }
 }
 
 } // namespace c10d

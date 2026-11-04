@@ -5,13 +5,11 @@
 
 #include <torch/csrc/distributed/autograd/context/context.h>
 
-namespace torch {
-namespace distributed {
-namespace autograd {
+namespace torch::distributed::autograd {
 
 // Singleton class per worker which is responsible for storing the distributed
 // autograd context for each autograd pass and also cleans up data for an
-// autograd pass once its done.
+// autograd pass once it's done.
 //
 // Each autograd pass is assigned a unique autograd_context_id and all data for
 // that pass (DistAutogradContext) is stored in this container indexed by the
@@ -92,6 +90,8 @@ class TORCH_API DistAutogradContainer {
   // Returns the current thread local context id for this thread.
   static int64_t currentContextId();
 
+  DistAutogradContainer() = delete;
+  ~DistAutogradContainer() = default;
   DistAutogradContainer(const DistAutogradContainer&) = delete;
   DistAutogradContainer& operator=(const DistAutogradContainer&) = delete;
   DistAutogradContainer(DistAutogradContainer&&) = delete;
@@ -116,9 +116,6 @@ class TORCH_API DistAutogradContainer {
     // Map storing autograd contexts for this shard.
     std::unordered_map<int64_t, ContextPtr> contexts;
   };
-
-  DistAutogradContainer() = delete;
-  ~DistAutogradContainer() = default;
 
   static DistAutogradContainer& getInstanceInternal();
 
@@ -162,6 +159,4 @@ class TORCH_API DistAutogradContainer {
   int64_t max_id_;
 };
 
-} // namespace autograd
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::autograd

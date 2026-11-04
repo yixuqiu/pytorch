@@ -3,19 +3,17 @@
 #include <ATen/code_template.h>
 #include <torch/csrc/Export.h>
 
-namespace torch {
-namespace jit {
-namespace fuser {
-namespace cuda {
+namespace torch::jit::fuser::cuda {
 
 /*with type_as not checking type of its input, a fusion group can have non-fp32
 tensor as input. Correct code for this case is generated, however, nvrtc does
 not know how to handle int*_t integer types, so typedefs help it handle those
 cases*/
 
-#if defined(USE_ROCM)
+static constexpr auto bfloat16_type_string = "__nv_bfloat16";
+
+#if defined(USE_ROCM) && ROCM_VERSION < 70000
 static auto type_declarations_template = at::jit::CodeTemplate(R"(
-${RuntimeHeader}
 ${HalfHeader}
 ${BFloat16Header}
 ${RandHeader}
@@ -263,12 +261,37 @@ typedef __half half;
 #endif
 
 #if defined(USE_ROCM)
+
+#if ROCM_VERSION >= 70000
+#define BF16_UINT32_DEF "typedef unsigned int uint32_t;\n"
+#else
+#define BF16_UINT32_DEF ""
+#endif
+
+// NOTE [ ROCm JIT bfloat16 symbol collision ]
+// This file is excluded from hipify (see tools/amd_build/build_amd.py), so it
+// ships its own self-contained __nv_bfloat16 type plus the
+// __float2bfloat16/__bfloat162float conversions for the runtime-compiled fuser
+// kernel. Starting with ROCm 7.x, hiprtc auto-injects a runtime header
+// (hiprtc_runtime.h) that also defines __float2bfloat16 returning
+// __hip_bfloat16. Since C++ cannot overload on return type alone, the two
+// definitions collide. Rather than gate on ROCM_VERSION (a build-time value
+// that does not reliably track whether the *runtime* hiprtc actually provides
+// these symbols), we keep PyTorch's own round-to-nearest-even implementation
+// and rename our private definitions via the preprocessor so they cannot
+// clash. hiprtc's definitions remain (parsed earlier in the translation unit)
+// but go unused. These #defines must stay in effect for the rest of the kernel
+// source -- do NOT #undef them, since the emitted kernel body calls these
+// conversions after this header is spliced in.
 constexpr auto bfloat16_support_literal =
     R"(
+#define __internal_float2bfloat16 __pt_jit_internal_float2bfloat16
+#define __float2bfloat16 __pt_jit_float2bfloat16
+#define __bfloat162float __pt_jit_bfloat162float
 #ifndef __align__
 #define __align__(x) __attribute__((aligned(x)))
 #endif
-
+)" BF16_UINT32_DEF R"(
 typedef struct __align__(2) {
   unsigned short x;
 }
@@ -404,7 +427,4 @@ __device__ float __bfloat162float(const __nv_bfloat16 a) {
 )";
 #endif
 
-} // namespace cuda
-} // namespace fuser
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::fuser::cuda

@@ -4,9 +4,7 @@
 
 #include <sstream>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 thread_local std::vector<std::shared_ptr<RRefContext::PendingUserState>>
     RRefContext::userTable_;
@@ -138,15 +136,15 @@ std::unordered_map<std::string, std::string> RRefContext::getDebugInfo() {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ownerSize = owners_.size();
   auto numPendingUsers = pendingUsers_.size();
-  int numForks = 0;
+  size_t numForks = 0;
   for (const auto& owner : forks_) {
     numForks += owner.second.size();
   }
   lock.unlock();
-  info[kNumOwnerRRefs] = c10::to_string(ownerSize);
-  info[kNumPendingFutures] = c10::to_string(numPendingFutures_.load());
-  info[kNumPendingUsers] = c10::to_string(numPendingUsers);
-  info[kNumForks] = c10::to_string(numForks);
+  info[kNumOwnerRRefs] = std::to_string(ownerSize);
+  info[kNumPendingFutures] = std::to_string(numPendingFutures_.load());
+  info[kNumPendingUsers] = std::to_string(numPendingUsers);
+  info[kNumForks] = std::to_string(numForks);
   return info;
 }
 
@@ -156,8 +154,7 @@ void RRefContext::checkRRefLeaks(bool ignoreRRefLeak) {
     for (auto& entry : forks_) {
       const RRefId& rrefId = entry.first;
       for (const auto& forkId : entry.second) {
-        ss << "Leaking RRef " << rrefId << " with fork Id " << forkId
-           << std::endl;
+        ss << "Leaking RRef " << rrefId << " with fork Id " << forkId << '\n';
       }
     }
 
@@ -172,7 +169,7 @@ void RRefContext::checkRRefLeaks(bool ignoreRRefLeak) {
         << "GC has deleted them before calling shutdown(): \n"
         << ss.str();
     if (!ignoreRRefLeak) {
-      TORCH_CHECK(false, ss.str());
+      TORCH_CHECK(false, std::move(ss).str());
     }
   }
 }
@@ -259,7 +256,7 @@ void RRefContext::delAllUsersAndUnforkedOwners(
   // Start sending UserRRef delete messages, after all pendings are confirmed.
   // Note, there should be no new forkings in between, because it's assumed that
   // this utility is called during graceful shutdown, where no new user RPCs can
-  // be initiaited anymore.
+  // be initiated anymore.
   for (const auto& user : tempConfirmedUsers) {
     c10::intrusive_ptr<RRef> rref_ptr = user.second.lock();
     if (!rref_ptr) {
@@ -278,7 +275,7 @@ void RRefContext::delAllUsersAndUnforkedOwners(
     std::vector<RRefId> unforkedOwners;
     for (const auto& it : owners_) {
       auto rrefId = it.first;
-      if (forks_.find(rrefId) == forks_.end()) {
+      if (!forks_.contains(rrefId)) {
         // Successful fork of owner was never processed.
         unforkedOwners.push_back(rrefId);
       }
@@ -351,7 +348,7 @@ c10::intrusive_ptr<OwnerRRef> RRefContext::getOrCreateOwnerRRef(
     // here is a plain TensorType, they are not equal relationship:
     // specialized TensorType <: plain TensorType
     //
-    // In RPC we don't care the difference as we ser/de with just the
+    // In RPC we don't care the difference as we Ser/De with just the
     // plain TensorType. This is not a issue for UserRRef creation either,
     // since Tensor can only get specialized with a previous run of local
     // JIT function, and we shouldn't preserve the specialized SubTensorType
@@ -750,7 +747,7 @@ void RRefContext::addForkOfOwnerIfNotPresent(
   // the child may have been added by a previous send attempt, and this check
   // (as opposed to an assertion here) ensures that messages that trigger this
   // function are idempotent.
-  if (rrefForks.find(forkId) == rrefForks.end()) {
+  if (!rrefForks.contains(forkId)) {
     rrefForks.insert(forkId);
   } else {
     LOG(INFO) << "Ignoring duplicate request to add Fork of OwnerRRef with "
@@ -803,6 +800,4 @@ c10::intrusive_ptr<RRef> RRefContext::delForkOfOwner(
   return deletedRRef;
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

@@ -9,8 +9,7 @@
 #include <memory>
 #include <vector>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 constexpr int kCPUDevice = -1;
 
@@ -32,7 +31,7 @@ TORCH_API bool canFuseOnGPU();
 // flakiness)
 TORCH_API void overrideCanFuseOnCPU(bool value);
 
-// Sets whether fusion on CPU must use LLVM Codegen and not SimplieIREval
+// Sets whether fusion on CPU must use LLVM Codegen and not SimpleIREval
 TORCH_API void overrideMustUseLLVMOnCPU(bool value);
 
 // Sets whether fusion on the GPU is allowed (enabled by default)
@@ -52,5 +51,4 @@ TORCH_API std::string debugGetFusedKernelCode(
 
 TORCH_API size_t nCompiledKernels();
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

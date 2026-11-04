@@ -7,8 +7,10 @@ import math
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+
 import torch
 from torch.nn import functional as F
+
 
 mpl.use("Agg")
 
@@ -95,7 +97,7 @@ for it in range(20000):
     opt.step()
 
     if it % 100 == 0:
-        print("Iteration %d -- Outer Loss: %.4f" % (it, loss2))
+        print(f"Iteration {it:d} -- Outer Loss: {loss2:.4f}")
     losses.append(loss2.detach())
 
 t_A = torch.tensor(0.0).uniform_(0.1, 0.5)
@@ -107,7 +109,7 @@ t_y = t_A * torch.sin(t_x + t_b)
 opt.zero_grad()
 
 t_params = params
-for k in range(5):
+for _ in range(5):
     t_f = net(t_x, t_params)
     t_loss = F.l1_loss(t_f, t_y)
 

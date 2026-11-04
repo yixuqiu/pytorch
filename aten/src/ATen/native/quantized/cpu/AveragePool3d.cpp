@@ -5,6 +5,7 @@
 #include <ATen/native/quantized/cpu/init_qnnpack.h>
 #include <ATen/native/quantized/cpu/QnnpackUtils.h>
 #include <ATen/native/quantized/cpu/QuantizedOps.h>
+#include <c10/util/safe_conv.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -16,8 +17,7 @@
 
 #include <vector>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 DEFINE_DISPATCH(qavg_pool3d_nhwc_stub);
 
@@ -27,13 +27,13 @@ inline std::tuple<int, int, int> get_kernel(IntArrayRef kernel_size) {
   TORCH_CHECK(
       kernel_size.size() == 1 || kernel_size.size() == 3,
       "avg_pool3d: kernel_size must either be a single int, or a tuple of three ints");
-  const int kD = safe_downcast<int, int64_t>(kernel_size[0]);
+  const int kD = c10::safe_conv<int>(kernel_size[0], "kernel_size");
   const int kH = kernel_size.size() == 1
       ? kD
-      : safe_downcast<int, int64_t>(kernel_size[1]);
+      : c10::safe_conv<int>(kernel_size[1], "kernel_size");
   const int kW = kernel_size.size() == 1
       ? kD
-      : safe_downcast<int, int64_t>(kernel_size[2]);
+      : c10::safe_conv<int>(kernel_size[2], "kernel_size");
   return std::make_tuple(kW, kH, kD);
 }
 
@@ -41,13 +41,13 @@ inline std::tuple<int, int, int> get_stride(IntArrayRef stride, int kW, int kH, 
   TORCH_CHECK(
       stride.empty() || stride.size() == 1 || stride.size() == 3,
       "avg_pool3d: stride must either be omitted, a single int, or a tuple of three ints");
-  const int dD = stride.empty() ? kD : safe_downcast<int, int64_t>(stride[0]);
+  const int dD = stride.empty() ? kD : c10::safe_conv<int>(stride[0], "stride");
   const int dH = stride.empty()
       ? kH
-      : stride.size() == 1 ? dD : safe_downcast<int, int64_t>(stride[1]);
+      : stride.size() == 1 ? dD : c10::safe_conv<int>(stride[1], "stride");
   const int dW = stride.empty()
       ? kW
-      : stride.size() == 1 ? dD : safe_downcast<int, int64_t>(stride[2]);
+      : stride.size() == 1 ? dD : c10::safe_conv<int>(stride[2], "stride");
   return std::make_tuple(dW, dH, dD);
 }
 
@@ -55,11 +55,11 @@ inline std::tuple<int, int, int> get_padding(IntArrayRef padding) {
   TORCH_CHECK(
       padding.size() == 1 || padding.size() == 3,
       "avg_pool3d: padding must either be a single int, or a tuple of three ints");
-  const int padD = safe_downcast<int, int64_t>(padding[0]);
+  const int padD = c10::safe_conv<int>(padding[0], "padding");
   const int padH =
-      padding.size() == 1 ? padD : safe_downcast<int, int64_t>(padding[1]);
+      padding.size() == 1 ? padD : c10::safe_conv<int>(padding[1], "padding");
   const int padW =
-      padding.size() == 1 ? padD : safe_downcast<int, int64_t>(padding[2]);
+      padding.size() == 1 ? padD : c10::safe_conv<int>(padding[2], "padding");
   return std::make_tuple(padW, padH, padD);
 }
 
@@ -100,7 +100,7 @@ Tensor q_avg_pool3d(
     IntArrayRef padding,
     bool ceil_mode,
     bool count_include_pad,
-    c10::optional<int64_t> divisor_override) {
+    std::optional<int64_t> divisor_override) {
   auto [kW, kH, kD] = get_kernel(kernel_size);
   auto [dW, dH, dD] = get_stride(stride, kW, kH, kD);
   auto [padW, padH, padD] = get_padding(padding);
@@ -128,7 +128,7 @@ Tensor q_avg_pool3d(
       input_nhwc.options().memory_format(input_nhwc.suggest_memory_format()),
       input_nhwc.q_scale(),
       input_nhwc.q_zero_point(),
-      c10::nullopt);
+      std::nullopt);
   // fast path for channel last: qavg_pool_2d_nhwc_stub
   qavg_pool3d_nhwc_stub(
       input_nhwc.device().type(),
@@ -165,7 +165,7 @@ Tensor avg_pool3d_quantized_cpu(
     IntArrayRef padding,
     bool ceil_mode,
     bool count_include_pad,
-    c10::optional<int64_t> divisor_override) {
+    std::optional<int64_t> divisor_override) {
   Tensor output;
   AT_DISPATCH_QINT_TYPES(input.scalar_type(), "avg_pool3d_quantized_cpu", [&]() {
     output = q_avg_pool3d<scalar_t>(
@@ -180,5 +180,4 @@ Tensor avg_pool3d_quantized_cpu(
   return output;
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

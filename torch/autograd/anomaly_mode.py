@@ -1,19 +1,23 @@
+# mypy: allow-untyped-defs
+r"""Autograd anomaly mode."""
+
 import warnings
 
 import torch
+
 
 __all__ = ["detect_anomaly", "set_detect_anomaly"]
 
 
 class detect_anomaly:
-    r"""Context-manager that enable anomaly detection for the autograd engine.
+    r"""Context-manager that enables anomaly detection for the autograd engine.
 
     This does two things:
 
     - Running the forward pass with detection enabled will allow the backward
       pass to print the traceback of the forward operation that created the failing
       backward function.
-    - If ``check_nan`` is ``True``, any backward computation that generate "nan"
+    - If ``check_nan`` is ``True``, any backward computation that generates "nan"
       value will raise an error. Default ``True``.
 
     .. warning::
@@ -21,7 +25,6 @@ class detect_anomaly:
         will slow down your program execution.
 
     Example:
-
         >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_ANOMALY)
         >>> import torch
         >>> from torch import autograd
@@ -29,6 +32,7 @@ class detect_anomaly:
         ...     @staticmethod
         ...     def forward(ctx, inp):
         ...         return inp.clone()
+        ...
         ...     @staticmethod
         ...     def backward(ctx, gO):
         ...         # Error during the backward pass

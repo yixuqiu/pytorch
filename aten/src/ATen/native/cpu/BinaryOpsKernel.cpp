@@ -81,6 +81,12 @@ void atan2_kernel(TensorIteratorBase& iter) {
 }
 
 #if !defined(C10_MOBILE)
+#define _AT_DISPATCH_INTEGRAL_TYPES_V2(TYPE, NAME, ...)  \
+  AT_DISPATCH_V2(                                        \
+      TYPE,                                              \
+      NAME,                                              \
+      AT_WRAP(__VA_ARGS__),                              \
+      AT_EXPAND(AT_INTEGRAL_TYPES_V2))
 #define _AT_DISPATCH_ALL_TYPES_AND_BOOL(TYPE, NAME, ...) \
   AT_DISPATCH_V2(                \
       TYPE,                                              \
@@ -104,6 +110,8 @@ void atan2_kernel(TensorIteratorBase& iter) {
   AT_DISPATCH_V2(TYPE, NAME, AT_WRAP(__VA_ARGS__),       \
       kHalf, kBFloat16, AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES))
 #else
+#define _AT_DISPATCH_INTEGRAL_TYPES_V2(TYPE, NAME, ...)  \
+  AT_DISPATCH_INTEGRAL_TYPES(TYPE, NAME, __VA_ARGS__)
 #define _AT_DISPATCH_ALL_TYPES_AND_BOOL(TYPE, NAME, ...) \
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(                \
       kComplexHalf, kHalf, kBool, kBFloat16, TYPE, NAME, __VA_ARGS__)
@@ -248,8 +256,12 @@ inline Vectorized<scalar_t> div_floor_floating_vec(
     const Vectorized<scalar_t>& a,
     const Vectorized<scalar_t>& b) {
   using vec_t = Vectorized<scalar_t>;
+  const auto basic_div = a / b;
+  vec_t inf(std::numeric_limits<scalar_t>::infinity());
   auto mod = a.fmod(b);
-  auto div = (a - mod) / b;
+  // Fixup for a case that isn't properly handled by Sleef_fmod
+  auto floor = vec_t::blendv(a - mod, a, (basic_div.abs() == inf) & (a.abs() != inf));
+  auto div = floor / b;
   const auto zero = vec_t(0);
   auto mask = (mod != zero) & ((b < zero) ^ (mod < zero));
   const auto one = vec_t(1);
@@ -257,11 +269,30 @@ inline Vectorized<scalar_t> div_floor_floating_vec(
   auto floordiv = div.floor();
   mask = (div - floordiv) > vec_t(0.5);
   floordiv = vec_t::blendv(floordiv, floordiv + one, mask);
-  const auto basic_div = a / b;
   floordiv = vec_t::blendv(floordiv, zero.copysign(basic_div), div == zero);
   floordiv = vec_t::blendv(floordiv, basic_div, b == zero);
   return floordiv;
-};
+}
+
+#if defined(CPU_CAPABILITY_SVE256) && defined(__ARM_FEATURE_BF16)
+
+// Since sve lacks sufficient bf16 intrinsics, do the calculations in f32 to
+// avoid rounding errors. This should not cause performance issues as
+// most of the used instructions would be cast to f32 vectors anyway.
+template<>
+inline Vectorized<c10::BFloat16> div_floor_floating_vec(
+  const Vectorized<c10::BFloat16>& a,
+  const Vectorized<c10::BFloat16>& b) {
+  auto [a1, a2] = convert_bfloat16_float(a);
+  auto [b1, b2] = convert_bfloat16_float(b);
+
+  auto res1 = div_floor_floating_vec(a1, b1);
+  auto res2 = div_floor_floating_vec(a2, b2);
+
+  return convert_float_bfloat16(res1, res2);
+}
+
+#endif
 
 void div_floor_kernel(TensorIteratorBase& iter) {
   const auto dtype = iter.common_dtype();
@@ -269,7 +300,8 @@ void div_floor_kernel(TensorIteratorBase& iter) {
     // In the special case of unsigned integer division, floor division is
     // equivalent to truncation division (since the signs of the divisor and
     // dividend are always the same)
-    return div_trunc_kernel(iter);
+    div_trunc_kernel(iter);
+    return;
   } else if (isIntegralType(dtype, /*includeBool*/ false)) {
     // There's no SIMD integer division, so don't try to vectorize it.
     AT_DISPATCH_INTEGRAL_TYPES(dtype, "div_floor_cpu", [&]() {
@@ -321,6 +353,9 @@ void remainder_kernel(TensorIteratorBase& iter) {
     AT_DISPATCH_INTEGRAL_TYPES(iter.common_dtype(), "remainder_cpu", [&]() {
       cpu_kernel(iter, [](scalar_t a, scalar_t b) -> scalar_t {
         TORCH_CHECK(b != 0, "ZeroDivisionError");
+        if (a == std::numeric_limits<scalar_t>::min() && b == scalar_t(-1)) {
+          return 0;
+        }
         scalar_t r = a % b;
         if ((r != 0) && (c10::is_negative(r) != c10::is_negative(b))) {
           r += b;
@@ -379,7 +414,7 @@ void bitwise_and_kernel(TensorIteratorBase& iter) {
   if (iter.dtype() == ScalarType::Bool) {
     cpu_kernel(iter, [](bool a, bool b) { return a && b; });
   } else {
-    AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "bitwise_and_cpu", [&]() {
+    _AT_DISPATCH_INTEGRAL_TYPES_V2(iter.dtype(), "bitwise_and_cpu", [&]() {
       cpu_kernel_vec(
           iter,
           [](scalar_t a, scalar_t b) -> scalar_t { return a & b; },
@@ -392,7 +427,7 @@ void bitwise_or_kernel(TensorIteratorBase& iter) {
   if (iter.dtype() == ScalarType::Bool) {
     cpu_kernel(iter, [](bool a, bool b) { return a || b; });
   } else {
-    AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "bitwise_or_cpu", [&]() {
+    _AT_DISPATCH_INTEGRAL_TYPES_V2(iter.dtype(), "bitwise_or_cpu", [&]() {
       cpu_kernel_vec(
           iter,
           [](scalar_t a, scalar_t b) -> scalar_t { return a | b; },
@@ -407,7 +442,7 @@ void bitwise_xor_kernel(TensorIteratorBase& iter) {
     // this operation for both Boolean and integral types.
     cpu_kernel(iter, [](bool a, bool b) { return a != b; });
   } else {
-    AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "bitwise_xor_cpu", [&]() {
+    _AT_DISPATCH_INTEGRAL_TYPES_V2(iter.dtype(), "bitwise_xor_cpu", [&]() {
       cpu_kernel_vec(
           iter,
           [](scalar_t a, scalar_t b) -> scalar_t { return a ^ b; },
@@ -589,11 +624,11 @@ void ge_kernel(TensorIteratorBase& iter) {
 void eq_kernel(TensorIteratorBase& iter) {
   // See Note [special-case bool outputs]
   if (iter.dtype() == ScalarType::Bool) {
-    _AT_DISPATCH_ALL_TYPES_AND_BOOL(iter.common_dtype(), "eq_cpu", [&]() {
+    AT_DISPATCH_V2(iter.common_dtype(), "eq_cpu", AT_WRAP([&]() {
       cpu_kernel(iter, [](scalar_t a, scalar_t b) -> bool { return a == b; });
-    });
+    }), kComplexHalf, kBComplex32, kHalf, kBool, kBFloat16, AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kFloat4_e2m1fn_x2);
   } else {
-    _AT_DISPATCH_ALL_TYPES_NO_BOOL(iter.common_dtype(), "eq_cpu", [&]() {
+    AT_DISPATCH_V2(iter.common_dtype(), "eq_cpu", AT_WRAP([&]() {
       cpu_kernel_vec(
           iter,
           [](scalar_t a, scalar_t b) -> scalar_t {
@@ -601,18 +636,18 @@ void eq_kernel(TensorIteratorBase& iter) {
           },
           [](Vectorized<scalar_t> a, Vectorized<scalar_t> b)
               -> Vectorized<scalar_t> { return a.eq(b); });
-    });
+    }), kComplexHalf, kHalf, kBComplex32, kBFloat16, AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kFloat4_e2m1fn_x2);
   }
 }
 
 void ne_kernel(TensorIteratorBase& iter) {
   // See Note [special-case bool outputs]
   if (iter.dtype() == ScalarType::Bool) {
-    _AT_DISPATCH_ALL_TYPES_AND_BOOL(iter.common_dtype(), "ne_cpu", [&]() {
+    AT_DISPATCH_V2(iter.common_dtype(), "ne_cpu", AT_WRAP([&]() {
       cpu_kernel(iter, [](scalar_t a, scalar_t b) -> bool { return a != b; });
-    });
+    }), kComplexHalf, kBComplex32, kHalf, kBool, kBFloat16, AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kFloat4_e2m1fn_x2);
   } else {
-    _AT_DISPATCH_ALL_TYPES_NO_BOOL(iter.common_dtype(), "ne_cpu", [&]() {
+    AT_DISPATCH_V2(iter.common_dtype(), "ne_cpu", AT_WRAP([&]() {
       cpu_kernel_vec(
           iter,
           [](scalar_t a, scalar_t b) -> scalar_t {
@@ -620,22 +655,35 @@ void ne_kernel(TensorIteratorBase& iter) {
           },
           [](Vectorized<scalar_t> a, Vectorized<scalar_t> b)
               -> Vectorized<scalar_t> { return a.ne(b); });
-    });
+    }), kComplexHalf, kHalf, kBComplex32, kBFloat16, AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kFloat4_e2m1fn_x2);
   }
+}
+
+// std::min and std::max return their first argument when the two compare equal,
+// so they keep the sign of a zero; a hardware min/max does not. Restore `a`
+// where both operands are zeros -- their bitwise or is +-0, which still
+// compares equal to zero.
+template <typename scalar_t>
+Vectorized<scalar_t> keep_zero_sign(
+    const Vectorized<scalar_t>& res,
+    const Vectorized<scalar_t>& a,
+    const Vectorized<scalar_t>& b) {
+  const auto both_zero = (a | b) == Vectorized<scalar_t>(scalar_t(0));
+  return Vectorized<scalar_t>::blendv(res, a, both_zero);
 }
 
 void maximum_kernel(TensorIteratorBase& iter) {
   if (iter.dtype() == ScalarType::Bool) {
     cpu_kernel(iter, [](bool a, bool b) -> bool { return a || b; });
   } else if (isIntegralType(iter.dtype(), /*includeBool=*/false)) {
-    AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "maximum_cpu", [&]() {
+    AT_DISPATCH_V2(iter.dtype(), "maximum_cpu", AT_WRAP([&]() {
       cpu_kernel_vec(
           iter,
           [](scalar_t a, scalar_t b) -> scalar_t { return std::max(a, b); },
           [](Vectorized<scalar_t> a, Vectorized<scalar_t> b) {
             return at::vec::maximum(a, b);
           });
-    });
+    }), AT_EXPAND(AT_INTEGRAL_TYPES_V2));
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -653,7 +701,7 @@ void maximum_kernel(TensorIteratorBase& iter) {
                 }
               },
               [](Vectorized<scalar_t> a, Vectorized<scalar_t> b) {
-                return at::vec::maximum(a, b);
+                return keep_zero_sign(at::vec::maximum(a, b), a, b);
               });
         });
   }
@@ -663,14 +711,14 @@ void minimum_kernel(TensorIteratorBase& iter) {
   if (iter.dtype() == ScalarType::Bool) {
     cpu_kernel(iter, [](bool a, bool b) -> bool { return a && b; });
   } else if (isIntegralType(iter.dtype(), /*includeBool=*/false)) {
-    AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "minimum_cpu", [&]() {
+    AT_DISPATCH_V2(iter.dtype(), "minimum_cpu", AT_WRAP([&]() {
       cpu_kernel_vec(
           iter,
           [](scalar_t a, scalar_t b) -> scalar_t { return std::min(a, b); },
           [](Vectorized<scalar_t> a, Vectorized<scalar_t> b) {
             return at::vec::minimum(a, b);
           });
-    });
+    }), AT_EXPAND(AT_INTEGRAL_TYPES_V2));
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -688,7 +736,7 @@ void minimum_kernel(TensorIteratorBase& iter) {
                 }
               },
               [](Vectorized<scalar_t> a, Vectorized<scalar_t> b) {
-                return at::vec::minimum(a, b);
+                return keep_zero_sign(at::vec::minimum(a, b), a, b);
               });
         });
   }
@@ -730,7 +778,7 @@ void fmin_kernel(TensorIteratorBase& iter) {
 
 void smooth_l1_kernel(TensorIteratorBase& iter, double beta) {
   if (iter.dtype() == kBFloat16) {
-    const float beta_val(beta);
+    const float beta_val(static_cast<float>(beta));
     const Vectorized<float> beta_val_vec(beta_val);
     const Vectorized<float> point_five_vec(static_cast<float>(0.5));
     cpu_kernel_vec(
@@ -781,8 +829,43 @@ void smooth_l1_kernel(TensorIteratorBase& iter, double beta) {
 }
 
 void huber_kernel(TensorIterator& iter, double delta) {
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      kBFloat16, kHalf, iter.dtype(), "huber_cpu", [&]() {
+  // Special-case kHalf: compute in float for numerical stability
+  if (iter.dtype() == kHalf) {
+    const float delta_val(static_cast<float>(delta));
+    const Vectorized<float> delta_vec(static_cast<float>(delta));
+    const Vectorized<float> point_five_vec(static_cast<float>(0.5));
+    cpu_kernel_vec(
+      iter,
+      // scalar lambda: convert half -> float, compute in float, cast back to half
+      [&delta_val] (at::Half a, at::Half b) -> at::Half {
+        float af = static_cast<float>(a);
+        float bf = static_cast<float>(b);
+        float z = std::abs(af - bf);
+        float out = z < delta_val
+          ? 0.5f * z * z
+          : delta_val * (z - 0.5f * delta_val);
+        return static_cast<at::Half>(out);
+      },
+      [&delta_vec, &point_five_vec] (Vectorized<Half> a, Vectorized<Half> b) {
+        auto [a0, a1] = convert_half_float(a);
+        auto [b0, b1] = convert_half_float(b);
+        auto z = (a0 - b0).abs();
+        a0 = Vectorized<float>::blendv(
+          point_five_vec * z * z,
+          delta_vec * (z - point_five_vec * delta_vec),
+          z >= delta_vec);
+        z = (a1 - b1).abs();
+        a1 = Vectorized<float>::blendv(
+          point_five_vec * z * z,
+          delta_vec * (z - point_five_vec * delta_vec),
+          z >= delta_vec);
+        return convert_float_half(a0, a1);
+      }
+    );
+    return;
+  }
+  else {
+   AT_DISPATCH_FLOATING_TYPES_AND(kBFloat16, iter.dtype(), "huber_cpu", [&]() {
         using Vec = Vectorized<scalar_t>;
         const scalar_t delta_val(delta);
         const Vec delta_val_vec(delta_val);
@@ -803,6 +886,7 @@ void huber_kernel(TensorIterator& iter, double delta) {
                   z >= delta_val_vec);
             });
       });
+  }
 }
 
 void sigmoid_backward_kernel(TensorIteratorBase& iter) {
@@ -819,7 +903,7 @@ void sigmoid_backward_kernel(TensorIteratorBase& iter) {
           });
     });
   } else if (iter.dtype() == kBFloat16) {
-    auto one_vec = Vectorized<float>((float)(1));
+    auto one_vec = Vectorized<float>((float)1);
     cpu_kernel_vec(
         iter,
         [=](BFloat16 a, BFloat16 b) -> BFloat16 {
@@ -948,13 +1032,7 @@ void tanh_backward_kernel(TensorIteratorBase& iter) {
 }
 
 void mse_kernel(TensorIteratorBase& iter) {
-  if (iter.dtype() == ScalarType::Half) {
-    TORCH_WARN_ONCE(
-        "Applying the CPU mse kernel on half-type tensors. "
-        "This may be slower than using float or double-type tensors.");
-  }
-
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(iter.dtype(), "mse_cpu", [&]() {
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "mse_cpu", [&]() {
     cpu_kernel_vec(
         iter,
         [=](scalar_t a, scalar_t b) -> scalar_t {
@@ -973,6 +1051,9 @@ void fmod_kernel(TensorIteratorBase& iter) {
     AT_DISPATCH_INTEGRAL_TYPES(iter.common_dtype(), "fmod_cpu", [&]() {
       cpu_kernel(iter, [=](scalar_t x, scalar_t d) -> scalar_t {
         TORCH_CHECK(d != 0, "ZeroDivisionError");
+        if (x == std::numeric_limits<scalar_t>::min() && d == scalar_t(-1)) {
+          return 0;
+        }
         return x % d;
       });
     });
@@ -1362,74 +1443,87 @@ void shifted_chebyshev_polynomial_w_kernel(TensorIteratorBase& iterator) {
       });
 } // shifted_chebyshev_polynomial_w_kernel(TensorIteratorBase& iterator)
 
+void ldexp_kernel(TensorIteratorBase& iter) {
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.input_dtype(0), "ldexp_cpu", [&] {
+    using float_t = scalar_t;
+    AT_DISPATCH_INTEGRAL_TYPES(iter.input_dtype(1), "ldexp_cpu_exp", [&] {
+      using int_t = scalar_t;
+      cpu_kernel(iter, [](float_t x, int_t exp) -> float_t {
+        return static_cast<float_t>(std::ldexp(static_cast<double>(x), exp));
+      });
+    });
+  });
+}
+
 } // namespace
 
-REGISTER_DISPATCH(add_clamp_stub, &add_clamp_kernel);
-REGISTER_DISPATCH(mul_stub, &mul_kernel);
-REGISTER_DISPATCH(div_true_stub, &div_true_kernel);
-REGISTER_DISPATCH(div_trunc_stub, &div_trunc_kernel);
-REGISTER_DISPATCH(div_floor_stub, &div_floor_kernel);
-REGISTER_DISPATCH(bitwise_and_stub, &bitwise_and_kernel);
-REGISTER_DISPATCH(bitwise_or_stub, &bitwise_or_kernel);
-REGISTER_DISPATCH(bitwise_xor_stub, &bitwise_xor_kernel);
-REGISTER_DISPATCH(lshift_stub, &lshift_kernel);
-REGISTER_DISPATCH(rshift_stub, &rshift_kernel);
-REGISTER_DISPATCH(logical_xor_stub, &logical_xor_kernel);
-REGISTER_DISPATCH(logical_and_stub, &logical_and_kernel);
-REGISTER_DISPATCH(logical_or_stub, &logical_or_kernel);
-REGISTER_DISPATCH(lt_stub, &lt_kernel);
-REGISTER_DISPATCH(le_stub, &le_kernel);
-REGISTER_DISPATCH(gt_stub, &gt_kernel);
-REGISTER_DISPATCH(ge_stub, &ge_kernel);
-REGISTER_DISPATCH(eq_stub, &eq_kernel);
-REGISTER_DISPATCH(ne_stub, &ne_kernel);
-REGISTER_DISPATCH(maximum_stub, &maximum_kernel);
-REGISTER_DISPATCH(minimum_stub, &minimum_kernel);
-REGISTER_DISPATCH(fmax_stub, &fmax_kernel);
-REGISTER_DISPATCH(fmin_stub, &fmin_kernel);
-REGISTER_DISPATCH(copysign_stub, &copysign_kernel);
-REGISTER_DISPATCH(remainder_stub, &remainder_kernel);
-REGISTER_DISPATCH(fmod_stub, &fmod_kernel);
-REGISTER_DISPATCH(gcd_stub, &gcd_kernel);
-REGISTER_DISPATCH(lcm_stub, &lcm_kernel);
-REGISTER_DISPATCH(xlogy_stub, &xlogy_kernel);
-REGISTER_DISPATCH(xlog1py_stub, &xlog1py_kernel);
-REGISTER_DISPATCH(zeta_stub, &zeta_kernel);
-REGISTER_DISPATCH(nextafter_stub, &nextafter_kernel);
-REGISTER_DISPATCH(heaviside_stub, &heaviside_kernel);
-REGISTER_DISPATCH(chebyshev_polynomial_t_stub, &chebyshev_polynomial_t_kernel);
-REGISTER_DISPATCH(chebyshev_polynomial_v_stub, &chebyshev_polynomial_v_kernel);
-REGISTER_DISPATCH(chebyshev_polynomial_w_stub, &chebyshev_polynomial_w_kernel);
-REGISTER_DISPATCH(laguerre_polynomial_l_stub, &laguerre_polynomial_l_kernel);
-REGISTER_DISPATCH(legendre_polynomial_p_stub, &legendre_polynomial_p_kernel);
+REGISTER_DISPATCH(add_clamp_stub, &add_clamp_kernel)
+REGISTER_DISPATCH(mul_stub, &mul_kernel)
+REGISTER_DISPATCH(div_true_stub, &div_true_kernel)
+REGISTER_DISPATCH(div_trunc_stub, &div_trunc_kernel)
+REGISTER_DISPATCH(div_floor_stub, &div_floor_kernel)
+REGISTER_DISPATCH(bitwise_and_stub, &bitwise_and_kernel)
+REGISTER_DISPATCH(bitwise_or_stub, &bitwise_or_kernel)
+REGISTER_DISPATCH(bitwise_xor_stub, &bitwise_xor_kernel)
+REGISTER_DISPATCH(lshift_stub, &lshift_kernel)
+REGISTER_DISPATCH(rshift_stub, &rshift_kernel)
+REGISTER_DISPATCH(logical_xor_stub, &logical_xor_kernel)
+REGISTER_DISPATCH(logical_and_stub, &logical_and_kernel)
+REGISTER_DISPATCH(logical_or_stub, &logical_or_kernel)
+REGISTER_DISPATCH(lt_stub, &lt_kernel)
+REGISTER_DISPATCH(le_stub, &le_kernel)
+REGISTER_DISPATCH(gt_stub, &gt_kernel)
+REGISTER_DISPATCH(ge_stub, &ge_kernel)
+REGISTER_DISPATCH(eq_stub, &eq_kernel)
+REGISTER_DISPATCH(ne_stub, &ne_kernel)
+REGISTER_DISPATCH(maximum_stub, &maximum_kernel)
+REGISTER_DISPATCH(minimum_stub, &minimum_kernel)
+REGISTER_DISPATCH(fmax_stub, &fmax_kernel)
+REGISTER_DISPATCH(fmin_stub, &fmin_kernel)
+REGISTER_DISPATCH(copysign_stub, &copysign_kernel)
+REGISTER_DISPATCH(remainder_stub, &remainder_kernel)
+REGISTER_DISPATCH(fmod_stub, &fmod_kernel)
+REGISTER_DISPATCH(gcd_stub, &gcd_kernel)
+REGISTER_DISPATCH(lcm_stub, &lcm_kernel)
+REGISTER_DISPATCH(xlogy_stub, &xlogy_kernel)
+REGISTER_DISPATCH(xlog1py_stub, &xlog1py_kernel)
+REGISTER_DISPATCH(zeta_stub, &zeta_kernel)
+REGISTER_DISPATCH(nextafter_stub, &nextafter_kernel)
+REGISTER_DISPATCH(heaviside_stub, &heaviside_kernel)
+REGISTER_DISPATCH(chebyshev_polynomial_t_stub, &chebyshev_polynomial_t_kernel)
+REGISTER_DISPATCH(chebyshev_polynomial_v_stub, &chebyshev_polynomial_v_kernel)
+REGISTER_DISPATCH(chebyshev_polynomial_w_stub, &chebyshev_polynomial_w_kernel)
+REGISTER_DISPATCH(laguerre_polynomial_l_stub, &laguerre_polynomial_l_kernel)
+REGISTER_DISPATCH(legendre_polynomial_p_stub, &legendre_polynomial_p_kernel)
 REGISTER_DISPATCH(
     shifted_chebyshev_polynomial_t_stub,
-    &shifted_chebyshev_polynomial_t_kernel);
+    &shifted_chebyshev_polynomial_t_kernel)
 REGISTER_DISPATCH(
     shifted_chebyshev_polynomial_u_stub,
-    &shifted_chebyshev_polynomial_u_kernel);
+    &shifted_chebyshev_polynomial_u_kernel)
 REGISTER_DISPATCH(
     shifted_chebyshev_polynomial_v_stub,
-    &shifted_chebyshev_polynomial_v_kernel);
+    &shifted_chebyshev_polynomial_v_kernel)
 REGISTER_DISPATCH(
     shifted_chebyshev_polynomial_w_stub,
-    &shifted_chebyshev_polynomial_w_kernel);
+    &shifted_chebyshev_polynomial_w_kernel)
 // Might enable AVX512 dispatch after enabling explicit vectorization for them.
-REGISTER_DISPATCH(chebyshev_polynomial_u_stub, &chebyshev_polynomial_u_kernel);
-REGISTER_DISPATCH(hermite_polynomial_h_stub, &hermite_polynomial_h_kernel);
-REGISTER_DISPATCH(hermite_polynomial_he_stub, &hermite_polynomial_he_kernel);
+REGISTER_DISPATCH(chebyshev_polynomial_u_stub, &chebyshev_polynomial_u_kernel)
+REGISTER_DISPATCH(hermite_polynomial_h_stub, &hermite_polynomial_h_kernel)
+REGISTER_DISPATCH(hermite_polynomial_he_stub, &hermite_polynomial_he_kernel)
+REGISTER_DISPATCH(ldexp_stub, ldexp_kernel)
 
-ALSO_REGISTER_AVX512_DISPATCH(atan2_stub, &atan2_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(smooth_l1_stub, &smooth_l1_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(huber_stub, &huber_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(sigmoid_backward_stub, &sigmoid_backward_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(logit_backward_stub, &logit_backward_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(tanh_backward_stub, &tanh_backward_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(mse_stub, &mse_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(logaddexp_stub, &logaddexp_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(logaddexp2_stub, &logaddexp2_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(hypot_stub, &hypot_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(igamma_stub, &igamma_kernel);
-ALSO_REGISTER_AVX512_DISPATCH(igammac_stub, &igammac_kernel);
+ALSO_REGISTER_AVX512_DISPATCH(atan2_stub, &atan2_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(smooth_l1_stub, &smooth_l1_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(huber_stub, &huber_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(sigmoid_backward_stub, &sigmoid_backward_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(logit_backward_stub, &logit_backward_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(tanh_backward_stub, &tanh_backward_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(mse_stub, &mse_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(logaddexp_stub, &logaddexp_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(logaddexp2_stub, &logaddexp2_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(hypot_stub, &hypot_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(igamma_stub, &igamma_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(igammac_stub, &igammac_kernel)
 
 } // namespace at::native

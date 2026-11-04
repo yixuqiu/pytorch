@@ -1,4 +1,4 @@
-# Owner(s): ["oncall: package/deploy"]
+# Owner(s): ["module: package/deploy"]
 
 import inspect
 import os
@@ -17,6 +17,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
     skipIfTorchDynamo,
 )
+
 
 try:
     from .common import PackageTestCase
@@ -145,7 +146,10 @@ class TestMisc(PackageTestCase):
                         spec = spec_from_loader(fullname, finder)
                     if spec is not None:
                         break
-                assert spec is not None and isinstance(spec.loader, SourceFileLoader)
+                if spec is None or not isinstance(spec.loader, SourceFileLoader):
+                    raise AssertionError(
+                        f"Expected SourceFileLoader, got {type(spec.loader) if spec else None}"
+                    )
                 spec.loader = LoaderThatRemapsModuleA(
                     spec.loader.name, spec.loader.path
                 )
@@ -195,7 +199,7 @@ class TestMisc(PackageTestCase):
         "Tests that use temporary files are disabled in fbcode",
     )
     def test_load_python_version_from_package(self):
-        """Tests loading a package with a python version embdded"""
+        """Tests loading a package with a python version embedded"""
         importer1 = PackageImporter(
             f"{Path(__file__).parent}/package_e/test_nn_module.pt"
         )
@@ -240,7 +244,7 @@ class TestMisc(PackageTestCase):
             )
             self.assertEqual(he.get_rdeps("package_b.subpackage_2"), ["package_b"])
 
-        with self.assertRaises(PackagingError) as e:
+        with self.assertRaises(PackagingError):
             with PackageExporter(BytesIO()) as he:
                 import package_b
 
@@ -337,10 +341,13 @@ class TestMisc(PackageTestCase):
         causes modules who do this hackery to fail on import. See
         https://github.com/pytorch/pytorch/issues/57490 for more information.
         """
-        import package_a.std_sys_module_hacks
+        if sys.version_info < (3, 13):
+            import package_a.std_sys_module_hacks as std_sys_module_hacks
+        else:
+            import package_a.std_sys_module_hacks_3_13 as std_sys_module_hacks
 
         buffer = BytesIO()
-        mod = package_a.std_sys_module_hacks.Module()
+        mod = std_sys_module_hacks.Module()
 
         with PackageExporter(buffer) as pe:
             pe.intern("**")

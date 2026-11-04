@@ -6,10 +6,8 @@
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 
 #include <cstddef>
-#include <limits>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 namespace {
 
@@ -81,7 +79,6 @@ struct FunctionalGraphSlicer {
         graph_->createWithSubgraph(prim::FunctionalGraph)
             ->insertBefore(block->return_node());
     auto reverse_iter = block->nodes().reverse();
-    std::vector<Value*> graph_outputs;
     for (auto it = reverse_iter.begin(); it != reverse_iter.end();) {
       Node* n = *it++;
 
@@ -93,7 +90,7 @@ struct FunctionalGraphSlicer {
       // if `n` is functional, all of its blocks will be merged into the
       // new functional subgraph, so we only need to recurse if it is not
       // functional
-      if (!functional_nodes_.count(n)) {
+      if (!functional_nodes_.contains(n)) {
         for (Block* b : n->blocks()) {
           auto block_changed = CreateFunctionalGraphsImpl(b);
           changed = block_changed && changed;
@@ -223,5 +220,4 @@ void InlineFunctionalGraphs(const std::shared_ptr<Graph>& graph) {
   InlineFunctionalGraphs(graph->block());
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

@@ -2,10 +2,10 @@
 
 set -ex
 
-# Mirror jenkins user in container
-# jenkins user as ec2-user should have the same user-id
-echo "jenkins:x:1000:1000::/var/lib/jenkins:" >> /etc/passwd
-echo "jenkins:x:1000:" >> /etc/group
+# Match the uid/gid of the GitHub runner (1001) so the job container can write
+# to GITHUB_WORKSPACE and the runner can clean it up afterwards
+echo "jenkins:x:1001:1001::/var/lib/jenkins:" >> /etc/passwd
+echo "jenkins:x:1001:" >> /etc/group
 # Needed on focal or newer
 echo "jenkins:*:19110:0:99999:7:::" >>/etc/shadow
 

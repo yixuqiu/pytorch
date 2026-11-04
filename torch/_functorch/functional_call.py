@@ -1,5 +1,7 @@
-from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -9,14 +11,14 @@ from torch._functorch.utils import exposed_in
 
 @exposed_in("torch.func")
 def functional_call(
-    module: "torch.nn.Module",
-    parameter_and_buffer_dicts: Union[Dict[str, Tensor], Sequence[Dict[str, Tensor]]],
-    args: Union[Any, Tuple],
-    kwargs: Optional[Dict[str, Any]] = None,
+    module: torch.nn.Module,
+    parameter_and_buffer_dicts: dict[str, Tensor] | Sequence[dict[str, Tensor]],
+    args: Any = None,
+    kwargs: dict[str, Any] | None = None,
     *,
     tie_weights: bool = True,
     strict: bool = False,
-):
+) -> Any:
     r"""Performs a functional call on the module by replacing the module parameters
     and buffers with the provided ones.
 
@@ -59,7 +61,10 @@ def functional_call(
 
     .. code-block:: python
 
-            a = ({'weight': torch.ones(1, 1)}, {'buffer': torch.zeros(1)})  # two separate dictionaries
+            a = (
+                {"weight": torch.ones(1, 1)},
+                {"buffer": torch.zeros(1)},
+            )  # two separate dictionaries
             mod = nn.Bar(1, 1)  # return self.weight @ x + self.buffer
             print(mod.weight)  # tensor(...)
             print(mod.buffer)  # tensor(...)
@@ -82,9 +87,11 @@ def functional_call(
         t = torch.randn(4, 3)
         model = nn.Linear(3, 3)
 
+
         def compute_loss(params, x, t):
             y = functional_call(model, params, x)
             return nn.functional.mse_loss(y, t)
+
 
         grad_weights = grad(compute_loss)(dict(model.named_parameters()), x, t)
 
@@ -125,8 +132,12 @@ def functional_call(
             raise ValueError(
                 "Expected all elements of parameter_and_buffer_dicts to be dictionaries"
             )
-        all_keys = [k for d in parameter_and_buffer_dicts for k in d.keys()]
-        repeated_keys = [key for key, n in Counter(all_keys).items() if n > 1]
+        all_keys = [k for d in parameter_and_buffer_dicts for k in d]
+        all_keys_counter: dict[str, int] = {}
+        for k in all_keys:
+            v = all_keys_counter.get(k, 0)
+            all_keys_counter[k] = v + 1
+        repeated_keys = [key for key, n in all_keys_counter.items() if n > 1]
         if len(repeated_keys) > 0:
             raise ValueError(
                 f"{repeated_keys} appeared in multiple dictionaries; behavior of functional call is ambiguous"
@@ -152,8 +163,8 @@ def functional_call(
 
 @exposed_in("torch.func")
 def stack_module_state(
-    models: List[nn.Module],
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    models: Sequence[nn.Module] | nn.ModuleList,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """stack_module_state(models) -> params, buffers
 
     Prepares a list of torch.nn.Modules for ensembling with :func:`vmap`.
@@ -174,8 +185,10 @@ def stack_module_state(
         models = [torch.nn.Linear(in_features, out_features) for i in range(num_models)]
         data = torch.randn(batch_size, 3)
 
+
         def wrapper(params, buffers, data):
-            return torch.func.functional_call(model[0], (params, buffers), data)
+            return torch.func.functional_call(models[0], (params, buffers), data)
+
 
         params, buffers = stack_module_state(models)
         output = vmap(wrapper, (0, 0, None))(params, buffers, data)
@@ -187,6 +200,8 @@ def stack_module_state(
     .. code-block:: python
 
         import torch.nn as nn
+
+
         class Foo(nn.Module):
             def __init__(self, in_features, out_features):
                 super().__init__()
@@ -196,6 +211,7 @@ def stack_module_state(
 
             def forward(self, x):
                 return self.l2(self.l1(x))
+
 
         num_models = 5
         in_features, out_features = 3, 3
@@ -215,7 +231,7 @@ def stack_module_state(
             "stack_module_state: Expected all models to have the same training/eval mode."
         )
     model0_typ = type(models[0])
-    if not all(type(m) == model0_typ for m in models):
+    if not all(type(m) is model0_typ for m in models):
         raise RuntimeError(
             "stack_module_state: Expected all models to be of the same class."
         )
@@ -234,7 +250,7 @@ def stack_module_state(
 
 
 def construct_stacked_leaf(
-    tensors: Union[Tuple[Tensor, ...], List[Tensor]], name: str
+    tensors: tuple[Tensor, ...] | list[Tensor], name: str
 ) -> Tensor:
     all_requires_grad = all(t.requires_grad for t in tensors)
     none_requires_grad = all(not t.requires_grad for t in tensors)

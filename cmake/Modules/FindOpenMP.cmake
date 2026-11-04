@@ -79,12 +79,25 @@ cmake_policy(SET CMP0012 NEW) # if() recognizes numbers and booleans
 cmake_policy(SET CMP0054 NEW) # if() quoted variables not dereferenced
 cmake_policy(SET CMP0057 NEW) # if IN_LIST
 
+
+if(NOT "$ENV{OMP_PREFIX}" STREQUAL "")
+  set(OpenMP_PREFIX "$ENV{OMP_PREFIX}")
+elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" AND EXISTS /opt/homebrew/opt/libomp)
+  set(OpenMP_PREFIX "/opt/homebrew/opt/libomp")
+endif()
+
 function(_OPENMP_FLAG_CANDIDATES LANG)
   if(NOT OpenMP_${LANG}_FLAG)
     unset(OpenMP_FLAG_CANDIDATES)
 
     set(OMP_FLAG_GNU "-fopenmp")
-    set(OMP_FLAG_Clang "-fopenmp=libomp" "-fopenmp=libiomp5" "-fopenmp")
+    if(CMAKE_${LANG}_COMPILER_ID STREQUAL "Clang" AND CMAKE_${LANG}_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+      # clang-cl specific flags
+      set(OMP_FLAG_Clang "-Xclang -fopenmp=libomp" "-Xclang -fopenmp=libiomp5" "-Xclang -fopenmp")
+    else()
+      # regular clang flags
+      set(OMP_FLAG_Clang "-fopenmp=libomp" "-fopenmp=libiomp5" "-fopenmp")
+    endif()
 
     if(WIN32)
       # Prefer Intel OpenMP header which can be provided by CMAKE_INCLUDE_PATH.
@@ -93,7 +106,7 @@ function(_OPENMP_FLAG_CANDIDATES LANG)
     else()
       # AppleClang may need a header file, search for omp.h with hints to brew
       # default include dir
-      find_path(__header_dir "omp.h" HINTS "/usr/local/include")
+      find_path(__header_dir "omp.h" HINTS "/usr/local/include" "${OpenMP_PREFIX}/include")
     endif()
     set(OMP_FLAG_AppleClang "-Xpreprocessor -fopenmp" "-Xpreprocessor -fopenmp -I${__header_dir}")
 
@@ -254,10 +267,58 @@ function(_OPENMP_GET_FLAGS LANG FLAG_MODE OPENMP_FLAG_VAR OPENMP_LIB_NAMES_VAR)
       set(OpenMP_libomp_LIBRARY "${MKL_OPENMP_LIBRARY}" CACHE STRING "libomp location for OpenMP")
     endif()
 
-    if (NOT OpenMP_libomp_LIBRARY)
+    # Check if we are using  OpenBLAS which is linked against libgomp
+    # we may end up with  multiple omp runtimes linked
+    # against libtorch_cpu.so
+    if(OpenBLAS_LIB AND OPENBLAS_USES_LIBGOMP)
+      find_library(OpenMP_libomp_LIBRARY
+        NAMES gomp
+        HINTS ${CMAKE_${LANG}_IMPLICIT_LINK_DIRECTORIES}
+        DOC "libomp location for OpenMP"
+      )
+      mark_as_advanced(OpenMP_libomp_LIBRARY)
+    endif()
+
+    # For Clang, ask the compiler where it keeps libomp.so before falling back
+    # to the generic search. This avoids picking up GCC's libgomp (which lacks
+    # the __kmpc_* ABI) when libomp lives in a non-standard location (e.g.
+    # inside a ROCm venv SDK directory not in CMAKE_IMPLICIT_LINK_DIRECTORIES).
+    if (NOT OpenMP_libomp_LIBRARY AND CMAKE_${LANG}_COMPILER_ID MATCHES "Clang")
+      execute_process(
+        COMMAND "${CMAKE_${LANG}_COMPILER}" -print-file-name=libomp.so
+        OUTPUT_VARIABLE _omp_clang_lib
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+      )
+      if(_omp_clang_lib AND NOT _omp_clang_lib STREQUAL "libomp.so")
+        set(OpenMP_libomp_LIBRARY "${_omp_clang_lib}" CACHE STRING "libomp location for OpenMP")
+        mark_as_advanced(OpenMP_libomp_LIBRARY)
+      endif()
+      unset(_omp_clang_lib)
+    endif()
+
+    # cl.exe links the OpenMP runtime matching its -openmp flag by itself (vcomp
+    # for -openmp[:experimental]), so on MSVC this search must not add one. It
+    # would find the libomp.lib shipped with Visual Studio, and with two runtimes
+    # in one process omp_get_thread_num() returns 0 on every vcomp worker, so
+    # at::parallel_for runs the whole range on each thread (#193784). The compiler
+    # id is checked rather than MSVC because clang-cl sets MSVC too but emits
+    # __kmpc_* calls and does need libomp.
+    if ((NOT OpenMP_libomp_LIBRARY) AND (NOT CMAKE_${LANG}_COMPILER_ID STREQUAL "MSVC"))
       find_library(OpenMP_libomp_LIBRARY
         NAMES omp gomp iomp5
         HINTS ${CMAKE_${LANG}_IMPLICIT_LINK_DIRECTORIES}
+        DOC "libomp location for OpenMP"
+      )
+      mark_as_advanced(OpenMP_libomp_LIBRARY)
+    endif()
+
+    # Use OpenMP_PREFIX if defined. Skipped on MSVC for the same reason as above:
+    # setting a prefix must not bring libomp in next to vcomp.
+    if ((NOT OpenMP_libomp_LIBRARY) AND (NOT "${OpenMP_PREFIX}" STREQUAL "") AND (NOT CMAKE_${LANG}_COMPILER_ID STREQUAL "MSVC"))
+      find_library(OpenMP_libomp_LIBRARY
+        NAMES omp gomp iomp5
+        HINTS "${OpenMP_PREFIX}/lib"
         DOC "libomp location for OpenMP"
       )
       mark_as_advanced(OpenMP_libomp_LIBRARY)
@@ -656,5 +717,6 @@ unset(OpenMP_Fortran_TEST_SOURCE)
 unset(OpenMP_C_CXX_CHECK_VERSION_SOURCE)
 unset(OpenMP_Fortran_CHECK_VERSION_SOURCE)
 unset(OpenMP_Fortran_INCLUDE_LINE)
+unset(OpenMP_PREFIX)
 
 cmake_policy(POP)

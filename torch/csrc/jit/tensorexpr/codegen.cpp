@@ -3,6 +3,7 @@
 #include <torch/csrc/jit/tensorexpr/codegen.h>
 
 #include <sstream>
+#include <utility>
 
 namespace torch::jit::tensorexpr {
 
@@ -20,6 +21,21 @@ CodeGen::CodeGen(
   allocIntermediateBufs();
 }
 
+CodeGen::CodeGen(const CodeGen& rhs) = default;
+
+CodeGen::CodeGen(CodeGen&& rhs) = default;
+
+CodeGen::~CodeGen() = default;
+
+CodeGen& CodeGen::operator=(const CodeGen& rhs) = default;
+
+CodeGen& CodeGen::operator=(CodeGen&& rhs) = default;
+
+RegisterCodeGenList& RegisterCodeGenList::GetInstance() {
+  static RegisterCodeGenList codegen_list;
+  return codegen_list;
+}
+
 RegisterCodeGenList::StmtFactoryMethod RegisterCodeGenList::
     FindStmtFactoryMethod(const std::string& name) {
   auto iter = stmt_factory_methods_.find(name);
@@ -35,8 +51,8 @@ RegisterCodeGenList::StmtFactoryMethod RegisterCodeGenList::
       oss << entry.first;
       index++;
     }
-    oss << "]";
-    throw std::runtime_error(oss.str());
+    oss << ']';
+    TORCH_CHECK(false, std::move(oss).str());
   }
   return iter->second;
 }
@@ -55,10 +71,10 @@ std::unique_ptr<CodeGen> CreateCodeGen(
     const std::string& kernel_func_name) {
   RegisterCodeGenList::StmtFactoryMethod method =
       RegisterCodeGenList::GetInstance().FindStmtFactoryMethod(name);
-  return method(stmt, params, device, kernel_func_name);
+  return method(std::move(stmt), params, device, kernel_func_name);
 }
 
-ExprPtr GenericIntrinsicsExpander::mutate(IntrinsicsPtr v) {
+ExprPtr GenericIntrinsicsExpander::mutate(const IntrinsicsPtr& v) {
   if (v->op_type() == kSigmoid) {
     auto x = v->param(0)->accept_mutator(this);
     auto one = expr_to_vec(
@@ -81,13 +97,12 @@ void* CodeGen::argToPtr(const BufferArg& bufferArg, const CallArg& callArg) {
   case ScalarType::Name:    \
     return callArg.Name##Ptr();
 
-    AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE);
+    AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE)
 #undef TYPE_CASE
 
     default:
-      throw unsupported_dtype();
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE");
   }
-  return nullptr;
 }
 
 void CodeGen::call_with_numel(void** args, int64_t numel) {
@@ -95,11 +110,11 @@ void CodeGen::call_with_numel(void** args, int64_t numel) {
       false, "This codegen backend does not implement call_with_numel");
 }
 
-static c10::optional<size_t> bufSize(BufPtr buf) {
+static std::optional<size_t> bufSize(const BufPtr& buf) {
   size_t size = elementSize(buf->dtype().scalar_type()) * buf->dtype().lanes();
   for (auto& d : buf->dims()) {
     if (!d->isConstant()) {
-      return c10::nullopt;
+      return std::nullopt;
     }
     size = size * (*intValue(d));
   }
@@ -121,8 +136,8 @@ static std::vector<std::pair<BufPtr, BufPtr>> AllocBufsWithMemReuse(
     const std::unordered_set<BufPtr>& bufs_external_allocs) {
   // Sort buffers by the time they appear.
   std::vector<BufPtr> bufs_sorted(bufs.begin(), bufs.end());
-  auto sorting_function_by_start_time = [&buf_ranges](
-                                            BufPtr b1, BufPtr b2) -> bool {
+  auto sorting_function_by_start_time =
+      [&buf_ranges](const BufPtr& b1, const BufPtr& b2) -> bool {
     return std::get<0>(buf_ranges.at(b1)) < std::get<0>(buf_ranges.at(b2));
   };
   std::sort(
@@ -133,8 +148,8 @@ static std::vector<std::pair<BufPtr, BufPtr>> AllocBufsWithMemReuse(
   std::unordered_map<BufPtr, BufPtr> buf_mem_map;
   std::vector<std::pair<BufPtr, BufPtr>> buf_allocs;
 
-  auto sorting_function_by_end_time = [&buf_ranges](
-                                          BufPtr b1, BufPtr b2) -> bool {
+  auto sorting_function_by_end_time =
+      [&buf_ranges](const BufPtr& b1, const BufPtr& b2) -> bool {
     return std::get<1>(buf_ranges.at(b1)) < std::get<1>(buf_ranges.at(b2));
   };
   for (const auto& buf : bufs_sorted) {
@@ -172,7 +187,7 @@ static std::vector<std::pair<BufPtr, BufPtr>> AllocBufsWithMemReuse(
     }
 
     bool allocated = false;
-    if (bufs_external_allocs.find(buf) == bufs_external_allocs.end()) {
+    if (!bufs_external_allocs.contains(buf)) {
       // Check whether there are free memories that this buf can reuse.
       for (auto it = mem_up_for_grabs.begin(); it != mem_up_for_grabs.end();
            it++) {
@@ -201,7 +216,7 @@ static std::vector<std::pair<BufPtr, BufPtr>> AllocBufsWithMemReuse(
 static StmtPtr insertAllocFree(
     std::vector<std::pair<BufPtr, BufPtr>>& buf_allocs,
     const std::unordered_set<BufPtr>& bufs_external_allocs,
-    StmtPtr stmt) {
+    const StmtPtr& stmt) {
   BlockPtr b = to<Block>(stmt);
   if (!b) {
     b = alloc<Block>(std::vector<StmtPtr>({stmt}));
@@ -212,7 +227,7 @@ static StmtPtr insertAllocFree(
   for (auto rit = buf_allocs.rbegin(); rit != buf_allocs.rend(); ++rit) {
     if (rit->first == rit->second) {
       BufPtr buf = rit->first;
-      if (bufs_external_allocs.find(buf) == bufs_external_allocs.end()) {
+      if (!bufs_external_allocs.contains(buf)) {
         b->prepend_stmt(alloc<Allocate>(buf));
         b->append_stmt(alloc<Free>(buf));
       } else {
@@ -258,9 +273,9 @@ ExtCallMemoryReuse::ExtCallMemoryReuse(
   }
 }
 
-StmtPtr ExtCallMemoryReuse::mutate(ExternalCallPtr v) {
-  if (extCallFuncNameMap_.count(v->func_name()) &&
-      bufferArgs_.count(v->buf()) == 0) {
+StmtPtr ExtCallMemoryReuse::mutate(const ExternalCallPtr& v) {
+  if (extCallFuncNameMap_.contains(v->func_name()) &&
+      !bufferArgs_.contains(v->buf())) {
     std::vector<BufPtr> buf_out_args = {v->buf()};
     return alloc<ExternalCallWithAlloc>(
         extCallFuncNameMap_.at(v->func_name()),
@@ -291,7 +306,7 @@ void CodeGen::allocIntermediateBufs() {
   std::unordered_set<BufPtr> interm_bufs;
   std::unordered_map<BufPtr, std::tuple<int32_t, int32_t>> interm_buf_ranges;
   for (const auto& buf : bufs) {
-    if (!bufs_allocated.count(buf) && !interm_bufs.count(buf)) {
+    if (!bufs_allocated.contains(buf) && !interm_bufs.contains(buf)) {
       interm_bufs.insert(buf);
 
       // Identify the access stmts to each unallocated intermediate buffer.
@@ -314,7 +329,7 @@ void CodeGen::allocIntermediateBufs() {
     set_stmt(stmt_new);
   }
 
-  GRAPH_DEBUG("\nMemory Allocation:\n\n", *stmt(), "\n");
+  GRAPH_DEBUG("\nMemory Allocation:\n\n", *stmt(), '\n');
 }
 
 } // namespace torch::jit::tensorexpr

@@ -7,11 +7,8 @@
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 
-#include <array>
 #include <cmath>
 #include <cstdint>
-#include <functional>
-#include <memory>
 #include <regex>
 #include <string>
 #include <tuple>
@@ -21,11 +18,10 @@
 
 using namespace torch::nn::utils::rnn;
 
-namespace torch {
-namespace nn {
+namespace torch::nn {
 
 /// These must line up with the CUDNN mode codes:
-/// https://docs.nvidia.com/deeplearning/sdk/cudnn-developer-guide/index.html#cudnnRNNMode_t
+/// https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-adv-library.html#cudnnrnnmode-t
 enum class CuDNNMode { RNN_RELU = 0, RNN_TANH = 1, LSTM = 2, GRU = 3 };
 
 static CuDNNMode get_cudnn_mode_for_rnn(
@@ -55,8 +51,7 @@ namespace detail {
 template <typename Derived>
 RNNImplBase<Derived>::RNNImplBase(const RNNOptionsBase& options_)
     : options_base(options_) {
-  // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall)
-  reset();
+  RNNImplBase<Derived>::reset();
 }
 
 template <typename Derived>
@@ -157,21 +152,19 @@ void RNNImplBase<Derived>::reset() {
       }
 
       for (const auto i : c10::irange(param_names.size())) {
-        auto name = param_names[i];
-        auto param = layer_params[i];
-        this->register_parameter(name, param);
+        this->register_parameter(param_names[i], std::move(layer_params[i]));
       }
       flat_weights_names_.insert(
           flat_weights_names_.end(), param_names.begin(), param_names.end());
-      all_weights_.emplace_back(param_names);
+      all_weights_.emplace_back(std::move(param_names));
     }
   }
 
   flat_weights_ = {};
   for (const auto& wn : flat_weights_names_) {
     auto named_parameters = this->named_parameters(/*recurse=*/false);
-    if (named_parameters.contains(wn)) {
-      flat_weights_.emplace_back(named_parameters[wn]);
+    if (auto* parameter = named_parameters.find(wn)) {
+      flat_weights_.emplace_back(*parameter);
     } else {
       flat_weights_.emplace_back();
     }
@@ -249,8 +242,8 @@ void RNNImplBase<Derived>::reset_flat_weights() {
   flat_weights_ = {};
   for (const auto& wn : flat_weights_names_) {
     auto named_parameters = this->named_parameters(/*recurse=*/false);
-    if (named_parameters.contains(wn)) {
-      flat_weights_.emplace_back(named_parameters[wn]);
+    if (auto* parameter = named_parameters.find(wn)) {
+      flat_weights_.emplace_back(*parameter);
     } else {
       flat_weights_.emplace_back();
     }
@@ -381,7 +374,7 @@ void RNNImplBase<Derived>::pretty_print(std::ostream& stream) const {
   if (options_base.proj_size() > 0) {
     stream << ", proj_size=" << options_base.proj_size();
   }
-  stream << ")";
+  stream << ')';
 }
 
 template <typename Derived>
@@ -513,10 +506,7 @@ std::tuple<Tensor, Tensor> RNNImpl::forward_helper(
           torch::enumtype::get_enum_name(options_base.mode()));
     }
   }
-  auto output = std::get<0>(result);
-  auto hidden = std::get<1>(result);
-
-  return std::make_tuple(output, hidden);
+  return result;
 }
 
 std::tuple<Tensor, Tensor> RNNImpl::forward(const Tensor& input, Tensor hx) {
@@ -548,7 +538,7 @@ std::tuple<PackedSequence, Tensor> RNNImpl::forward_with_packed_input(
   auto output_packed =
       PackedSequence(output, batch_sizes, sorted_indices, unsorted_indices);
   return std::make_tuple(
-      output_packed, this->permute_hidden(hidden, unsorted_indices));
+      std::move(output_packed), this->permute_hidden(hidden, unsorted_indices));
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LSTM ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -613,7 +603,7 @@ std::tuple<Tensor, std::tuple<Tensor, Tensor>> LSTMImpl::forward_helper(
     const Tensor& batch_sizes,
     const Tensor& sorted_indices,
     int64_t max_batch_size,
-    torch::optional<std::tuple<Tensor, Tensor>> hx_opt) {
+    std::optional<std::tuple<Tensor, Tensor>> hx_opt) {
   std::tuple<Tensor, Tensor> hx;
   if (!hx_opt.has_value()) {
     int64_t num_directions = options.bidirectional() ? 2 : 1;
@@ -629,7 +619,7 @@ std::tuple<Tensor, std::tuple<Tensor, Tensor>> LSTMImpl::forward_helper(
          max_batch_size,
          options.hidden_size()},
         torch::dtype(input.dtype()).device(input.device()));
-    hx = std::make_tuple(h_zeros, c_zeros);
+    hx = std::make_tuple(std::move(h_zeros), std::move(c_zeros));
   } else {
     hx = hx_opt.value();
     // Each batch of the hidden state should match the input sequence that
@@ -642,7 +632,7 @@ std::tuple<Tensor, std::tuple<Tensor, Tensor>> LSTMImpl::forward_helper(
   if (!batch_sizes.defined()) {
     result = torch::lstm(
         input,
-        {std::get<0>(hx), std::get<1>(hx)},
+        {std::move(std::get<0>(hx)), std::move(std::get<1>(hx))},
         flat_weights_,
         options.bias(),
         options.num_layers(),
@@ -654,7 +644,7 @@ std::tuple<Tensor, std::tuple<Tensor, Tensor>> LSTMImpl::forward_helper(
     result = torch::lstm(
         input,
         batch_sizes,
-        {std::get<0>(hx), std::get<1>(hx)},
+        {std::move(std::get<0>(hx)), std::move(std::get<1>(hx))},
         flat_weights_,
         options.bias(),
         options.num_layers(),
@@ -662,15 +652,16 @@ std::tuple<Tensor, std::tuple<Tensor, Tensor>> LSTMImpl::forward_helper(
         this->is_training(),
         options.bidirectional());
   }
-  auto output = std::get<0>(result);
-  auto hidden = std::make_tuple(std::get<1>(result), std::get<2>(result));
+  auto output = std::move(std::get<0>(result));
+  auto hidden = std::make_tuple(
+      std::move(std::get<1>(result)), std::move(std::get<2>(result)));
 
-  return std::make_tuple(output, hidden);
+  return std::make_tuple(std::move(output), std::move(hidden));
 }
 
 std::tuple<Tensor, std::tuple<Tensor, Tensor>> LSTMImpl::forward(
     const Tensor& input,
-    torch::optional<std::tuple<Tensor, Tensor>> hx_opt) {
+    std::optional<std::tuple<Tensor, Tensor>> hx_opt) {
   auto batch_sizes = torch::Tensor();
   auto max_batch_size = options.batch_first() ? input.size(0) : input.size(1);
   auto sorted_indices = torch::Tensor();
@@ -686,7 +677,7 @@ std::tuple<Tensor, std::tuple<Tensor, Tensor>> LSTMImpl::forward(
 std::tuple<PackedSequence, std::tuple<Tensor, Tensor>> LSTMImpl::
     forward_with_packed_input(
         const PackedSequence& packed_input,
-        torch::optional<std::tuple<Tensor, Tensor>> hx_opt) {
+        std::optional<std::tuple<Tensor, Tensor>> hx_opt) {
   const auto& input = packed_input.data();
   const auto& batch_sizes = packed_input.batch_sizes();
   const auto& sorted_indices = packed_input.sorted_indices();
@@ -699,7 +690,7 @@ std::tuple<PackedSequence, std::tuple<Tensor, Tensor>> LSTMImpl::
   auto output_packed =
       PackedSequence(output, batch_sizes, sorted_indices, unsorted_indices);
   return std::make_tuple(
-      output_packed, this->permute_hidden(hidden, unsorted_indices));
+      std::move(output_packed), this->permute_hidden(hidden, unsorted_indices));
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ GRU ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -761,10 +752,7 @@ std::tuple<Tensor, Tensor> GRUImpl::forward_helper(
         this->is_training(),
         options.bidirectional());
   }
-  auto output = std::get<0>(result);
-  auto hidden = std::get<1>(result);
-
-  return std::make_tuple(output, hidden);
+  return result;
 }
 
 std::tuple<Tensor, Tensor> GRUImpl::forward(const Tensor& input, Tensor hx) {
@@ -795,7 +783,7 @@ std::tuple<PackedSequence, Tensor> GRUImpl::forward_with_packed_input(
   auto output_packed =
       PackedSequence(output, batch_sizes, sorted_indices, unsorted_indices);
   return std::make_tuple(
-      output_packed, this->permute_hidden(hidden, unsorted_indices));
+      std::move(output_packed), this->permute_hidden(hidden, unsorted_indices));
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ RNNCellImplBase
@@ -805,8 +793,7 @@ namespace detail {
 template <typename Derived>
 RNNCellImplBase<Derived>::RNNCellImplBase(const RNNCellOptionsBase& options_)
     : options_base(options_) {
-  // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall)
-  reset();
+  RNNCellImplBase<Derived>::reset();
 }
 
 template <typename Derived>
@@ -851,7 +838,7 @@ template <typename Derived>
 void RNNCellImplBase<Derived>::pretty_print(std::ostream& stream) const {
   const std::string name = this->name();
   const std::string name_without_impl = name.substr(0, name.size() - 4);
-  stream << name_without_impl << "(" << options_base.input_size() << ", "
+  stream << name_without_impl << '(' << options_base.input_size() << ", "
          << options_base.hidden_size();
   if (!options_base.bias()) {
     stream << ", bias=" << std::boolalpha << false;
@@ -860,13 +847,13 @@ void RNNCellImplBase<Derived>::pretty_print(std::ostream& stream) const {
   if (!nonlinearity_str.empty() && nonlinearity_str != "kTanh") {
     stream << ", nonlinearity=" << nonlinearity_str;
   }
-  stream << ")";
+  stream << ')';
 }
 
 template <typename Derived>
 void RNNCellImplBase<Derived>::check_forward_input(
     const Tensor& input,
-    const string name) const {
+    const std::string& name) const {
   TORCH_CHECK(
       input.dim() == 1 || input.dim() == 2,
       "Expected ",
@@ -897,7 +884,7 @@ RNNCellImpl::RNNCellImpl(const RNNCellOptions& options_)
           /*num_chunks=*/1)),
       options(options_) {}
 
-Tensor RNNCellImpl::forward(const Tensor& input, Tensor hx) {
+Tensor RNNCellImpl::forward(const Tensor& input, const Tensor& hx) {
   this->check_forward_input(input, "input");
   this->check_forward_input(hx, "hidden");
 
@@ -951,7 +938,7 @@ LSTMCellImpl::LSTMCellImpl(const LSTMCellOptions& options_)
 
 std::tuple<Tensor, Tensor> LSTMCellImpl::forward(
     const Tensor& input,
-    torch::optional<std::tuple<Tensor, Tensor>> hx_opt) {
+    std::optional<std::tuple<Tensor, Tensor>> hx_opt) {
   this->check_forward_input(input, "input");
   if (hx_opt.has_value()) {
     this->check_forward_input(std::get<0>(hx_opt.value()), "hx[0]");
@@ -1005,7 +992,7 @@ GRUCellImpl::GRUCellImpl(const GRUCellOptions& options_)
           /*num_chunks=*/3)),
       options(options_) {}
 
-Tensor GRUCellImpl::forward(const Tensor& input, Tensor hx) {
+Tensor GRUCellImpl::forward(const Tensor& input, const Tensor& hx) {
   this->check_forward_input(input, "input");
   this->check_forward_input(hx, "hidden");
 
@@ -1031,5 +1018,4 @@ Tensor GRUCellImpl::forward(const Tensor& input, Tensor hx) {
   return ret;
 }
 
-} // namespace nn
-} // namespace torch
+} // namespace torch::nn

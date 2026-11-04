@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 # This file takes partial of the implementation from NVIDIA's webdataset at here:
 # https://github.com/tmbdev/webdataset/blob/master/webdataset/autodecode.py
 
@@ -28,12 +29,39 @@ __all__ = [
 ################################################################
 # handle basic datatypes
 ################################################################
-def basichandlers(extension, data):
+def basichandlers(extension: str, data):
+    """Transforms raw data (byte stream) into python objects.
+
+    Looks at the extension and loads the data into a python object supporting
+    the corresponding extension.
+
+    Args:
+        extension (str): The file extension
+        data (byte stream): Data to load into a python object.
+
+    Returns:
+        object: The data loaded into a corresponding python object
+            supporting the extension.
+
+    Example:
+        >>> import pickle
+        >>> data = pickle.dumps("some data")
+        >>> new_data = basichandlers("pickle", data)
+        >>> new_data
+        some data
+
+    The transformation of data for extensions are:
+        - txt, text, transcript: utf-8 decoded data of str format
+        - cls, cls2, class, count, index, inx, id: int
+        - json, jsn: json loaded data
+        - pickle, pyd: pickle loaded data
+        - pt: torch loaded data
+    """
 
     if extension in "txt text transcript":
         return data.decode("utf-8")
 
-    if extension in "cls cls2 class count index inx id".split():
+    if extension in ["cls", "cls2", "class", "count", "index", "inx", "id"]:
         try:
             return int(data)
         except ValueError:
@@ -42,10 +70,10 @@ def basichandlers(extension, data):
     if extension in "json jsn":
         return json.loads(data)
 
-    if extension in "pyd pickle".split():
+    if extension in ["pyd", "pickle"]:
         return pickle.loads(data)
 
-    if extension in "pt".split():
+    if extension == "pt":
         stream = io.BytesIO(data)
         return torch.load(stream)
 
@@ -83,6 +111,7 @@ imagespecs = {
     "pilrgba": ("pil", None, "rgba"),
 }
 
+
 def handle_extension(extensions, f):
     """
     Return a decoder handler function for the list of extensions.
@@ -105,9 +134,10 @@ def handle_extension(extensions, f):
             if len(target) > len(extension):
                 continue
 
-            if extension[-len(target):] == target:
+            if extension[-len(target) :] == target:
                 return f(data)
             return None
+
     return g
 
 
@@ -138,25 +168,30 @@ class ImageHandler:
     - pilrgba: pil None rgba
     """
 
-    def __init__(self, imagespec):
-        assert imagespec in list(imagespecs.keys()), f"unknown image specification: {imagespec}"
+    def __init__(self, imagespec) -> None:
+        if imagespec not in list(imagespecs.keys()):
+            raise AssertionError(f"unknown image specification: {imagespec}")
         self.imagespec = imagespec.lower()
 
     def __call__(self, extension, data):
-        if extension.lower() not in "jpg jpeg png ppm pgm pbm pnm".split():
+        if extension.lower() not in ["jpg", "jpeg", "png", "ppm", "pgm", "pbm", "pnm"]:
             return None
 
         try:
             import numpy as np
-        except ImportError as e:
-            raise ModuleNotFoundError("Package `numpy` is required to be installed for default image decoder."
-                                      "Please use `pip install numpy` to install the package") from e
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "Package `numpy` is required to be installed for default image decoder."
+                "Please use `pip install numpy` to install the package"
+            ) from e
 
         try:
             import PIL.Image
-        except ImportError as e:
-            raise ModuleNotFoundError("Package `PIL` is required to be installed for default image decoder."
-                                      "Please use `pip install Pillow` to install the package") from e
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "Package `PIL` is required to be installed for default image decoder."
+                "Please use `pip install Pillow` to install the package"
+            ) from e
 
         imagespec = self.imagespec
         atype, etype, mode = imagespecs[imagespec]
@@ -169,14 +204,20 @@ class ImageHandler:
                 return img
             elif atype == "numpy":
                 result = np.asarray(img)
-                assert result.dtype == np.uint8, f"numpy image array should be type uint8, but got {result.dtype}"
+                if result.dtype != np.uint8:
+                    raise AssertionError(
+                        f"numpy image array should be type uint8, but got {result.dtype}"
+                    )
                 if etype == "uint8":
                     return result
                 else:
                     return result.astype("f") / 255.0
             elif atype == "torch":
                 result = np.asarray(img)
-                assert result.dtype == np.uint8, f"numpy image array should be type uint8, but got {result.dtype}"
+                if result.dtype != np.uint8:
+                    raise AssertionError(
+                        f"numpy image array should be type uint8, but got {result.dtype}"
+                    )
 
                 if etype == "uint8":
                     result = np.array(result.transpose(2, 0, 1))
@@ -186,6 +227,7 @@ class ImageHandler:
                     return torch.tensor(result) / 255.0
             return None
 
+
 def imagehandler(imagespec):
     return ImageHandler(imagespec)
 
@@ -194,15 +236,27 @@ def imagehandler(imagespec):
 # torch video
 ################################################################
 def videohandler(extension, data):
-    if extension not in "mp4 ogv mjpeg avi mov h264 mpg webm wmv".split():
+    if extension not in [
+        "mp4",
+        "ogv",
+        "mjpeg",
+        "avi",
+        "mov",
+        "h264",
+        "mpg",
+        "webm",
+        "wmv",
+    ]:
         return None
 
     try:
         import torchvision.io
     except ImportError as e:
-        raise ModuleNotFoundError("Package `torchvision` is required to be installed for default video file loader."
-                                  "Please use `pip install torchvision` or `conda install torchvision -c pytorch`"
-                                  "to install the package") from e
+        raise ModuleNotFoundError(
+            "Package `torchvision` is required to be installed for default video file loader."
+            "Please use `pip install torchvision`"
+            "to install the package"
+        ) from e
 
     with tempfile.TemporaryDirectory() as dirname:
         fname = os.path.join(dirname, f"file.{extension}")
@@ -221,9 +275,11 @@ def audiohandler(extension, data):
     try:
         import torchaudio  # type: ignore[import]
     except ImportError as e:
-        raise ModuleNotFoundError("Package `torchaudio` is required to be installed for default audio file loader."
-                                  "Please use `pip install torchaudio` or `conda install torchaudio -c pytorch`"
-                                  "to install the package") from e
+        raise ModuleNotFoundError(
+            "Package `torchaudio` is required to be installed for default audio file loader."
+            "Please use `pip install torchaudio`"
+            "to install the package"
+        ) from e
 
     with tempfile.TemporaryDirectory() as dirname:
         fname = os.path.join(dirname, f"file.{extension}")
@@ -240,17 +296,20 @@ class MatHandler:
         try:
             import scipy.io as sio
         except ImportError as e:
-            raise ModuleNotFoundError("Package `scipy` is required to be installed for mat file."
-                                      "Please use `pip install scipy` or `conda install scipy`"
-                                      "to install the package") from e
+            raise ModuleNotFoundError(
+                "Package `scipy` is required to be installed for mat file."
+                "Please use `pip install scipy`"
+                "to install the package"
+            ) from e
         self.sio = sio
         self.loadmat_kwargs = loadmat_kwargs
 
     def __call__(self, extension, data):
-        if extension != 'mat':
+        if extension != "mat":
             return None
         with io.BytesIO(data) as stream:
             return self.sio.loadmat(stream, **self.loadmat_kwargs)
+
 
 def mathandler(**loadmat_kwargs):
     return MatHandler(**loadmat_kwargs)
@@ -276,13 +335,13 @@ class Decoder:
     handlers until some handler returns something other than None.
     """
 
-    def __init__(self, *handler, key_fn=extension_extract_fn):
+    def __init__(self, *handler, key_fn=extension_extract_fn) -> None:
         self.handlers = list(handler) if handler else []
         self.key_fn = key_fn
 
     # Insert new handler from the beginning of handlers list to make sure the new
     # handler having the highest priority
-    def add_handler(self, *handler):
+    def add_handler(self, *handler) -> None:
         if not handler:
             return
         self.handlers = list(handler) + self.handlers

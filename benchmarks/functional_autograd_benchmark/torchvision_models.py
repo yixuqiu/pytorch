@@ -4,9 +4,9 @@ from collections import OrderedDict
 
 import torch
 from torch import nn
-
 from torch.jit.annotations import Dict
 from torch.nn import functional as F
+
 
 try:
     from scipy.optimize import linear_sum_assignment
@@ -402,8 +402,6 @@ class FCN(_SimpleSegmentationModel):
         aux_classifier (nn.Module, optional): auxiliary classifier used during training
     """
 
-    pass
-
 
 class FCNHead(nn.Sequential):
     def __init__(self, in_channels, channels):
@@ -424,7 +422,10 @@ def _segm_resnet(name, backbone_name, num_classes, aux, pretrained_backbone=True
     #     pretrained=pretrained_backbone,
     #     replace_stride_with_dilation=[False, True, True])
     # Hardcoded resnet 50
-    assert backbone_name == "resnet50"
+    if backbone_name != "resnet50":
+        raise AssertionError(
+            f"Expected backbone_name='resnet50', but got '{backbone_name}'"
+        )
     backbone = resnet50(
         pretrained=pretrained_backbone, replace_stride_with_dilation=[False, True, True]
     )
@@ -583,8 +584,10 @@ def generalized_box_iou(boxes1, boxes2):
     """
     # degenerate boxes gives inf / nan results
     # so do an early check
-    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
-    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    if not (boxes1[:, 2:] >= boxes1[:, :2]).all():
+        raise AssertionError("boxes1 has invalid box coordinates (x1 < x0 or y1 < y0)")
+    if not (boxes2[:, 2:] >= boxes2[:, :2]).all():
+        raise AssertionError("boxes2 has invalid box coordinates (x1 < x0 or y1 < y0)")
     iou, union = box_iou(boxes1, boxes2)
 
     lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
@@ -690,7 +693,8 @@ class SetCriterion(nn.Module):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
-        assert "pred_logits" in outputs
+        if "pred_logits" not in outputs:
+            raise AssertionError("outputs must contain 'pred_logits' key")
         src_logits = outputs["pred_logits"]
 
         idx = self._get_src_permutation_idx(indices)
@@ -736,7 +740,8 @@ class SetCriterion(nn.Module):
         targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
         The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
         """
-        assert "pred_boxes" in outputs
+        if "pred_boxes" not in outputs:
+            raise AssertionError("outputs must contain 'pred_boxes' key")
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs["pred_boxes"][idx]
         target_boxes = torch.cat(
@@ -760,7 +765,8 @@ class SetCriterion(nn.Module):
         """Compute the losses related to the masks: the focal loss and the dice loss.
         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
-        assert "pred_masks" in outputs
+        if "pred_masks" not in outputs:
+            raise AssertionError("outputs must contain 'pred_masks' key")
 
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
@@ -788,7 +794,7 @@ class SetCriterion(nn.Module):
         losses = {
             "loss_mask": sigmoid_focal_loss(  # noqa: F821
                 src_masks, target_masks, num_boxes
-            ),  # noqa: F821
+            ),
             "loss_dice": dice_loss(src_masks, target_masks, num_boxes),  # noqa: F821
         }
         return losses
@@ -816,7 +822,10 @@ class SetCriterion(nn.Module):
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
         }
-        assert loss in loss_map, f"do you really want to compute {loss} loss?"
+        if loss not in loss_map:
+            raise AssertionError(
+                f"Unknown loss type '{loss}'. Available: {list(loss_map.keys())}"
+            )
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
     def forward(self, outputs, targets):
@@ -886,9 +895,10 @@ class HungarianMatcher(nn.Module):
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
-        assert (
-            cost_class != 0 or cost_bbox != 0 or cost_giou != 0
-        ), "all costs cant be 0"
+        if cost_class == 0 and cost_bbox == 0 and cost_giou == 0:
+            raise AssertionError(
+                "At least one of cost_class, cost_bbox, or cost_giou must be non-zero"
+            )
 
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -922,13 +932,13 @@ class HungarianMatcher(nn.Module):
 
         # Compute the classification cost. Contrary to the loss, we don't use the NLL,
         # but approximate it in 1 - proba[target class].
-        # The 1 is a constant that doesn't change the matching, it can be ommitted.
+        # The 1 is a constant that doesn't change the matching, it can be omitted.
         cost_class = -out_prob[:, tgt_ids]
 
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
-        # Compute the giou cost betwen boxes
+        # Compute the giou cost between boxes
         cost_giou = -generalized_box_iou(
             box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
         )

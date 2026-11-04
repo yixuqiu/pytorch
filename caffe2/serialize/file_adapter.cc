@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <cstdio>
 #include <string>
-#include "caffe2/core/common.h"
 
 namespace caffe2 {
 namespace serialize {
@@ -21,7 +20,8 @@ FileAdapter::RAIIFile::RAIIFile(const std::string& file_name) {
     auto error_msg =
         std::system_category().default_error_condition(old_errno).message();
 #endif
-    AT_ERROR(
+    TORCH_CHECK(
+        false,
         "open file failed because of errno ",
         old_errno,
         " on fopen: ",

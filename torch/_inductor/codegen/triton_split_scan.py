@@ -1,19 +1,20 @@
+# mypy: allow-untyped-defs
 import functools
 
-from typing import Optional, Set
+import sympy
 
-import torch._inductor.runtime.hints
 from torch._inductor import config
-
+from torch._inductor.codegen.simd import IterationRangesRoot, prefix_is_reduction
 from torch._inductor.codegen.triton import (
-    IterationRangesRoot,
     triton_compute_type,
+    TritonCSEVariable,
     TritonKernel,
 )
-
-from torch._prims_common import prod
-
+from torch._inductor.runtime.triton_heuristics import SplitScanGrid
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import CeilDiv
+
+from ..utils import sympy_product, upcast_compute_type
 
 
 class TritonSplitScanKernel(TritonKernel):
@@ -34,41 +35,45 @@ class TritonSplitScanKernel(TritonKernel):
 
     def __init__(
         self,
-        *groups,
-        index_dtype: str,
-        mutations: Optional[Set[str]] = None,
-        reduction_hint=torch._inductor.runtime.hints.ReductionHint.DEFAULT,
-        min_elem_per_thread=0,
-    ):
+        tiling: dict[str, sympy.Expr],
+        pid_cache=None,
+        fixed_config=None,
+        **kwargs,
+    ) -> None:
+        if pid_cache is not None:
+            raise AssertionError("not supported")
+        if fixed_config is not None:
+            raise AssertionError("not supported")
         super().__init__(
-            *groups,
-            index_dtype=index_dtype,
-            mutations=mutations,
-            pid_cache=None,
-            reduction_hint=reduction_hint,
-            min_elem_per_thread=min_elem_per_thread,
+            tiling,
+            **kwargs,
         )
         self.no_x_dim = True
 
+    def should_use_persistent_reduction(self) -> bool:
+        return False
+
+    def should_use_cooperative_reduction(self) -> bool:
+        return False
+
     def initialize_range_tree(self, pid_cache):
-        prefixes = "yxr"
-        assert len(self.numels) <= len(
-            prefixes
-        ), "z dimension not supported for split scan"
+        prefixes = ["y", "x", "r0_"]
+        if len(self.numels) > len(prefixes):
+            raise AssertionError("z dimension not supported for split scan")
         active_prefixes = prefixes[len(prefixes) - len(self.numels) :]
 
-        grid_dims = "rxy"
-        for numel, prefix in zip(self.numels, active_prefixes):
-            is_reduction = prefix == "r"
-            tensor_dim = 0 if is_reduction else None
-            grid_dim = grid_dims.find(prefix)
+        grid_dims = {"r0_": 0, "x": 1, "y": 2}
+        for prefix in active_prefixes:
+            numel = self.numels[prefix]
+            tensor_dim = 0 if prefix_is_reduction(prefix) else None
+            grid_dim = grid_dims[prefix]
             self.range_trees.append(
                 IterationRangesRoot(
                     f"{prefix}index",
                     numel,
                     prefix,
                     grid_dim,
-                    self,
+                    self,  # type: ignore[arg-type]
                     pid_cache=pid_cache,
                     is_loop=False,
                     tensor_dim=tensor_dim,
@@ -76,18 +81,20 @@ class TritonSplitScanKernel(TritonKernel):
                     has_zdim=False,
                 )
             )
-        for tree in self.range_trees:
-            tree.codegen_header(self.body)
 
     def reduction(self, dtype, src_dtype, reduction_type, value):
         raise NotImplementedError("NYI TritonSplitDimKernel reductions")
 
     def scan(self, dtypes, combine_fn, values):
+        """
+        Perform an associative scan on 'values'.
+        """
         import triton.language as tl
 
         (dtype,) = dtypes
         (value,) = values
 
+        dtype = upcast_compute_type(dtype)
         compute_type = triton_compute_type(dtype)
         compute_type_triton = getattr(tl, compute_type[3:])
 
@@ -100,43 +107,75 @@ class TritonSplitScanKernel(TritonKernel):
             scratch_type_triton.primitive_bitwidth // 8
         )
 
-        cse_load = functools.partial(self.cse.generate, self.loads)
         cse_compute = functools.partial(self.cse.generate, self.compute)
 
-        assert len(self.numels) == 2, "Unexpected tiling"
+        if len(self.numels) != 2:
+            raise AssertionError("Unexpected tiling")
         min_rblock = config.triton.min_split_scan_rblock
-        max_blocks = prod(self.numels[:-1]) * CeilDiv(self.numels[-1], min_rblock)
+        reduction_numel = sympy_product(
+            numel
+            for prefix, numel in self.numels.items()
+            if prefix_is_reduction(prefix)
+        )
+        pointwise_numel = sympy_product(
+            numel
+            for prefix, numel in self.numels.items()
+            if not prefix_is_reduction(prefix)
+        )
+        max_blocks = pointwise_numel * CeilDiv(reduction_numel, min_rblock)
         nbytes = scratch_nbytes_per_block * max_blocks
-        scratch_base, offset = self.args.workspace(nbytes=nbytes, zero_fill=True)
+        scratch_base: str | TritonCSEVariable
+        scratch_base, _, offset = self.args.workspace(nelem=nbytes, zero_fill=True)
         if offset != 0:
-            scratch_base = cse_load(f"{scratch_base} + {self.index_to_str(offset)}")
-        runtime_rblocks = cse_load(f"tl.num_programs({self.range_trees[-1].index})")
-        scratch_base = cse_load(
+            scratch_base = f"({scratch_base} + {self.index_to_str(offset)})"
+        runtime_rblocks = f"tl.num_programs({self.range_trees[-1].index})"
+        scratch_base = (
             f"{scratch_base}.to(tl.pointer_type({scratch_type})) + xoffset * "
             f"{scratch_elems_per_block} * {runtime_rblocks}"
         )
 
-        masks = {f"{tree.prefix}mask" for tree in self.range_trees}
+        masks = OrderedSet(f"{tree.prefix}mask" for tree in self.range_trees)
         self.filter_masks(masks)
-        masks = sorted(masks)
-        assert not self._load_mask, "ops.scan not supported inside ops.masked"
+        if self._load_mask:
+            raise AssertionError("ops.scan not supported inside ops.masked")
 
-        value = cse_compute(f"{value}.to({compute_type})")
-        value = cse_compute(f"tl.broadcast_to({value}, {self.dense_size_str()})")
+        value = cse_compute(
+            f"{value}.to({compute_type})",
+            dtype=dtype,
+            shape=value.shape,
+        )
+        value = cse_compute(
+            f"tl.broadcast_to({value}, {self.dense_size_str()})",
+            dtype=dtype,
+            shape=self.dense_size_list(),
+        )
 
-        combine_helper_fn = self._lift_helper(combine_fn, 1)
+        combine_helper_fn = self._lift_helper(combine_fn, (value,), (dtype,))
         dim = self.triton_tensor_ndim() - 1
-        assert dim == 0, ""
+        if dim != 0:
+            raise AssertionError(f"expected scan dim == 0, got {dim}")
+        scan_shape = value.shape
+        if scan_shape is None:
+            raise AssertionError("expected value.shape to be set")
+        reduced_shape = list(scan_shape)
+        del reduced_shape[dim]
 
-        block_sum = cse_compute(f"tl.reduce({value}, {dim}, {combine_helper_fn})")
-        exclusive_prefix = self.cse.newvar()
+        block_sum = cse_compute(
+            f"tl.reduce({value}, {dim}, {combine_helper_fn})",
+            dtype=dtype,
+            shape=reduced_shape,
+        )
+        exclusive_prefix = self.cse.newvar(
+            dtype=dtype,
+            shape=reduced_shape,
+        )
         if element_nbits == 64:
             self.compute.splice(
                 f"""
                 {exclusive_prefix} = triton_helpers.exclusive_scan_decoupled_lookback_64(
                     {scratch_base},
                     {block_sum},
-                    {self.range_trees[-1].get_pid()},
+                    {self.iteration_ranges_get_pid(self.range_trees[-1])},
                     {combine_helper_fn},
                 )
                 """,
@@ -144,7 +183,10 @@ class TritonSplitScanKernel(TritonKernel):
             )
 
         else:
-            assert element_nbits <= 32
+            if element_nbits > 32:
+                raise AssertionError(
+                    f"expected element_nbits <= 32, got {element_nbits}"
+                )
             value_as_uint_dtype = f"tl.uint{element_nbits}"
 
             self.compute.splice(
@@ -152,7 +194,7 @@ class TritonSplitScanKernel(TritonKernel):
                 {exclusive_prefix} = triton_helpers.exclusive_scan_decoupled_lookback(
                     {scratch_base},
                     {block_sum},
-                    {self.range_trees[-1].get_pid()},
+                    {self.iteration_ranges_get_pid(self.range_trees[-1])},
                     {combine_helper_fn},
                     DTYPE_VALUE_AS_UINT={value_as_uint_dtype},
                     DTYPE_PACK={scratch_type},
@@ -162,17 +204,25 @@ class TritonSplitScanKernel(TritonKernel):
             )
         # Compute final cumsum
         block_scan = cse_compute(
-            f"tl.associative_scan({value}, {dim}, {combine_helper_fn})"
+            f"tl.associative_scan({value}, {dim}, {combine_helper_fn})",
+            dtype=dtype,
+            shape=scan_shape,
         )
         combined_result = cse_compute(
-            f"{combine_helper_fn}({exclusive_prefix}, {block_scan})"
+            f"{combine_helper_fn}({exclusive_prefix}, {block_scan})",
+            dtype=dtype,
+            shape=scan_shape,
         )
         return (
-            cse_compute(f"tl.where(roffset == 0, {block_scan}, {combined_result})"),
+            cse_compute(
+                f"tl.where(roffset == 0, {block_scan}, {combined_result})",
+                dtype=dtype,
+                shape=scan_shape,
+            ),
         )
 
     def _get_heuristic(self):
         return "split_scan"
 
-    def _get_grid_fn(self):
-        return "split_scan_grid"
+    def _get_grid_type(self) -> type[SplitScanGrid]:
+        return SplitScanGrid

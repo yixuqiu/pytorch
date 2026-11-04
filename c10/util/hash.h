@@ -87,7 +87,7 @@ struct sha1 {
       buf << std::hex << std::setfill('0') << std::setw(8) << i;
     }
 
-    return buf.str();
+    return std::move(buf).str();
   }
 
  private:
@@ -293,7 +293,7 @@ template <typename T>
 struct hash {
   size_t operator()(const T& o) const {
     return _hash_detail::dispatch_hash(o);
-  };
+  }
 };
 
 // Specialization for std::tuple

@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import sys
 import warnings
 from contextlib import contextmanager
@@ -5,6 +6,7 @@ from functools import lru_cache as _lru_cache
 from typing import Any
 
 from torch.backends import __allow_nonbracketed_mutation, ContextProp, PropModule
+
 
 try:
     import opt_einsum as _opt_einsum  # type: ignore[import]
@@ -14,7 +16,14 @@ except ImportError:
 
 @_lru_cache
 def is_available() -> bool:
-    r"""Return a bool indicating if opt_einsum is currently available."""
+    r"""Return a bool indicating if opt_einsum is currently available.
+
+    You must install opt-einsum in order for torch to automatically optimize einsum. To
+    make opt-einsum available, you can install it along with torch: ``pip install torch[opt-einsum]``
+    or by itself: ``pip install opt-einsum``. If the package is installed, torch will import
+    it automatically and use it accordingly. Use this function to check whether opt-einsum
+    was installed and properly imported by torch.
+    """
     return _opt_einsum is not None
 
 
@@ -61,6 +70,7 @@ def _set_strategy(_strategy: str) -> None:
 
 
 def _get_strategy() -> str:
+    # pyrefly: ignore [bad-return]
     return strategy
 
 
@@ -91,9 +101,6 @@ def flags(enabled=None, strategy=None):
 
 
 class OptEinsumModule(PropModule):
-    def __init__(self, m, name):
-        super().__init__(m, name)
-
     global enabled
     enabled = ContextProp(_get_enabled, _set_enabled)
     global strategy
@@ -106,5 +113,5 @@ class OptEinsumModule(PropModule):
 # https://stackoverflow.com/questions/2447353/getattr-on-a-module/7668273#7668273
 sys.modules[__name__] = OptEinsumModule(sys.modules[__name__], __name__)
 
-enabled = True if is_available() else False
+enabled = bool(is_available())
 strategy = "auto" if is_available() else None

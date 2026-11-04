@@ -7,20 +7,21 @@ import warnings
 import weakref
 from collections import namedtuple, OrderedDict
 from copy import deepcopy
-
 from functools import partial
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_nn import _create_basic_net, NNTestCase
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     instantiate_parametrized_tests,
     IS_WINDOWS,
     parametrize as parametrize_test,
     run_tests,
     skipIfTorchDynamo,
+    swap,
     TestCase,
 )
 
@@ -55,11 +56,11 @@ class ToyModel(nn.Module):
 
 def forward_hook(
     self: TestCase,
-    fired_hooks: List[int],
+    fired_hooks: list[int],
     expected_module: nn.Module,
     hook_id: int,
     module: nn.Module,
-    inp: Tuple[torch.Tensor],
+    inp: tuple[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
     fired_hooks.append(hook_id)
@@ -69,11 +70,11 @@ def forward_hook(
 
 def forward_pre_hook(
     self: TestCase,
-    fired_hooks: List[int],
+    fired_hooks: list[int],
     expected_module: nn.Module,
     hook_id: int,
     module: nn.Module,
-    inp: Tuple[torch.Tensor],
+    inp: tuple[torch.Tensor],
 ) -> None:
     fired_hooks.append(hook_id)
     self.assertEqual(id(module), id(expected_module))
@@ -82,12 +83,12 @@ def forward_pre_hook(
 
 def full_backward_hook(
     self: TestCase,
-    fired_hooks: List[int],
+    fired_hooks: list[int],
     expected_module: nn.Module,
     hook_id: int,
     module: nn.Module,
-    grad_input: Tuple[torch.Tensor],
-    grad_output: Tuple[torch.Tensor],
+    grad_input: tuple[torch.Tensor],
+    grad_output: tuple[torch.Tensor],
 ) -> None:
     fired_hooks.append(hook_id)
     self.assertEqual(id(module), id(expected_module))
@@ -97,11 +98,11 @@ def full_backward_hook(
 
 def full_backward_pre_hook(
     self: TestCase,
-    fired_hooks: List[int],
+    fired_hooks: list[int],
     expected_module: nn.Module,
     hook_id: int,
     module: nn.Module,
-    grad_input: Tuple[torch.Tensor],
+    grad_input: tuple[torch.Tensor],
 ) -> None:
     fired_hooks.append(hook_id)
     self.assertEqual(id(module), id(expected_module))
@@ -122,8 +123,8 @@ class KwargModel(nn.Module):
     def internal_forward_hook(
         self,
         module: nn.Module,
-        args: Tuple[torch.Tensor],
-        kwargs: Dict[str, Any],
+        args: tuple[torch.Tensor],
+        kwargs: dict[str, Any],
         out: torch.Tensor,
     ):
         return out + kwargs["bias"]
@@ -142,13 +143,13 @@ class FailsInForwardModel(nn.Module):
 
 def kwarg_forward_pre_hook(
     self: TestCase,
-    fired_hooks: List[int],
+    fired_hooks: list[int],
     expected_module: nn.Module,
     hook_id: int,
     module: nn.Module,
-    args: Tuple[torch.Tensor],
-    kwargs: Dict[str, Any],
-) -> Tuple[Any, Any]:
+    args: tuple[torch.Tensor],
+    kwargs: dict[str, Any],
+) -> tuple[Any, Any]:
     fired_hooks.append(hook_id)
     self.assertEqual(id(module), id(expected_module))
     self.assertEqual(len(args), 1)
@@ -158,12 +159,12 @@ def kwarg_forward_pre_hook(
 
 def kwarg_forward_hook(
     self: TestCase,
-    fired_hooks: List[int],
+    fired_hooks: list[int],
     expected_module: nn.Module,
     hook_id: int,
     module: nn.Module,
-    args: Tuple[torch.Tensor],
-    kwargs: Dict[str, Any],
+    args: tuple[torch.Tensor],
+    kwargs: dict[str, Any],
     out: torch.Tensor,
 ) -> Any:
     fired_hooks.append(hook_id)
@@ -186,9 +187,11 @@ class DummyContextManager:
 
 
 class TestModuleHooks(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @parametrize_test("named_tuple", (True, False))
     def test_forward_hooks(self, named_tuple):
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         model = ToyModel(named_tuple)
         x = torch.randn(10, 10)
         hook = partial(forward_hook, self, fired_hooks, model.net1.seq2)
@@ -210,7 +213,7 @@ class TestModuleHooks(TestCase):
 
     @parametrize_test("named_tuple", (True, False))
     def test_forward_pre_hooks(self, named_tuple):
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         model = ToyModel(named_tuple)
         x = torch.randn(10, 10)
         hook = partial(forward_pre_hook, self, fired_hooks, model.net2.seq1)
@@ -232,7 +235,7 @@ class TestModuleHooks(TestCase):
 
     @parametrize_test("named_tuple", (True, False))
     def test_full_backward_hooks(self, named_tuple):
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         model = ToyModel(named_tuple)
         x = torch.randn(10, 10)
         hook = partial(full_backward_hook, self, fired_hooks, model.net1)
@@ -254,7 +257,7 @@ class TestModuleHooks(TestCase):
 
     @parametrize_test("named_tuple", (True, False))
     def test_full_backward_pre_hooks(self, named_tuple):
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         model = ToyModel(named_tuple)
         x = torch.randn(10, 10)
         hook = partial(full_backward_pre_hook, self, fired_hooks, model.net1)
@@ -294,7 +297,7 @@ class TestModuleHooks(TestCase):
 
     @parametrize_test("named_tuple", (True, False))
     def test_mixed_hooks(self, named_tuple):
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         model = ToyModel(named_tuple)
         x = torch.randn(10, 10)
         model.register_forward_pre_hook(
@@ -319,7 +322,7 @@ class TestModuleHooks(TestCase):
 
     def test_kwarg_hooks(self):
         # 1. test forward pre hook
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         x: torch.Tensor = torch.ones(10, 10)
         bias: torch.Tensor = torch.ones(10, 10)
         model = KwargModel()
@@ -336,7 +339,7 @@ class TestModuleHooks(TestCase):
         self.assertEqual(out, x + 2 * bias, rtol=0, atol=1e-5)
 
         # 2. test forward pre and forward hooks
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         x: torch.Tensor = torch.ones(10, 10)
         bias: torch.Tensor = torch.ones(10, 10)
         model = KwargModel()
@@ -372,7 +375,7 @@ class TestModuleHooks(TestCase):
 
     def test_remove_kwarg_hooks(self):
         # test forward pre and forward hooks
-        fired_hooks: List[int] = []
+        fired_hooks: list[int] = []
         x: torch.Tensor = torch.ones(10, 10)
         bias: torch.Tensor = torch.ones(10, 10)
         model = KwargModel()
@@ -549,6 +552,9 @@ def _hook_to_pickle(*args, **kwargs):
 
 
 class TestStateDictHooks(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    @swap([True, False])
     def test_load_state_dict_pre_hook(self):
         m = nn.Linear(10, 10)
         m_state_dict = m.state_dict()
@@ -586,21 +592,28 @@ class TestStateDictHooks(TestCase):
             hook_called += 1
 
         hook_called = 0
+        # Test private API since this sets with_module=False which diverges from public API
         m_load._register_load_state_dict_pre_hook(hook_without_module)
         m_load.load_state_dict(m_state_dict)
         self.assertEqual(1, hook_called)
 
         hook_called = 0
-        m_load._register_load_state_dict_pre_hook(hook_with_module, True)
+        m_load.register_load_state_dict_pre_hook(hook_with_module)
         m_load.load_state_dict(m_state_dict)
         self.assertEqual(2, hook_called)
+
+        # Test private API with with_module=True
+        hook_called = 0
+        m_load._register_load_state_dict_pre_hook(hook_with_module, True)
+        m_load.load_state_dict(m_state_dict)
+        self.assertEqual(3, hook_called)
 
     def test_no_extra_ref_to_module(self):
         try:
             gc.disable()
             m = nn.Linear(10, 10)
 
-            m._register_load_state_dict_pre_hook(_hook_to_pickle, True)
+            m.register_load_state_dict_pre_hook(_hook_to_pickle)
             weak_m = weakref.ref(m)
             del m
 
@@ -610,15 +623,16 @@ class TestStateDictHooks(TestCase):
 
     def test_pickled_hook(self):
         m = nn.Linear(10, 10)
-        m._register_load_state_dict_pre_hook(_hook_to_pickle, True)
+        m.register_load_state_dict_pre_hook(_hook_to_pickle)
         pickle.loads(pickle.dumps(m))
 
+    @swap([True, False])
     def test_load_state_dict_module_pre_hook(self):
         hook_called = 0
 
         # Test with module instance method as hook
         class MyModule(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.foo = torch.nn.Parameter(torch.rand(10))
 
@@ -632,10 +646,18 @@ class TestStateDictHooks(TestCase):
                 unexpected_keys,
                 error_msgs,
             ):
-                assert [] == error_msgs
-                assert [] == unexpected_keys
-                assert [] == missing_keys
-                assert strict
+                if error_msgs != []:
+                    raise AssertionError(f"Expected empty error_msgs, got {error_msgs}")
+                if unexpected_keys != []:
+                    raise AssertionError(
+                        f"Expected empty unexpected_keys, got {unexpected_keys}"
+                    )
+                if missing_keys != []:
+                    raise AssertionError(
+                        f"Expected empty missing_keys, got {missing_keys}"
+                    )
+                if not strict:
+                    raise AssertionError("Expected strict to be True")
                 nonlocal hook_called
                 hook_called += 1
 
@@ -650,11 +672,20 @@ class TestStateDictHooks(TestCase):
                 unexpected_keys,
                 error_msgs,
             ):
-                assert [] == error_msgs
-                assert [] == unexpected_keys
-                assert [] == missing_keys
-                assert strict
-                assert self is module
+                if error_msgs != []:
+                    raise AssertionError(f"Expected empty error_msgs, got {error_msgs}")
+                if unexpected_keys != []:
+                    raise AssertionError(
+                        f"Expected empty unexpected_keys, got {unexpected_keys}"
+                    )
+                if missing_keys != []:
+                    raise AssertionError(
+                        f"Expected empty missing_keys, got {missing_keys}"
+                    )
+                if not strict:
+                    raise AssertionError("Expected strict to be True")
+                if self is not module:
+                    raise AssertionError("Expected self is module")
                 nonlocal hook_called
                 hook_called += 1
 
@@ -675,27 +706,28 @@ class TestStateDictHooks(TestCase):
                 mod = m
 
             hook_called = 0
+            # Test private API since this sets with_module=False which diverges from public API
             mod._register_load_state_dict_pre_hook(mod.my_pre_load_hook)
             m.load_state_dict(state_dict)
             self.assertEqual(1, hook_called)
 
             hook_called = 0
-            mod._register_load_state_dict_pre_hook(
-                mod.my_pre_load_hook_with_module, True
-            )
+            mod.register_load_state_dict_pre_hook(mod.my_pre_load_hook_with_module)
             m.load_state_dict(state_dict)
             self.assertEqual(2, hook_called)
 
+    @swap([True, False])
     def test_load_state_dict_post_hook(self):
         hook_called = 0
 
         class MyModule(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.foo = torch.nn.Parameter(torch.rand(10))
 
             def my_post_load_hook(self, module, incompatible_keys):
-                assert module is self
+                if module is not self:
+                    raise AssertionError("Expected module is self")
                 nonlocal hook_called
                 incompatible_keys.missing_keys.append("foo")
                 incompatible_keys.unexpected_keys.append("bar")
@@ -743,6 +775,7 @@ class TestStateDictHooks(TestCase):
         self.assertEqual([], ret.unexpected_keys)
 
     @unittest.skipIf(IS_WINDOWS, "Tempfile permission issue on windows")
+    @swap([True, False])
     def test_load_state_dict_post_hook_backward_compatibility(self):
         def my_post_load_hook(mod, _):
             nonlocal called
@@ -762,7 +795,8 @@ class TestStateDictHooks(TestCase):
                 # Note that torch.save / torch.load is not recommended to save/load
                 # modules.
                 torch.save(m, f.name)
-                m = torch.load(f.name)
+                # weights_only=False as this is legacy code that saves the model
+                m = torch.load(f.name, weights_only=False)
                 m.load_state_dict(sd)
                 self.assertFalse(called)
 
@@ -771,8 +805,151 @@ class TestStateDictHooks(TestCase):
             m.load_state_dict(sd)
             self.assertTrue(called)
 
+    def _test_register_state_dict_pre_hook(self, model, submodule):
+        _state_dict_prefix = "foo."
+        state_dict_pre_hook_count = 0
+        keep_var_setting = False
+
+        def my_state_dict_pre_hook(module, prefix, keep_vars):
+            self.assertEqual(keep_vars, keep_var_setting)
+            nonlocal state_dict_pre_hook_count
+            state_dict_pre_hook_count += 1
+            self.assertTrue(prefix.startswith(_state_dict_prefix))
+
+        model.register_state_dict_pre_hook(my_state_dict_pre_hook)
+        # Test to ensure submodules run the hook as well.
+        submodule.register_state_dict_pre_hook(my_state_dict_pre_hook)
+
+        def check_results(model):
+            nonlocal state_dict_pre_hook_count, keep_var_setting
+            for keep_var_setting in [True, False]:
+                _ = model.state_dict(
+                    prefix=_state_dict_prefix, keep_vars=keep_var_setting
+                )
+                self.assertEqual(2, state_dict_pre_hook_count)
+                state_dict_pre_hook_count = 0
+
+        # Test state dict works as expected after model construction
+        check_results(model)
+        # Test state dict works as expected after forward
+        model(torch.ones(10, 3))
+        check_results(model)
+
+    def test_register_state_dict_pre_hook(self):
+        class MyModule(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.a = nn.Sequential(
+                    nn.Linear(3, 3), nn.Linear(3, 3), nn.Linear(3, 3)
+                )
+
+            def forward(self, x):
+                return self.a(x)
+
+        mod = MyModule()
+        self._test_register_state_dict_pre_hook(mod, mod.a)
+
+    def test_register_state_dict_pre_hook_lazy_module(self):
+        class MyLazyModule(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layer1 = nn.LazyLinear(8)
+                self.layer2 = nn.LazyLinear(5)
+
+            def forward(self, x):
+                return self.layer2(self.layer1(x))
+
+        mod = MyLazyModule()
+        self._test_register_state_dict_pre_hook(mod, mod.layer1)
+
+    @unittest.skipIf(IS_WINDOWS, "Tempfile permission issue on windows")
+    def test_register_state_dict_pre_hook_backward_compat(self):
+        called = False
+
+        def my_state_dict_pre_hook(*args, **kwargs):
+            nonlocal called
+            called = True
+
+        m = nn.Linear(1, 1)
+        self.assertTrue(hasattr(m, "_state_dict_pre_hooks"))
+        delattr(m, "_state_dict_pre_hooks")
+        # Save and load, ensure we can still call state_dict
+        # without running into issues.
+        with NamedTemporaryFile() as f:
+            # Note that torch.save / torch.load is not recommended
+            # to save / load modules.
+            torch.save(m, f.name)
+            # weights_only=False as this is legacy code that saves the model
+            m = torch.load(f.name, weights_only=False)
+
+        # Ensure we can run state_dict without issues
+        _ = m.state_dict()
+        self.assertFalse(called)
+        m.register_state_dict_pre_hook(my_state_dict_pre_hook)
+        _ = m.state_dict()
+        self.assertTrue(called)
+
+    @parametrize_test("private", [True, False])
+    def test_register_state_dict_post_hook(self, private):
+        m = nn.Transformer(
+            d_model=4, nhead=2, num_encoder_layers=2, num_decoder_layers=2
+        )
+
+        def linear_state_dict_post_hook(module, state_dict, prefix, local_metadata):
+            for name, _param in module.named_parameters(recurse=False):
+                state_dict[prefix + name] = torch.nn.Parameter(
+                    state_dict[prefix + name]
+                )
+
+        def register_linear_hook(module):
+            if isinstance(module, nn.Linear):
+                hook_registration_fn = (
+                    module._register_state_dict_hook
+                    if private
+                    else module.register_state_dict_post_hook
+                )
+                hook_registration_fn(linear_state_dict_post_hook)
+
+        def _check_sd(state_dict):
+            for k, v in m.state_dict().items():
+                if "linear" in k or "out_proj" in k:
+                    self.assertTrue(isinstance(v, torch.nn.Parameter))
+                else:
+                    self.assertFalse(isinstance(v, torch.nn.Parameter))
+
+        # verify that return type of hook registered on child submodules has no effect
+        # regardless of whether using public or private API
+        m.apply(register_linear_hook)
+        _check_sd(m.state_dict())
+
+        # verify that return type of hook registered root module has no effect
+        # for public API but has effect for private API
+        hook_registration_fn = (
+            m._register_state_dict_hook if private else m.register_state_dict_post_hook
+        )
+
+        def fn(m, s, p, l):
+            return OrderedDict()
+
+        hook_registration_fn(fn)
+        if private:
+            self.assertFalse(hasattr(fn, "_from_public_api"))
+            self.assertTrue(len(m.state_dict()) == 0)
+        else:
+            self.assertTrue(hasattr(fn, "_from_public_api"))
+            with self.assertRaisesRegex(
+                RuntimeError, "state_dict post-hook must return None"
+            ):
+                m.state_dict()
+            with self.assertRaisesRegex(
+                RuntimeError, "previously registered via register_state_dict_post_hook"
+            ):
+                m._register_state_dict_hook(fn)
+
 
 class TestModuleGlobalHooks(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def tearDown(self):
         nn.modules.module._global_backward_hooks = OrderedDict()
         nn.modules.module._global_forward_hooks = OrderedDict()
@@ -839,9 +1016,9 @@ class TestModuleGlobalHooks(TestCase):
             lambda *args: fw_hook(2, *args)
         )
 
-        output = module_1(input)
-        output = module_2(input)
-        output = module_3(input)
+        module_1(input)
+        module_2(input)
+        module_3(input)
         self.assertEqual(counter["forwards"], 15)
         self.assertEqual(counter["backwards"], 4)
 
@@ -1061,8 +1238,30 @@ class TestModuleGlobalHooks(TestCase):
         output.backward(torch.ones(5, 5), retain_graph=True)
         self.assertTrue(local_backward_called and global_backward_called)
 
+    @skipIfTorchDynamo("TorchDynamo does not work well with hooks")
+    def test_module_global_hooks_with_kwargs(self):
+        def kwarg_global_forward_hook(
+            module: nn.Module,
+            args: tuple[torch.Tensor],
+            kwargs: dict[str, Any],
+            out: torch.Tensor,
+        ) -> Any:
+            out = out + kwargs["bias"]
+            return out
+
+        model = KwargModel()
+        nn.modules.module.register_module_forward_hook(
+            kwarg_global_forward_hook,
+            with_kwargs=True,
+        )
+        x: torch.Tensor = torch.randn(10, 20)
+        bias: torch.Tensor = torch.randn(10, 20)
+        out = model(x, bias=bias)
+        self.assertEqual(out, x + 2 * bias, rtol=0, atol=1e-5)
+
 
 class TestModuleHookNN(NNTestCase):
+    hw_classification = HardwareClassification.GENERIC
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
 
@@ -1272,7 +1471,14 @@ class TestModuleHookNN(NNTestCase):
         mod.register_full_backward_hook(hook)
 
         # This should run and trigger the hook properly
-        mod(inp).sum().backward()
+        with self.assertWarnsRegex(
+            UserWarning,
+            (
+                "Full backward hook is firing when gradients are computed with "
+                "respect to module outputs since no inputs require gradients"
+            ),
+        ):
+            mod(inp).sum().backward()
         self.assertEqual(hook_called[0], 1)
 
         return_val = "grad_input"
@@ -1284,6 +1490,17 @@ class TestModuleHookNN(NNTestCase):
         with self.assertRaisesRegex(RuntimeError, "where no input requires gradient"):
             mod(inp).sum().backward()
 
+    @skipIfTorchDynamo("TorchDynamo does not work well with hooks")
+    def test_pre_hook_no_requires_grad_no_warning(self):
+        # A full backward pre-hook only receives grad_output, so firing from the
+        # output side when no input requires grad is expected and must not emit
+        # the full-backward-hook warning. See
+        # https://github.com/pytorch/pytorch/issues/189093
+        mod = nn.Linear(2, 3)
+        inp = torch.rand(1, 2)
+        mod.register_full_backward_pre_hook(lambda mod, gO: None)
+        self.assertNotWarn(lambda: mod(inp).sum().backward())
+
     def test_hook_last_arg_requires_grad(self):
         mod = nn.L1Loss()
         inp = torch.rand(1, requires_grad=True)
@@ -1292,7 +1509,7 @@ class TestModuleHookNN(NNTestCase):
         try:
             mod(inp.detach(), inp)
         except Exception as ex:
-            self.fail("Unexpected exception: %s" % ex)
+            self.fail(f"Unexpected exception: {ex}")
 
     def test_hook_extra_input(self):
         class MyModule(nn.Module):
@@ -1344,19 +1561,19 @@ class TestModuleHookNN(NNTestCase):
                 # Input inplace error should throw an error
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "Output 0 of BackwardHookFunctionBackward is "
+                    "Output 0 of BackwardHookFunction is "
                     "a view and is being modified inplace.",
                 ):
                     mod(inp.clone(), True)
 
-                # Input inplace error should throw an error if we try to re-use the view after they have
+                # Input inplace error should throw an error if we try to reuse the view after they have
                 # been modified
                 local_inp = inp.clone()
                 out = mod(local_inp, False)
                 local_inp[0] *= 1
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "Output 0 of BackwardHookFunctionBackward is "
+                    "Output 0 of BackwardHookFunction is "
                     "a view and its base or another view",
                 ):
                     # Any operation involving the view will fail here
@@ -1366,8 +1583,7 @@ class TestModuleHookNN(NNTestCase):
                 out = mod(inp, False)
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "BackwardHookFunctionBackward is a view "
-                    "and is being modified inplace.",
+                    "BackwardHookFunction is a view and is being modified inplace.",
                 ):
                     out += 1
 
@@ -1387,7 +1603,8 @@ class TestModuleHookNN(NNTestCase):
         m.register_backward_hook(noop)
 
         with self.assertWarnsRegex(
-            UserWarning, "does not take as input a single Tensor or a tuple of Tensors"
+            FutureWarning,
+            "does not take as input a single Tensor or a tuple of Tensors",
         ):
             m([a, b])
 
@@ -1400,7 +1617,7 @@ class TestModuleHookNN(NNTestCase):
         m.register_backward_hook(noop)
 
         with self.assertWarnsRegex(
-            UserWarning, "does not return a single Tensor or a tuple of Tensors"
+            FutureWarning, "does not return a single Tensor or a tuple of Tensors"
         ):
             m(a, b)
 
@@ -1413,7 +1630,7 @@ class TestModuleHookNN(NNTestCase):
         m.register_backward_hook(noop)
 
         with self.assertWarnsRegex(
-            UserWarning, "outputs are generated by different autograd Nodes"
+            FutureWarning, "outputs are generated by different autograd Nodes"
         ):
             m(a, b)
 
@@ -1426,7 +1643,7 @@ class TestModuleHookNN(NNTestCase):
         m.register_backward_hook(noop)
 
         with self.assertWarnsRegex(
-            UserWarning, "the forward contains multiple autograd Nodes"
+            FutureWarning, "the forward contains multiple autograd Nodes"
         ):
             m(a)
 
@@ -1552,6 +1769,7 @@ class TestModuleHookNN(NNTestCase):
 
 
 instantiate_parametrized_tests(TestModuleHooks)
+instantiate_parametrized_tests(TestStateDictHooks)
 
 if __name__ == "__main__":
     run_tests()

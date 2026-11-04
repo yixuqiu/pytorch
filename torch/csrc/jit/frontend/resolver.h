@@ -4,8 +4,7 @@
 #include <ATen/core/qualified_name.h>
 #include <torch/csrc/jit/frontend/sugared_value.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 struct Resolver;
 using ResolverPtr = std::shared_ptr<Resolver>;
@@ -13,7 +12,7 @@ using ResolverPtr = std::shared_ptr<Resolver>;
 /**
  * class Resolver
  *
- * Represents an "outer environment" in which we an look up names and return
+ * Represents an "outer environment" in which we can look up names and return
  * a corresponding SugaredValue. This is used during compilation to resolve
  * references to names which are not defined internal to the graph.
  *
@@ -64,5 +63,4 @@ struct NativeResolver : public Resolver {
 inline std::shared_ptr<NativeResolver> nativeResolver() {
   return std::make_shared<NativeResolver>();
 }
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

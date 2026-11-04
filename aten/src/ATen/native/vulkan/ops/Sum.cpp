@@ -14,7 +14,7 @@ Tensor sum_dim(
     const at::Tensor& self,
     int64_t dim,
     bool keepdim,
-    const optional<ScalarType> dtype) {
+    const std::optional<ScalarType> dtype) {
   TORCH_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan sum.dim_IntList supports 1d, 2d, 3d, 4d tensors as input!");
@@ -91,7 +91,7 @@ Tensor sum_dim_IntList(
     const at::Tensor& self,
     const OptionalIntArrayRef opt_dim,
     bool keepdim,
-    const optional<ScalarType> dtype) {
+    const std::optional<ScalarType> dtype) {
   TORCH_CHECK(
       opt_dim.has_value(),
       "Vulkan sum.dim_IntList without a dim arg is not implemented");
@@ -112,7 +112,7 @@ Tensor sum_dim_IntList(
           dim);
       // Normalize dim into range [0, self.dim() - 1]
       int64_t dim_normalized = utils::normalize(dim, self.dim());
-      if (dims_set.find(dim_normalized) != dims_set.end()) {
+      if (dims_set.contains(dim_normalized)) {
         TORCH_CHECK(
             false,
             "dim ",
@@ -132,8 +132,9 @@ Tensor sum_dim_IntList(
   return self;
 }
 
-Tensor sum(const Tensor& self, const c10::optional<ScalarType> dtype) {
+Tensor sum(const Tensor& self, const std::optional<ScalarType> dtype) {
   std::vector<int64_t> dims;
+  dims.reserve(self.dim());
   for (int64_t d = 0; d < self.dim(); d++) {
     // If any dimension has zero elements, we will shortcut to a zero-dim.
     if (self.size(d) == 0) {

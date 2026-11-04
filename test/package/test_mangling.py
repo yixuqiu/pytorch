@@ -1,4 +1,4 @@
-# Owner(s): ["oncall: package/deploy"]
+# Owner(s): ["module: package/deploy"]
 
 from io import BytesIO
 
@@ -10,6 +10,7 @@ from torch.package._mangling import (
     PackageMangler,
 )
 from torch.testing._internal.common_utils import run_tests
+
 
 try:
     from .common import PackageTestCase

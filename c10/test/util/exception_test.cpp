@@ -26,6 +26,7 @@ TEST(ExceptionTest, TORCH_INTERNAL_ASSERT_DEBUG_ONLY) {
   // Does nothing - `throw ...` should not be evaluated
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   ASSERT_NO_THROW(TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+      // @allow-raw-throw: the test asserts this argument is never evaluated
       (throw std::runtime_error("I'm throwing..."), true)));
 #else
   ASSERT_THROW(TORCH_INTERNAL_ASSERT_DEBUG_ONLY(false), c10::Error);
@@ -34,8 +35,7 @@ TEST(ExceptionTest, TORCH_INTERNAL_ASSERT_DEBUG_ONLY) {
 }
 
 // On these platforms there's no assert
-#if !defined(__ANDROID__) && !defined(__APPLE__) && \
-    !(defined(USE_ROCM) && ROCM_VERSION < 40100)
+#if !defined(__ANDROID__) && !defined(__APPLE__)
 TEST(ExceptionTest, CUDA_KERNEL_ASSERT) {
   // This function always throws even in NDEBUG mode
   ASSERT_DEATH_IF_SUPPORTED({ CUDA_KERNEL_ASSERT(false); }, "Assert");

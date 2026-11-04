@@ -5,6 +5,7 @@
 #include <torch/torch.h>
 
 #include <torch/csrc/autograd/FunctionsManual.h>
+#include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/autograd/functions/basic_ops.h>
 
 #include <test/cpp/api/support.h>
@@ -15,7 +16,7 @@ using namespace torch::test;
 #define ASSERT_VARIABLE_EQ(a, b) ASSERT_TRUE(torch::allclose((a), (b)))
 #define EXPECT_VARIABLE_EQ(a, b) EXPECT_TRUE(torch::allclose((a), (b)))
 
-std::string graph_desc(std::shared_ptr<Node> node) {
+std::string graph_desc(c10::intrusive_ptr<Node> node) {
   if (!node) {
     return "None";
   }
@@ -290,6 +291,48 @@ TEST(CustomAutogradTest, CustomFunctionReturnInputAsIsAndSavesIt) {
   Variable x = torch::randn({5, 5}, torch::requires_grad());
   Variable y = torch::randn({5, 5}, torch::requires_grad());
   MyFunction::apply(x, y);
+}
+
+// Regression test: CppNode<T> must override release_resources() to reset the
+// AutogradContext. Otherwise the weak self-reference in ctx_.grad_fn_ keeps
+// weakcount > 0 and leaks the CppNode<T>.
+TEST(CustomAutogradTest, CppNodeReleaseResourcesBreaksRefCycle) {
+  struct MyFunction : public Function<MyFunction> {
+    static Variable forward(
+        AutogradContext* ctx,
+        Variable x,
+        Variable stashed) {
+      ctx->saved_data["stashed"] = stashed;
+      return x * 2;
+    }
+
+    static variable_list backward(
+        AutogradContext* ctx,
+        variable_list grad_output) {
+      return {grad_output[0] * 2, Variable()};
+    }
+  };
+
+  c10::weak_intrusive_ptr<Node> weak_node(c10::intrusive_ptr<Node>{});
+  c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>
+      weak_stashed(
+          c10::intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>{});
+  {
+    Variable x = torch::randn({5, 5}, torch::requires_grad());
+    Variable stashed = torch::randn({5, 5});
+    weak_stashed =
+        c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>(
+            stashed.getIntrusivePtr());
+    Variable y = MyFunction::apply(x, stashed);
+    weak_node = c10::weak_intrusive_ptr<Node>(y.grad_fn());
+  }
+  // After the scope exits, the CppNode should be destroyed. If
+  // release_resources() is not overridden, ctx_.grad_fn_ (a weak reference to
+  // the node itself) keeps the weakcount > 1 so the node is leaked, which
+  // also leaks anything stashed in ctx_->saved_data.
+  EXPECT_TRUE(weak_node.expired());
+  EXPECT_EQ(weak_node.weak_use_count(), 1);
+  EXPECT_TRUE(weak_stashed.expired());
 }
 
 TEST(CustomAutogradTest, CustomFunction) {
@@ -583,7 +626,7 @@ TEST(CustomAutogradTest, MarkDirty) {
     }
   };
 
-  // Clone here because modifying leafs inplace is not allowed
+  // Clone here because modifying leaves inplace is not allowed
   auto x = torch::randn({5, 5}, torch::requires_grad()).clone();
   auto version_before = x._version();
   auto out = MyFunction::apply(x);
@@ -1198,7 +1241,7 @@ TEST(CustomAutogradTest, BackwardWithCreateGraphWarns) {
   auto z = x * x;
   {
     WarningCapture warnings;
-    z.backward(torch::ones({5, 5}), c10::nullopt, true);
+    z.backward(torch::ones({5, 5}), std::nullopt, true);
     ASSERT_TRUE(
         warnings.str().find("Using backward() with create_graph=True") !=
         std::string::npos);
@@ -1206,7 +1249,7 @@ TEST(CustomAutogradTest, BackwardWithCreateGraphWarns) {
 
   {
     WarningCapture warnings;
-    torch::autograd::backward({z}, {torch::ones({5, 5})}, c10::nullopt, true);
+    torch::autograd::backward({z}, {torch::ones({5, 5})}, std::nullopt, true);
     ASSERT_TRUE(
         warnings.str().find("Using backward() with create_graph=True") !=
         std::string::npos);
@@ -1265,7 +1308,7 @@ int64_t ret_single_non_tensor(
 
 torch::Tensor opt_op(
     const torch::Tensor& self,
-    const c10::optional<at::Tensor>& other) {
+    const std::optional<at::Tensor>& other) {
   if (other.has_value()) {
     return self + other.value();
   } else {
@@ -1288,12 +1331,6 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> ret_tuple_non_tensor(
 }
 
 torch::Tensor view_op(const torch::Tensor& self) {
-  return self.alias();
-}
-
-torch::Tensor view_op_with_extra_arg(
-    const torch::Tensor& self,
-    const torch::Tensor& other) {
   return self.alias();
 }
 
@@ -1461,11 +1498,11 @@ TEST(TestAutogradNotImplementedFallback, OptOp) {
   auto opHandle =
       c10::Dispatcher::singleton().findSchemaOrThrow("_test::opt_op", "");
   auto op = [&](const torch::Tensor& _1,
-                const c10::optional<torch::Tensor>& _2) {
+                const std::optional<torch::Tensor>& _2) {
     return callOpUnboxed<
         torch::Tensor,
         const torch::Tensor&,
-        const c10::optional<torch::Tensor>&>(opHandle, _1, _2);
+        const std::optional<torch::Tensor>&>(opHandle, _1, _2);
   };
 
   auto a = torch::tensor({1.}, {torch::kFloat32}).set_requires_grad(true);
@@ -1533,35 +1570,9 @@ TEST(TestAutogradNotImplementedFallback, ViewOp) {
   // Test inplace on view
   auto t = torch::tensor({1.}, {torch::kFloat32}).set_requires_grad(true);
 
-  // raise on rebase_history when it refreshes grad_fn
-  ASSERT_THROWS_WITH(
-      v1.add_(t), "which does not have a derivative implemented is forbidden");
-  // base should not be aware of the views, so this is still okay
+  // this works as we can properly replay the view given by the user
+  v1.add_(t);
   b1.add_(t);
-  ASSERT_THROWS_WITH(
-      v1.grad_fn(),
-      "which does not have a derivative implemented is forbidden");
-}
-
-TEST(TestAutogradNotImplementedFallback, ViewOpWithExtraArg) {
-  REGISTER_TEST_OP(
-      "view_op_with_extra_arg",
-      "_test::view_op_with_extra_arg(Tensor(a) self, Tensor other) -> Tensor(a)",
-      view_op_with_extra_arg);
-  auto opHandle = c10::Dispatcher::singleton().findSchemaOrThrow(
-      "_test::view_op_with_extra_arg", "");
-  auto op = [&](const torch::Tensor& _1, const torch::Tensor& _2) {
-    return callOpUnboxed<
-        torch::Tensor,
-        const torch::Tensor&,
-        const torch::Tensor&>(opHandle, _1, _2);
-  };
-  assertBasicChecks(op);
-  auto a = torch::tensor({1.}, {torch::kFloat32});
-  auto b = torch::tensor({2.}, {torch::kFloat32});
-  auto out1 = op(a, b);
-  ASSERT_TRUE(out1.is_view());
-  ASSERT_EQ(out1._base().unsafeGetTensorImpl(), a.unsafeGetTensorImpl());
 }
 
 TEST(TestAutogradNotImplementedFallback, RetTensorVectorView) {
@@ -1666,6 +1677,36 @@ TEST(TestAutogradNotImplementedFallback, TensorlistOp) {
       torch::autograd::grad({out}, {vec[1]}), "is not implemented");
 
   ASSERT_TRUE(at::allclose(op(a, vec), tensorlist_op(a, vec)));
+}
+
+static std::string test_format_error(const std::string& s) {
+  return s;
+}
+
+TEST(TestAutogradUtils, ValidateOutputsReduce) {
+  auto input = torch::ones({}, {torch::kFloat32});
+  auto grad = torch::ones({2, 3}, {torch::kFloat32});
+
+  std::vector<std::optional<InputMetadata>> input_metadata;
+  input_metadata.emplace_back(InputMetadata(input));
+  std::vector<torch::Tensor> grads;
+  grads.emplace_back(grad);
+
+  torch::autograd::validate_outputs(input_metadata, grads, test_format_error);
+  ASSERT_TRUE(at::allclose(grads[0], grad.sum()));
+}
+
+TEST(TestAutogradUtils, ValidateOutputsBasic) {
+  auto input = torch::zeros({2, 3}, {torch::kFloat32});
+  auto grad = torch::ones({2, 3}, {torch::kFloat32});
+
+  std::vector<std::optional<InputMetadata>> input_metadata;
+  input_metadata.emplace_back(InputMetadata(input));
+  std::vector<torch::Tensor> grads;
+  grads.emplace_back(grad);
+
+  torch::autograd::validate_outputs(input_metadata, grads, test_format_error);
+  ASSERT_TRUE(at::allclose(grad, torch::ones({2, 3})));
 }
 
 // TODO add these tests if needed

@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "ruff==0.14.4",
+# ]
+# ///
 """Adapter for https://github.com/charliermarsh/ruff."""
 
 from __future__ import annotations
@@ -14,13 +20,10 @@ import sys
 import time
 from typing import Any, BinaryIO
 
+
 LINTER_CODE = "RUFF"
+SYNTAX_ERROR = "E999"
 IS_WINDOWS: bool = os.name == "nt"
-
-
-def eprint(*args: Any, **kwargs: Any) -> None:
-    """Print to stderr."""
-    print(*args, file=sys.stderr, flush=True, **kwargs)
 
 
 class LintSeverity(str, enum.Enum):
@@ -187,7 +190,7 @@ def get_issue_severity(code: str) -> LintSeverity:
 
     # "F821": Undefined name
     # "E999": syntax error
-    if any(code.startswith(x) for x in ("F821", "E999", "PLE")):
+    if any(code.startswith(x) for x in ("F821", SYNTAX_ERROR, "PLE")):
         return LintSeverity.ERROR
 
     # "F": PyFlakes Error
@@ -225,6 +228,7 @@ def check_files(
                 sys.executable,
                 "-m",
                 "ruff",
+                "check",
                 "--exit-zero",
                 "--quiet",
                 "--output-format=json",
@@ -268,27 +272,28 @@ def check_files(
     else:
         rules = {}
 
-    return [
-        LintMessage(
+    def lint_message(vuln: dict[str, Any]) -> LintMessage:
+        code = vuln["code"] or SYNTAX_ERROR
+        return LintMessage(
             path=vuln["filename"],
-            name=vuln["code"],
+            name=code,
             description=(
                 format_lint_message(
                     vuln["message"],
-                    vuln["code"],
+                    code,
                     rules,
-                    show_disable,
+                    show_disable and bool(vuln["code"]),
                 )
             ),
             line=int(vuln["location"]["row"]),
             char=int(vuln["location"]["column"]),
             code=LINTER_CODE,
-            severity=severities.get(vuln["code"], get_issue_severity(vuln["code"])),
+            severity=severities.get(code, get_issue_severity(code)),
             original=None,
             replacement=None,
         )
-        for vuln in vulnerabilities
-    ]
+
+    return [lint_message(v) for v in vulnerabilities]
 
 
 def check_file_for_fixes(
@@ -307,6 +312,7 @@ def check_file_for_fixes(
                     sys.executable,
                     "-m",
                     "ruff",
+                    "check",
                     "--fix-only",
                     "--exit-zero",
                     *([f"--config={config}"] if config else []),
@@ -362,10 +368,25 @@ def check_file_for_fixes(
     ]
 
 
+def _default_num_workers() -> int | None:
+    # Forks one process per file batch, so respect MAX_JOBS to cap parallelism.
+    max_jobs = os.environ.get("MAX_JOBS")
+    if max_jobs and max_jobs.isdigit() and int(max_jobs) > 0:
+        return int(max_jobs)
+    return os.cpu_count()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=f"Ruff linter. Linter code: {LINTER_CODE}. Use with RUFF-FIX to auto-fix issues.",
         fromfile_prefix_chars="@",
+    )
+    parser.add_argument(
+        "-j",
+        "--num-workers",
+        type=int,
+        default=None,
+        help="number of parallel workers (defaults to MAX_JOBS or the CPU count)",
     )
     parser.add_argument(
         "--config",
@@ -400,6 +421,7 @@ def main() -> None:
     )
     add_default_options(parser)
     args = parser.parse_args()
+    num_workers = args.num_workers or _default_num_workers()
 
     logging.basicConfig(
         format="<%(threadName)s:%(levelname)s> %(message)s",
@@ -415,7 +437,8 @@ def main() -> None:
     if args.severity:
         for severity in args.severity:
             parts = severity.split(":", 1)
-            assert len(parts) == 2, f"invalid severity `{severity}`"
+            if len(parts) != 2:
+                raise AssertionError(f"invalid severity `{severity}`")
             severities[parts[0]] = LintSeverity(parts[1])
 
     lint_messages = check_files(
@@ -436,7 +459,7 @@ def main() -> None:
 
     files_with_lints = {lint.path for lint in lint_messages if lint.path is not None}
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=os.cpu_count(),
+        max_workers=num_workers,
         thread_name_prefix="Thread",
     ) as executor:
         futures = {

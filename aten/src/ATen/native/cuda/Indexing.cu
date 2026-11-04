@@ -2,6 +2,7 @@
 #include <ATen/native/TensorAdvancedIndexing.h>
 #include <ATen/native/IndexingUtils.h>
 #include <ATen/native/quantized/IndexKernel.h>
+#include <ATen/native/cuda/IndexKernelUtils.h>
 #include <ATen/native/cuda/KernelUtils.cuh>
 
 #include <ATen/core/Tensor.h>
@@ -11,8 +12,10 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/MemoryOverlap.h>
 #include <ATen/TensorOperators.h>
+#include <ATen/WrapDimUtils.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/Loops.cuh>
+#include <ATen/native/cuda/MemoryAccess.cuh>
 #include <ATen/native/Resize.h>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/cuda/CUDAUtils.h>
@@ -22,29 +25,247 @@
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
+#include <ATen/ops/_assert_async.h>
+#include <ATen/ops/aminmax.h>
 #include <ATen/ops/arange.h>
 #include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros_like.h>
 #include <ATen/ops/ones_like.h>
 #include <ATen/ops/empty_quantized.h>
+#include <ATen/ops/gather.h>
 #include <ATen/ops/index_add_native.h>
+#include <ATen/ops/index_copy_native.h>
 #include <ATen/ops/index_reduce_native.h>
 #include <ATen/ops/index_select_native.h>
 #include <ATen/ops/masked_fill_native.h>
+#include <ATen/ops/scatter_reduce_native.h>
 #include <ATen/ops/_sparse_coo_tensor_with_dims_and_tensors.h>
 #endif
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/cub.h>
+#if defined(USE_ROCM)
+#include <ATen/cuda/cub.cuh>
+#endif
 #include <c10/util/irange.h>
 #include <c10/core/QScheme.h>
 #include <ATen/native/quantized/AffineQuantizerBase.h>
 
 #include <limits>
+#include <type_traits>
 
 #include <c10/macros/Macros.h>
 
 namespace {
+constexpr uint64_t getDefaultMaxThreadsPerBlock() {
+#ifndef USE_ROCM
+  return 128;
+#else
+  // bigger default
+  return 512;
+#endif
+}
+
+#ifdef USE_ROCM
+#define SKIP_SORTED_INDICES 32
+template <typename scalar_t, int SZ>
+__global__ void indexing_backward_kernel_many_indices(
+  const int64_t* sorted_indices, const int64_t* indices, const scalar_t* grad_output, scalar_t* grad_weight,
+  int64_t numel, int64_t stride, int64_t stride_before, int64_t outer_dim, bool accumulate) {
+  using opmath_t = at::opmath_type<scalar_t>;
+
+  extern __shared__ unsigned char smem[];
+  auto smem_dups_cache = reinterpret_cast<int64_t*>(smem);
+
+  int smem_offset = threadIdx.y * C10_WARP_SIZE;
+
+  int laneIdx = threadIdx.x % C10_WARP_SIZE;
+
+  for (int64_t z = blockIdx.z; z < outer_dim; z += gridDim.z) {
+    // Init duplicates every time we compute a new set of entries:
+    smem_dups_cache[smem_offset + laneIdx] = 0;
+    WARP_SYNC();
+
+    int64_t base_idx = blockIdx.x * blockDim.y * C10_WARP_SIZE + threadIdx.y * C10_WARP_SIZE;
+    int64_t idx = base_idx + laneIdx;
+
+    if (idx < numel) {
+      int64_t crnt_sorted_idx = sorted_indices[idx];
+
+      if (idx == 0 || crnt_sorted_idx != sorted_indices[idx - 1]) {
+        // Determine the number of duplicates in advance:
+        int64_t num_duplicates = 1;
+
+        // Lookahead in case there is a large number of duplicates. Once that is done, handle the tail.
+        while ((idx + num_duplicates + SKIP_SORTED_INDICES - 1) < numel) {
+          if (sorted_indices[idx + num_duplicates + SKIP_SORTED_INDICES - 1] != crnt_sorted_idx) break;
+            num_duplicates += SKIP_SORTED_INDICES;
+        }
+        while (((idx + num_duplicates) < numel) && (sorted_indices[idx + num_duplicates] == crnt_sorted_idx)) {
+          num_duplicates++;
+        }
+
+        smem_dups_cache[smem_offset + laneIdx] = num_duplicates;
+      }
+    }
+
+    WARP_SYNC();
+
+    // All lanes in the warp are still active here. Use them all to reduce duplicates when
+    // large number of duplicates are present:
+    for (int subwarp = 0; subwarp < C10_WARP_SIZE; subwarp++) {
+      // All lanes read the shared memory entry for number of duplicates
+      int64_t new_num_duplicates = smem_dups_cache[smem_offset + subwarp];
+
+      // Check if the original sub-warp had duplicates to eliminate, if not skip.
+      if (new_num_duplicates == 0)
+        continue;
+
+      // There are duplicates that need eliminating:
+      int64_t new_idx = base_idx + subwarp;
+      int64_t new_crnt_sorted_idx = sorted_indices[new_idx];
+      const int64_t new_weight_row = new_crnt_sorted_idx * stride + z * stride_before;
+
+      if (!accumulate) {
+        const int64_t grad_row = ((int64_t)indices[new_idx + new_num_duplicates - 1]) * stride + z * numel * stride;
+        int64_t feature_dim = blockIdx.y * blockDim.x + threadIdx.x;
+        while (feature_dim < stride) {
+          grad_weight[new_weight_row + feature_dim] = grad_output[grad_row + feature_dim];
+          feature_dim += gridDim.y * blockDim.x;
+        }
+        continue;
+      }
+
+      for (int dup = 0; dup < new_num_duplicates; dup++) {
+        const int64_t grad_row = ((int64_t) indices[new_idx + dup]) * stride + z * numel * stride;
+
+        // All lanes do the same thing up to here.
+        int64_t feature_dim = blockIdx.y * blockDim.x + threadIdx.x;
+
+        // Each lane has a different feature_dim.
+        while (feature_dim < stride) {
+          grad_weight[new_weight_row + feature_dim] += grad_output[grad_row + feature_dim];
+          feature_dim += gridDim.y * blockDim.x;
+        }
+      }
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void indexing_backward_kernel_stride_1(
+  const int64_t* sorted_indices, const int64_t* indices, const scalar_t* grad_output, scalar_t* grad_weight,
+  int64_t numel, int64_t stride, int64_t stride_before, int64_t outer_dim, bool accumulate) {
+  using opmath_t = at::opmath_type<scalar_t>;
+
+  int laneIdx = threadIdx.x % C10_WARP_SIZE;
+
+  const opmath_t scale = (opmath_t)1.0;
+  int64_t grad_row = 0;
+
+  extern __shared__ unsigned char smem[];
+  auto smem_dups_cache = reinterpret_cast<int64_t*>(smem);
+
+  // Each warp gets a different section of the share memory allocation:
+  int smem_offset = threadIdx.y * C10_WARP_SIZE;
+
+  // Number of values processed by each thread (grain size)
+  for (int64_t z = blockIdx.z; z < outer_dim; z += gridDim.z) {
+    // Init duplicates every time we compute a new set of entries:
+    smem_dups_cache[smem_offset + laneIdx] = 0;
+
+    int64_t base_idx = blockIdx.x * blockDim.y * C10_WARP_SIZE + threadIdx.y * C10_WARP_SIZE;
+    int64_t idx = base_idx + laneIdx;
+
+    // Each lane calculates the number of duplicates:
+    if (idx < numel) {
+      int64_t crnt_sorted_idx = sorted_indices[idx];
+
+      if (idx == 0 || crnt_sorted_idx != sorted_indices[idx - 1]) {
+        // Determine the number of duplicates in advance:
+        int64_t num_duplicates = 1;
+
+        // Lookahead in case there is a large number of duplicates. Once that is done, handle the tail.
+        while ((idx + num_duplicates + SKIP_SORTED_INDICES - 1) < numel) {
+          if (sorted_indices[idx + num_duplicates + SKIP_SORTED_INDICES - 1] != crnt_sorted_idx) break;
+            num_duplicates += SKIP_SORTED_INDICES;
+        }
+        while (((idx + num_duplicates) < numel) && (sorted_indices[idx + num_duplicates] == crnt_sorted_idx)) {
+          num_duplicates++;
+        }
+
+        if (!accumulate) {
+          const int64_t weight_row = crnt_sorted_idx * stride + z * stride_before;
+          grad_row = ((int64_t)indices[idx + num_duplicates - 1]) * stride + z * numel * stride;
+          grad_weight[weight_row] =
+            static_cast<scalar_t>(static_cast<opmath_t>(grad_output[grad_row]) * scale);
+          continue;
+        }
+
+        // Each lane sequentially handles the duplicate elimination:
+        if (num_duplicates < C10_WARP_SIZE) {
+          opmath_t gradient = (opmath_t)0.0;
+          const int64_t weight_row = crnt_sorted_idx * stride + z * stride_before;
+          for (int64_t i = 0; i < num_duplicates; ++i) {
+            grad_row = ((int64_t) indices[idx + i]) * stride + z * numel * stride;
+            gradient += static_cast<opmath_t>(grad_output[grad_row]) * scale;
+          }
+
+          grad_weight[weight_row] = static_cast<scalar_t>(static_cast<opmath_t>(grad_weight[weight_row]) + gradient);
+        } else {
+          // Add duplicate to the cache:
+          smem_dups_cache[smem_offset + laneIdx] = num_duplicates;
+        }
+      }
+    }
+
+    WARP_SYNC();
+
+    // All lanes in the warp are still active here. Use them all to reduce duplicates when
+    // large number of duplicates are present:
+    for (int subwarp = 0; subwarp < C10_WARP_SIZE; subwarp++) {
+      // All lanes read the shared memory entry for number of duplicates
+      int64_t new_num_duplicates = smem_dups_cache[smem_offset + subwarp];
+
+      // Check if the original sub-warp had duplicates to eliminate, if not skip.
+      if (new_num_duplicates == 0)
+        continue;
+
+      // There are duplicates that need eliminating:
+      int64_t new_idx = base_idx + subwarp;
+      int64_t new_crnt_sorted_idx = sorted_indices[new_idx];
+      const int64_t new_weight_row = new_crnt_sorted_idx * stride + z * stride_before;
+
+      // Result of the reduction will be in this variable:
+      opmath_t gradient = (opmath_t)0.0;
+
+      int64_t num_warp_passes = new_num_duplicates / C10_WARP_SIZE;
+      // Parallel reduction across the array of duplicates using all the lanes in the warp:
+      for (int64_t i = 0; i < num_warp_passes; ++i) {
+        grad_row = ((int64_t) indices[new_idx + i * C10_WARP_SIZE + laneIdx]) * stride + z * numel * stride;
+        gradient += static_cast<opmath_t>(grad_output[grad_row]) * scale;
+      }
+
+      // Reduce across the lanes of the warp:
+      WARP_SYNC();
+      for (int offset = C10_WARP_SIZE / 2; offset > 0; offset /= 2) {
+        gradient += WARP_SHFL_DOWN(gradient, offset);
+      }
+
+      if (laneIdx == 0) {
+        for (int64_t i = num_warp_passes * C10_WARP_SIZE; i < new_num_duplicates; ++i) {
+          grad_row = ((int64_t) indices[new_idx + i]) * stride + z * numel * stride;
+          gradient += static_cast<opmath_t>(grad_output[grad_row]) * scale;
+        }
+
+        grad_weight[new_weight_row] = static_cast<scalar_t>(static_cast<opmath_t>(grad_weight[new_weight_row]) + gradient);
+      }
+    }
+  }
+}
+#endif
+
 template <typename scalar_t, int SZ>
 __global__ void indexing_backward_kernel(
   const int64_t* sorted_indices, const int64_t* indices, const scalar_t* grad_output, scalar_t* grad_weight,
@@ -123,6 +344,7 @@ __global__ void indexing_backward_kernel(
   }
 }
 
+#ifndef USE_ROCM
 template <typename scalar_t>
 __global__ void indexing_backward_kernel_stride_1(
   const int64_t* sorted_indices, const int64_t* indices, const scalar_t* grad_output, scalar_t* grad_weight,
@@ -178,6 +400,7 @@ __global__ void indexing_backward_kernel_stride_1(
     }
   }
 }
+#endif
 
 template <typename scalar_t>
 __global__ void indexing_backward_kernel_small_stride(
@@ -290,6 +513,520 @@ namespace at::native {
 
 namespace {
 
+#if defined(USE_ROCM)
+constexpr int64_t INDEX_ADD_SORTED_CHUNK_SIZE = 512;
+// When runs average at least SPLIT_MIN_AVERAGE_RUN rows, CHUNK_SIZE boundaries
+// leave too few compact candidates to fill the GPU, so the compact kernels
+// split at SPLIT_CHUNK_SIZE instead. Long runs keep CHUNK_SIZE.
+constexpr int64_t INDEX_ADD_SORTED_SPLIT_CHUNK_SIZE = 128;
+constexpr int64_t INDEX_ADD_SORTED_SPLIT_MIN_AVERAGE_RUN = 128;
+// Threads per long-run final-pass block, split into chunk lanes.
+constexpr int INDEX_ADD_SORTED_FINAL_PASS_THREADS = 1024;
+constexpr int64_t INDEX_ADD_SORTED_LONG_RUN_SIZE = 8192;
+constexpr int64_t INDEX_ADD_SORTED_MIN_SORT_SIZE = 1000000;
+constexpr int64_t INDEX_ADD_SORTED_MAX_SCRATCH_BYTES = 64 * 1024 * 1024;
+
+template <typename index_t>
+__global__ void index_add_sorted_prepare_sort_kernel(
+    const index_t* index,
+    int32_t* keys,
+    int32_t* positions,
+    int64_t num_indices,
+    int64_t num_rows) {
+  for (int64_t current = blockIdx.x * blockDim.x + threadIdx.x;
+       current < num_indices;
+       current += blockDim.x * gridDim.x) {
+    const int64_t row = static_cast<int64_t>(index[current]);
+    const bool valid = row >= 0 && row < num_rows;
+    keys[current] = valid ? static_cast<int32_t>(row) : 0;
+    positions[current] = static_cast<int32_t>(current);
+    CUDA_KERNEL_ASSERT(valid);
+  }
+}
+
+// Returns the first segment offset greater than value. Fixed chunk boundaries
+// use this device-side upper_bound to find the duplicate run that owns them.
+template <typename offset_t>
+__device__ __forceinline__ int64_t index_add_sorted_upper_bound(
+    const offset_t* offsets,
+    int64_t count,
+    int64_t value) {
+  int64_t first = 0;
+  while (count > 0) {
+    const int64_t step = count / 2;
+    const int64_t current = first + step;
+    if (static_cast<int64_t>(offsets[current]) <= value) {
+      first = current + 1;
+      count -= step + 1;
+    } else {
+      count = step;
+    }
+  }
+  return first;
+}
+
+// Classifies runs that need two-pass reduction and records their fixed-size
+// chunk counts. Short and unused segments write zero so an exclusive scan can
+// turn this array into compact long-run scratch offsets.
+__global__ void index_add_sorted_long_chunk_counts_kernel(
+    const int32_t* segment_offsets,
+    const int64_t* num_segments_ptr,
+    int32_t* long_chunk_counts,
+    int64_t num_indices,
+    int64_t max_segments) {
+  const int64_t num_segments = *num_segments_ptr;
+  for (int64_t segment = blockIdx.x * blockDim.x + threadIdx.x;
+       segment < max_segments;
+       segment += blockDim.x * gridDim.x) {
+    int32_t count = 0;
+    if (segment < num_segments) {
+      const int64_t begin = static_cast<int64_t>(segment_offsets[segment]);
+      const int64_t end = segment + 1 < num_segments
+          ? static_cast<int64_t>(segment_offsets[segment + 1])
+          : num_indices;
+      const int64_t length = end - begin;
+      if (length >= INDEX_ADD_SORTED_LONG_RUN_SIZE) {
+        count = static_cast<int32_t>(
+            (length + INDEX_ADD_SORTED_CHUNK_SIZE - 1) /
+            INDEX_ADD_SORTED_CHUNK_SIZE);
+      }
+    }
+    long_chunk_counts[segment] = count;
+  }
+}
+
+// Non-atomic accumulate for output rows with exactly one writer.
+template <typename acc_t, typename output_t>
+__device__ __forceinline__ void index_add_sorted_add_owned(
+    output_t* output,
+    acc_t value) {
+  *output = static_cast<output_t>(static_cast<acc_t>(*output) + value);
+}
+
+__device__ __forceinline__ int64_t index_add_sorted_compact_chunk_size(
+    int64_t num_indices,
+    int64_t num_segments) {
+  return num_segments * INDEX_ADD_SORTED_SPLIT_MIN_AVERAGE_RUN <=
+          num_indices
+      ? INDEX_ADD_SORTED_SPLIT_CHUNK_SIZE
+      : INDEX_ADD_SORTED_CHUNK_SIZE;
+}
+
+// Broadcasts 64-bit metadata from logical lane zero by shuffling its two
+// 32-bit halves. The explicit width isolates subgroups packed into one wave64.
+__device__ __forceinline__ int64_t index_add_sorted_wave_broadcast_int64(
+    int64_t value,
+    int width) {
+  union Bits {
+    int64_t value;
+    uint32_t words[2];
+  } bits = {.value = value};
+  bits.words[0] = WARP_SHFL(bits.words[0], 0, width);
+  bits.words[1] = WARP_SHFL(bits.words[1], 0, width);
+  return bits.value;
+}
+
+// Describes whether a compact candidate is skipped, uniquely owns its output
+// row, or contributes one of multiple chunks through an atomic add.
+enum class IndexAddSortedCompactMode : uint32_t {
+  Invalid = 0,
+  Direct = 1,
+  Atomic = 2,
+};
+
+// Packed add of two adjacent fp16/bf16 values through the primitive behind
+// KernelUtils.h's ATOMICADD, which that header #undefs. Same version check.
+template <typename packed_t>
+__device__ __forceinline__ void index_add_sorted_packed_atomic_add(
+    packed_t* address,
+    packed_t value) {
+#if ROCM_VERSION < 60400
+  preview_unsafeAtomicAdd(address, value);
+#else
+  unsafeAtomicAdd(address, value);
+#endif
+}
+
+// Reduces every compact candidate (run start or chunk boundary) with several
+// logical subgroups per CTA. Metadata stays in subgroup registers, avoiding
+// shared-memory barriers. With vectorized_bfloat16, a 4-byte-aligned bf16
+// source is read in pairs.
+template <
+    typename scalar_t,
+    typename acc_t,
+    typename output_t,
+    typename index_t,
+    int64_t feature_size,
+    bool vectorized_bfloat16>
+__global__ void index_add_sorted_compact_dense_kernel(
+    const scalar_t* grad,
+    const index_t* sorted_indices,
+    const int32_t* sorted_positions,
+    const int32_t* segment_offsets,
+    const int64_t* num_segments_ptr,
+    const int32_t* long_chunk_counts,
+    output_t* grad_input,
+    int64_t num_indices,
+    int64_t num_rows,
+    int64_t outer_size) {
+  static_assert(feature_size == 128 || feature_size == 256);
+  static_assert(!vectorized_bfloat16 || std::is_same_v<scalar_t, c10::BFloat16>);
+  constexpr int64_t kValuesPerLane = 8;
+  constexpr int64_t kThreadsPerBlock = 256;
+  constexpr int64_t kGroupSize = feature_size / kValuesPerLane;
+  constexpr int64_t kGroupsPerBlock = kThreadsPerBlock / kGroupSize;
+  static_assert((kGroupSize & (kGroupSize - 1)) == 0);
+  static_assert(64 % kGroupSize == 0);
+  static_assert(kGroupSize * kGroupsPerBlock == kThreadsPerBlock);
+
+  const int64_t lane = threadIdx.x;
+  const int64_t group = threadIdx.y;
+  int64_t num_segments = lane == 0 ? *num_segments_ptr : 0;
+  num_segments =
+      index_add_sorted_wave_broadcast_int64(num_segments, kGroupSize);
+  const int64_t chunk_size =
+      index_add_sorted_compact_chunk_size(num_indices, num_segments);
+  const int64_t num_boundaries = (num_indices - 1) / chunk_size;
+  const int64_t candidates_per_outer = num_segments + num_boundaries;
+
+  const int64_t actual_work = outer_size * candidates_per_outer;
+  const int64_t work_stride =
+      static_cast<int64_t>(gridDim.x) * kGroupsPerBlock;
+  for (int64_t work =
+           static_cast<int64_t>(blockIdx.x) * kGroupsPerBlock + group;
+       work < actual_work;
+       work += work_stride) {
+    const int64_t candidate = work % candidates_per_outer;
+    const int64_t outer = work / candidates_per_outer;
+    int64_t chunk_begin = -1;
+    int64_t chunk_end = -1;
+    int64_t output_row = -1;
+    auto mode = IndexAddSortedCompactMode::Invalid;
+
+    if (lane == 0) {
+      int64_t segment;
+      int64_t run_end = num_indices;
+      const bool starts_run = candidate < num_segments;
+      if (starts_run) {
+        segment = candidate;
+        chunk_begin = static_cast<int64_t>(segment_offsets[segment]);
+        if (segment + 1 < num_segments) {
+          run_end = static_cast<int64_t>(segment_offsets[segment + 1]);
+        }
+      } else {
+        chunk_begin = (candidate - num_segments + 1) * chunk_size;
+        if (sorted_indices[chunk_begin] != sorted_indices[chunk_begin - 1]) {
+          chunk_begin = -1;
+          segment = -1;
+        } else {
+          const int64_t next_segment = index_add_sorted_upper_bound(
+              segment_offsets, num_segments, chunk_begin);
+          segment = next_segment - 1;
+          if (next_segment < num_segments) {
+            run_end = static_cast<int64_t>(segment_offsets[next_segment]);
+          }
+        }
+      }
+
+      if (chunk_begin >= 0 && long_chunk_counts[segment] != 0) {
+        chunk_begin = -1;
+      }
+      if (chunk_begin >= 0) {
+        const int64_t boundary_end =
+            ((chunk_begin / chunk_size) + 1) * chunk_size;
+        chunk_end = boundary_end < run_end ? boundary_end : run_end;
+        output_row = static_cast<int64_t>(sorted_indices[chunk_begin]);
+        mode = starts_run && chunk_end == run_end
+            ? IndexAddSortedCompactMode::Direct
+            : IndexAddSortedCompactMode::Atomic;
+      }
+    }
+
+    chunk_begin =
+        index_add_sorted_wave_broadcast_int64(chunk_begin, kGroupSize);
+    chunk_end =
+        index_add_sorted_wave_broadcast_int64(chunk_end, kGroupSize);
+    output_row =
+        index_add_sorted_wave_broadcast_int64(output_row, kGroupSize);
+    mode = static_cast<IndexAddSortedCompactMode>(WARP_SHFL(
+        static_cast<uint32_t>(mode), 0, kGroupSize));
+    if (mode == IndexAddSortedCompactMode::Invalid) {
+      continue;
+    }
+
+    const int64_t feature = lane * kValuesPerLane;
+    acc_t sums[kValuesPerLane] = {};
+    for (int64_t current = chunk_begin; current < chunk_end; ++current) {
+      const int64_t source_row =
+          static_cast<int64_t>(sorted_positions[current]);
+      const int64_t source_offset =
+          (outer * num_indices + source_row) * feature_size + feature;
+      if constexpr (vectorized_bfloat16) {
+#pragma unroll
+        for (int pair = 0; pair < kValuesPerLane / 2; ++pair) {
+          const auto values =
+              memory::load_vector<2>(grad + source_offset, pair);
+          sums[2 * pair] += static_cast<acc_t>(values.val[0]);
+          sums[2 * pair + 1] += static_cast<acc_t>(values.val[1]);
+        }
+      } else {
+#pragma unroll
+        for (int value = 0; value < kValuesPerLane; ++value) {
+          sums[value] += static_cast<acc_t>(grad[source_offset + value]);
+        }
+      }
+    }
+
+    const int64_t output_offset =
+        (outer * num_rows + output_row) * feature_size + feature;
+    if (mode == IndexAddSortedCompactMode::Direct) {
+#pragma unroll
+      for (int value = 0; value < kValuesPerLane; ++value) {
+        index_add_sorted_add_owned(
+            grad_input + output_offset + value, sums[value]);
+      }
+      continue;
+    }
+    output_t outputs[kValuesPerLane];
+#pragma unroll
+    for (int value = 0; value < kValuesPerLane; ++value) {
+      outputs[value] = static_cast<output_t>(sums[value]);
+    }
+    // The caller guarantees a 4-byte-aligned output, so every pair can use
+    // the packed atomic from KernelUtils.h.
+    if constexpr (std::is_same_v<output_t, c10::BFloat16>) {
+#pragma unroll
+      for (int pair = 0; pair < kValuesPerLane / 2; ++pair) {
+        __nv_bfloat162 packed;
+        packed.x = *reinterpret_cast<const __nv_bfloat16*>(&outputs[2 * pair]);
+        packed.y =
+            *reinterpret_cast<const __nv_bfloat16*>(&outputs[2 * pair + 1]);
+        index_add_sorted_packed_atomic_add(
+            reinterpret_cast<__nv_bfloat162*>(
+                grad_input + output_offset + 2 * pair),
+            packed);
+      }
+    } else if constexpr (std::is_same_v<output_t, c10::Half>) {
+#pragma unroll
+      for (int pair = 0; pair < kValuesPerLane / 2; ++pair) {
+        __half2 packed;
+        packed.x = static_cast<__half>(outputs[2 * pair]);
+        packed.y = static_cast<__half>(outputs[2 * pair + 1]);
+        index_add_sorted_packed_atomic_add(
+            reinterpret_cast<__half2*>(grad_input + output_offset + 2 * pair),
+            packed);
+      }
+    } else {
+#pragma unroll
+      for (int value = 0; value < kValuesPerLane; ++value) {
+        gpuAtomicAddNoReturn(
+            grad_input + output_offset + value, outputs[value]);
+      }
+    }
+  }
+}
+
+// First pass for exceptionally long runs. Each logical work item reduces at
+// most one fixed-size source chunk into bounded scratch, tiled over the
+// flattened outer and feature dimensions.
+template <
+    typename scalar_t,
+    typename acc_t,
+    typename scratch_t,
+    int values_per_thread>
+__global__ void index_add_sorted_long_first_pass_kernel(
+    const scalar_t* grad,
+    const int32_t* sorted_positions,
+    const int32_t* segment_offsets,
+    const int64_t* num_segments_ptr,
+    const int32_t* long_chunk_counts,
+    const int32_t* long_chunk_offsets,
+    scratch_t* scratch,
+    int64_t num_indices,
+    int64_t max_segments,
+    int64_t max_long_chunks,
+    int64_t inner_size,
+    int64_t feature_offset,
+    int64_t feature_count) {
+  static_assert(values_per_thread == 1 || values_per_thread == 2);
+  for (int64_t chunk = blockIdx.x; chunk < max_long_chunks;
+       chunk += gridDim.x) {
+    const int64_t segment = index_add_sorted_upper_bound(
+                                long_chunk_offsets, max_segments, chunk) -
+        1;
+    if (segment < 0 || segment >= max_segments) {
+      continue;
+    }
+    const int64_t first_chunk =
+        static_cast<int64_t>(long_chunk_offsets[segment]);
+    const int64_t chunk_count =
+        static_cast<int64_t>(long_chunk_counts[segment]);
+    const int64_t chunk_in_segment = chunk - first_chunk;
+    if (chunk_count == 0 || chunk_in_segment < 0 ||
+        chunk_in_segment >= chunk_count) {
+      continue;
+    }
+
+    const int64_t begin =
+        static_cast<int64_t>(segment_offsets[segment]) +
+        chunk_in_segment * INDEX_ADD_SORTED_CHUNK_SIZE;
+    const int64_t num_segments = *num_segments_ptr;
+    const int64_t run_end = segment + 1 < num_segments
+        ? static_cast<int64_t>(segment_offsets[segment + 1])
+        : num_indices;
+    const int64_t unbounded_end = begin + INDEX_ADD_SORTED_CHUNK_SIZE;
+    const int64_t end = unbounded_end < run_end ? unbounded_end : run_end;
+
+    if constexpr (values_per_thread == 2) {
+      static_assert(std::is_same_v<scalar_t, c10::BFloat16>);
+      static_assert(std::is_same_v<scratch_t, c10::BFloat16>);
+      for (int64_t local_feature = threadIdx.x * 2;
+           local_feature + 1 < feature_count;
+           local_feature += blockDim.x * 2) {
+        const int64_t flat_feature = feature_offset + local_feature;
+        const int64_t outer = flat_feature / inner_size;
+        const int64_t feature = flat_feature % inner_size;
+        acc_t sum0 = acc_t(0);
+        acc_t sum1 = acc_t(0);
+        for (int64_t current = begin; current < end; ++current) {
+          const int64_t source_row =
+              static_cast<int64_t>(sorted_positions[current]);
+          const int64_t source_offset =
+              (outer * num_indices + source_row) * inner_size;
+          const auto values = memory::load_vector<2>(
+              grad + source_offset, static_cast<uint32_t>(feature / 2));
+          sum0 += static_cast<acc_t>(values.val[0]);
+          sum1 += static_cast<acc_t>(values.val[1]);
+        }
+        const int64_t scratch_offset =
+            chunk * feature_count + local_feature;
+        scratch[scratch_offset] = static_cast<scratch_t>(sum0);
+        scratch[scratch_offset + 1] = static_cast<scratch_t>(sum1);
+      }
+    } else {
+      for (int64_t local_feature = threadIdx.x;
+           local_feature < feature_count;
+           local_feature += blockDim.x) {
+        const int64_t flat_feature = feature_offset + local_feature;
+        const int64_t outer = flat_feature / inner_size;
+        const int64_t feature = flat_feature % inner_size;
+        acc_t sum = acc_t(0);
+        for (int64_t current = begin; current < end; ++current) {
+          const int64_t source_row =
+              static_cast<int64_t>(sorted_positions[current]);
+          const int64_t source_offset =
+              (outer * num_indices + source_row) * inner_size + feature;
+          sum += static_cast<acc_t>(grad[source_offset]);
+        }
+        scratch[chunk * feature_count + local_feature] =
+            static_cast<scratch_t>(sum);
+      }
+    }
+  }
+}
+
+// Finalizes each long run by adding its first-pass scratch chunks into the
+// destination row once. Long runs are excluded from compact reduction, so this
+// pass needs no output atomics. A single hot row can own thousands of chunks
+// and only one block, so blockDim.y lanes stride over the chunks and are then
+// combined in lane order, which keeps the result deterministic.
+template <
+    typename scratch_t,
+    typename acc_t,
+    typename output_t,
+    typename index_t,
+    int values_per_thread>
+__global__ void index_add_sorted_long_final_pass_kernel(
+    const index_t* sorted_indices,
+    const int32_t* segment_offsets,
+    const int32_t* long_chunk_counts,
+    const int32_t* long_chunk_offsets,
+    const scratch_t* scratch,
+    output_t* grad_input,
+    int64_t num_rows,
+    int64_t max_segments,
+    int64_t max_long_chunks,
+    int64_t inner_size,
+    int64_t feature_offset,
+    int64_t feature_count) {
+  static_assert(values_per_thread == 1 || values_per_thread == 2);
+  static_assert(
+      values_per_thread == 1 ||
+      (std::is_same_v<scratch_t, c10::BFloat16> &&
+       std::is_same_v<output_t, c10::BFloat16>));
+  __shared__ acc_t partials[values_per_thread]
+                           [INDEX_ADD_SORTED_FINAL_PASS_THREADS];
+  const int64_t lane = threadIdx.y;
+  const int64_t num_lanes = blockDim.y;
+  const int64_t slot = lane * blockDim.x + threadIdx.x;
+  const int64_t features_per_step =
+      static_cast<int64_t>(blockDim.x) * values_per_thread;
+
+  // Bound by the chunks actually used so inputs without long runs exit at once.
+  const int64_t used_long_chunks =
+      static_cast<int64_t>(long_chunk_offsets[max_segments - 1]) +
+      static_cast<int64_t>(long_chunk_counts[max_segments - 1]);
+  for (int64_t chunk = blockIdx.x; chunk < used_long_chunks;
+       chunk += gridDim.x) {
+    const int64_t segment = index_add_sorted_upper_bound(
+                                long_chunk_offsets, max_segments, chunk) -
+        1;
+    if (segment < 0 || segment >= max_segments) {
+      continue;
+    }
+    const int64_t first_chunk =
+        static_cast<int64_t>(long_chunk_offsets[segment]);
+    const int64_t chunk_count =
+        static_cast<int64_t>(long_chunk_counts[segment]);
+    if (chunk != first_chunk || chunk_count == 0) {
+      continue;
+    }
+
+    const int64_t output_row = static_cast<int64_t>(
+        sorted_indices[static_cast<int64_t>(segment_offsets[segment])]);
+    // Every thread runs the same number of steps so the barriers stay uniform.
+    for (int64_t step = 0; step < feature_count; step += features_per_step) {
+      const int64_t local_feature =
+          step + static_cast<int64_t>(threadIdx.x) * values_per_thread;
+      const bool active = local_feature + values_per_thread <= feature_count;
+      acc_t sums[values_per_thread] = {};
+      if (active) {
+        for (int64_t current = lane; current < chunk_count;
+             current += num_lanes) {
+          const int64_t scratch_offset =
+              (first_chunk + current) * feature_count + local_feature;
+#pragma unroll
+          for (int value = 0; value < values_per_thread; ++value) {
+            sums[value] += static_cast<acc_t>(scratch[scratch_offset + value]);
+          }
+        }
+      }
+#pragma unroll
+      for (int value = 0; value < values_per_thread; ++value) {
+        partials[value][slot] = sums[value];
+      }
+      __syncthreads();
+      if (lane == 0 && active) {
+        const int64_t flat_feature = feature_offset + local_feature;
+        const int64_t outer = flat_feature / inner_size;
+        const int64_t feature = flat_feature % inner_size;
+        const int64_t output_offset =
+            (outer * num_rows + output_row) * inner_size + feature;
+#pragma unroll
+        for (int value = 0; value < values_per_thread; ++value) {
+          acc_t sum = acc_t(0);
+          for (int64_t other = 0; other < num_lanes; ++other) {
+            sum += partials[value][other * blockDim.x + threadIdx.x];
+          }
+          index_add_sorted_add_owned(grad_input + output_offset + value, sum);
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+#endif
+
 class ReduceMultiply {
 public:
   template <typename scalar_t>
@@ -301,10 +1038,20 @@ public:
 static ReduceMultiply reduce_multiply;
 
 class ReduceAdd {
-public:
+ public:
   template <typename scalar_t>
   constexpr C10_DEVICE void operator() (scalar_t* self_data_start, int64_t index, int64_t numel, const scalar_t * src_data) const {
+#if defined(USE_ROCM)
+    // TODO: this check is too coarse, revisit, we should only be checking for
+    //       the availability of the builtins required by the implementation, at
+    //       most.
+    if(__builtin_amdgcn_processor_is("gfx942") ||
+       __builtin_amdgcn_processor_is("gfx950"))
+      return opportunistic_fastAtomicAdd(self_data_start, index, numel, *src_data);
     fastAtomicAdd(self_data_start, index, numel, *src_data, true);
+#else
+    fastAtomicAdd(self_data_start, index, numel, *src_data, true);
+#endif
   }
 };
 static ReduceAdd reduce_add;
@@ -334,14 +1081,9 @@ static ReduceMaximum reduce_maximum;
 static Tensor wrapIndexOnce(const Tensor & index, int64_t dim, int64_t dim_size, bool check_range=true) {
 //we don't need to check range in backward - if there were out of bounds indices forward should already have errored out
   if (index.numel() != 0 && check_range) {
-    auto max_idx = index.max().item<int64_t>();
-    auto min_idx = index.min().item<int64_t>();
-    if (max_idx >= dim_size) {
-      TORCH_CHECK_INDEX(false, "index ", max_idx, " is out of bounds for dimension ", dim, " with size ", dim_size);
-    }
-    if (min_idx < -dim_size) {
-      TORCH_CHECK_INDEX(false, "index ", min_idx, " is out of bounds for dimension ", dim, " with size ", dim_size);
-    }
+    auto [index_min, index_max] = at::aminmax(index);
+    at::_assert_async(index_max < dim_size);
+    at::_assert_async(index_min >= -dim_size);
   }
   return index.remainder(dim_size);
 }
@@ -358,7 +1100,7 @@ static std::vector<int64_t> computeLinearStride(const Tensor & tensor) {
   return stride;
 }
 
-static std::tuple<Tensor, int64_t, int64_t, int64_t>
+static std::tuple<Tensor, int64_t, int64_t, int64_t, int64_t, int64_t>
 computeLinearIndex(const Tensor & src, TensorList indices, bool check_range) {
   auto strides = computeLinearStride(src);
   const auto& device = src.options().device();
@@ -369,8 +1111,10 @@ computeLinearIndex(const Tensor & src, TensorList indices, bool check_range) {
   // are not being index.
   Tensor linearIndex;
   int64_t nElemBefore = 1, nElemAfter = 1, strideBefore =0;
+  int64_t dims_before = 0, dims_indexed = 0;
   for (const auto i: c10::irange(src.dim())) {
     if (indices[i].defined()) {
+      dims_indexed++;
       // Cast index to the longType matching src's device
       // This allows us to support ie indexing a cuda tensor with a cpu tensor
       Tensor index = (wrapIndexOnce(indices[i], i, src.size(i), check_range) * strides[i]).to(device);
@@ -385,15 +1129,17 @@ computeLinearIndex(const Tensor & src, TensorList indices, bool check_range) {
     } else if (linearIndex.defined()) {
       nElemAfter *= src.size(i);
     } else {
+      dims_before++;
       nElemBefore *= src.size(i);
     }
   }
 
-  return std::make_tuple(std::move(linearIndex), nElemBefore, strideBefore, nElemAfter);
+  return std::make_tuple(std::move(linearIndex), nElemBefore, strideBefore, nElemAfter, dims_before, dims_indexed);
 }
 
 
-static std::tuple<Tensor, Tensor, int64_t, int64_t, int64_t, std::vector<int64_t>> makeLinearIndex(Tensor self, IOptTensorListRef orig, bool check_range) {
+static std::tuple<Tensor, Tensor, int64_t, int64_t, int64_t, std::vector<int64_t>, int64_t, int64_t>
+makeLinearIndex(Tensor self, IOptTensorListRef orig, bool check_range) {
   checkIndexTensorTypes(orig, /*allow_int*/true);
   // first expand BoolTensor (masks) or ByteTensor (masks) into 1 or more LongTensors
   auto indices = expandTensors(self, orig);
@@ -414,13 +1160,11 @@ static std::tuple<Tensor, Tensor, int64_t, int64_t, int64_t, std::vector<int64_t
   if (!hasContiguousSubspace(indices)) {
     std::tie(self, indices, inversePerm) = transposeToFrontAndInvPerm(self, indices);
   }
-  auto [linearIndex, nElemBefore, strideBefore, nElemAfter] = computeLinearIndex(self, indices, check_range);
-  return std::make_tuple(linearIndex, self, nElemBefore, strideBefore, nElemAfter, inversePerm);
+  auto [linearIndex, nElemBefore, strideBefore, nElemAfter, dims_before, dims_indexed] =
+    computeLinearIndex(self, indices, check_range);
+  return std::make_tuple(std::move(linearIndex), std::move(self), nElemBefore, strideBefore, nElemAfter, std::move(inversePerm),
+                         dims_before, dims_indexed);
 }
-
-
-void index_put_with_sort_kernel_thrust_helper(Tensor &linearIndex, Tensor &orig_indices, Tensor &sorted_indices, int64_t num_indices);
-
 namespace {
 
 int64_t largestIndex(const Tensor &self) {
@@ -431,7 +1175,21 @@ int64_t largestIndex(const Tensor &self) {
   return result;
 }
 
-void index_put_with_sort_kernel(Tensor & self, const c10::List<c10::optional<Tensor>>& indices, const Tensor & value, bool accumulate, bool unsafe) {
+DimVector valsShape(IntArrayRef self_sizes,
+                              int64_t dims_before,
+                              int64_t dims_indexed,
+                              IntArrayRef replacement_shape) {
+  auto shape = DimVector(self_sizes);
+  int64_t end = dims_before + dims_indexed;
+  shape.erase(shape.begin() + dims_before, shape.begin() + end);
+  shape.insert(
+    shape.begin() + dims_before,
+    replacement_shape.begin(),
+    replacement_shape.end());
+  return shape;
+}
+
+void index_put_with_sort_kernel(Tensor & self, const c10::List<std::optional<Tensor>>& indices, const Tensor & value, bool accumulate, bool unsafe) {
   TORCH_CHECK(!indices.empty() || is_expandable_to(value.sizes(), self.sizes()), "shape mismatch: value tensor of shape ", value.sizes(),
              " cannot be broadcast to indexing result of shape ", self.sizes());
   if (indices.size() > (size_t)self.dim()) {
@@ -440,27 +1198,13 @@ void index_put_with_sort_kernel(Tensor & self, const c10::List<c10::optional<Ten
   bool self_contiguous = self.is_contiguous();
   auto self_ = self_contiguous ? self : self.contiguous();
   Tensor linearIndex, src, expandedValue = value;
-  int64_t nElemBefore, strideBefore, sliceSize;
+  int64_t nElemBefore, strideBefore, sliceSize, dims_before, dims_indexed;
   std::vector<int64_t> inversePerm;
-  std::tie(linearIndex, src, nElemBefore, strideBefore, sliceSize, inversePerm) = makeLinearIndex(self_, indices, !unsafe);
+  std::tie(linearIndex, src, nElemBefore, strideBefore, sliceSize, inversePerm,
+  dims_before, dims_indexed) = makeLinearIndex(self_, indices, !unsafe);
+  auto vals_shape = valsShape(src.sizes(), dims_before, dims_indexed, linearIndex.sizes());
   int64_t num_indices = linearIndex.numel();
-
-  if (expandedValue.numel() < num_indices * nElemBefore * sliceSize) {
-    auto expanded_size = at::DimVector(expandedValue.sizes());
-    auto size1 = expandedValue.sizes();
-    auto size2 = linearIndex.sizes();
-    if (are_expandable(size1, size2)) {
-      expanded_size = infer_size_dimvector(size1, size2);
-    }
-    if (nElemBefore > 1) {
-      expanded_size.insert(expanded_size.begin(), nElemBefore);
-    }
-    if (sliceSize > 1) {
-      expanded_size.insert(expanded_size.end(), sliceSize);
-    }
-    expandedValue = expandedValue.expand(expanded_size);
-  }
-  expandedValue = expandedValue.contiguous();
+  expandedValue = expandedValue.expand(vals_shape).contiguous();
 
   if (num_indices > 0 && sliceSize > 0) {
       const bool permuted = !src.is_contiguous();
@@ -472,15 +1216,6 @@ void index_put_with_sort_kernel(Tensor & self, const c10::List<c10::optional<Ten
 
       linearIndex.divide_(sliceSize, "trunc");
 
-      // cub on CUDA <= 11.2 have a bug that for small sizes
-      // cub's sort can be much slower than thrust's merge sort
-      // this bug is fixed in CUDA 11.3
-#if (defined(CUDA_VERSION) && CUDA_VERSION < 11030) || defined(USE_ROCM)
-      if (num_indices < 50000) {
-        index_put_with_sort_kernel_thrust_helper(linearIndex, orig_indices, sorted_indices, num_indices);
-      } else
-#endif
-      {
       // Sort the inputs into sorted with the corresponding indices
       auto range = at::arange(num_indices, linearIndex.options());
       // linearIndex can not be negative, and we take advantage of this
@@ -490,43 +1225,43 @@ void index_put_with_sort_kernel(Tensor & self, const c10::List<c10::optional<Ten
         linearIndex.const_data_ptr<int64_t>(), sorted_indices.mutable_data_ptr<int64_t>(),
         range.const_data_ptr<int64_t>(), orig_indices.mutable_data_ptr<int64_t>(),
         num_indices, false, 0, nbits);
-      }
+
 
       TORCH_INTERNAL_ASSERT(
           linearIndex.numel()*sliceSize*nElemBefore == expandedValue.numel(),
           "number of flattened indices did not match number of elements in the value tensor: ",
           linearIndex.numel()*sliceSize*nElemBefore, " vs ", expandedValue.numel());
+
       const int UNROLL = 4;
       const int indices_per_block = 4;
       const int warp_size = at::cuda::warp_size();
       dim3 grid(ceil_div(num_indices, (int64_t) indices_per_block),
            std::min<int>(at::cuda::getCurrentDeviceProperties()->maxGridSize[1], ceil_div(sliceSize, (int64_t) (warp_size*UNROLL))),
-           std::min(std::max<int>(1,nElemBefore), at::cuda::getCurrentDeviceProperties()->maxGridSize[2]));
+           std::clamp<int>(nElemBefore, 1, at::cuda::getCurrentDeviceProperties()->maxGridSize[2]));
       dim3 block(warp_size, indices_per_block);
 
+#ifdef USE_ROCM
+      dim3 new_grid_many_indices(ceil_div(num_indices, (int64_t) (indices_per_block * warp_size)),
+      grid.y == 1 ? std::min<int>(at::cuda::getCurrentDeviceProperties()->maxGridSize[1], ceil_div(sliceSize, (int64_t) (warp_size))) : grid.y,
+      grid.z);
+      dim3 new_grid(ceil_div(num_indices, (int64_t) (indices_per_block * warp_size)), grid.y, grid.z);
+      size_t smem_dups_size = indices_per_block * warp_size * sizeof(int64_t);
+#define KERNEL_GRID new_grid
+#define KERNEL_SMEM smem_dups_size
+#else
+#define KERNEL_GRID grid
+#define KERNEL_SMEM 0
+#endif
 
       if (sliceSize == 1) {
         // This implementation is faster with high amounts of duplicates but could overflow
         // if FP16 / BF16 is used
-        AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(kComplexHalf, kHalf, kBool, kBFloat16,
-        expandedValue.scalar_type(), "indexing_backward_kernel_stride_1", [&] {
-          indexing_backward_kernel_stride_1<scalar_t><<<grid, block, 0, stream>>>(
-            sorted_indices.const_data_ptr<int64_t>(),
-            orig_indices.const_data_ptr<int64_t>(),
-            expandedValue.const_data_ptr<scalar_t>(),
-            src_.mutable_data_ptr<scalar_t>(),
-            num_indices,
-            sliceSize,
-            strideBefore,
-            nElemBefore,
-            accumulate);
-          C10_CUDA_KERNEL_LAUNCH_CHECK();
-        });
-      } else {
-        if (sliceSize <= warp_size) {
-          AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(kComplexHalf, kHalf, kBool, kBFloat16,
-          expandedValue.scalar_type(), "indexing_backward_kernel_small_stride", [&] {
-            indexing_backward_kernel_small_stride<scalar_t><<<grid, block, 0, stream>>>(
+        AT_DISPATCH_V2(
+          expandedValue.scalar_type(),
+          "indexing_backward_kernel_stride_1",
+          AT_WRAP([&] {
+            indexing_backward_kernel_stride_1<scalar_t><<<KERNEL_GRID, block, KERNEL_SMEM, stream>>>
+            (
               sorted_indices.const_data_ptr<int64_t>(),
               orig_indices.const_data_ptr<int64_t>(),
               expandedValue.const_data_ptr<scalar_t>(),
@@ -537,10 +1272,89 @@ void index_put_with_sort_kernel(Tensor & self, const c10::List<c10::optional<Ten
               nElemBefore,
               accumulate);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
+          }),
+          AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+          // AT_EXPAND(AT_FLOAT8_TYPES),
+          // TODO(#113663): clean up accumulation behavior in float8 dtypes, accumulate=True
+          // should not be supported here, then reenable AT_FLOAT8_DTYPES
+          kFloat8_e4m3fn,
+          kFloat8_e5m2,
+          kFloat8_e4m3fnuz,
+          kFloat8_e5m2fnuz,
+          kComplexHalf,
+          kBComplex32,
+          kHalf,
+          kBool,
+          kBFloat16);
+      } else {
+        if (sliceSize <= warp_size) {
+          AT_DISPATCH_V2(
+            expandedValue.scalar_type(),
+            "indexing_backward_kernel_small_stride",
+            AT_WRAP([&] {
+              indexing_backward_kernel_small_stride<scalar_t><<<grid, block, 0, stream>>>(
+                sorted_indices.const_data_ptr<int64_t>(),
+                orig_indices.const_data_ptr<int64_t>(),
+                expandedValue.const_data_ptr<scalar_t>(),
+                src_.mutable_data_ptr<scalar_t>(),
+                num_indices,
+                sliceSize,
+                strideBefore,
+                nElemBefore,
+                accumulate);
+              C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }),
+            AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+            // AT_EXPAND(AT_FLOAT8_TYPES),
+            // TODO(#113663): clean up accumulation behavior in float8 dtypes, accumulate=True
+            // should not be supported here, then reenable AT_FLOAT8_DTYPES
+            kFloat8_e4m3fn,
+            kFloat8_e5m2,
+            kFloat8_e4m3fnuz,
+            kFloat8_e5m2fnuz,
+            kComplexHalf,
+            kBComplex32,
+            kHalf,
+            kBool,
+            kBFloat16);
         } else {
-            AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(kComplexHalf, kHalf, kBool, kBFloat16,
-            expandedValue.scalar_type(), "indexing_backward", [&] {
+#ifdef USE_ROCM
+          if (num_indices >= 200000)
+            AT_DISPATCH_V2(
+              expandedValue.scalar_type(),
+              "indexing_backward_many_indices",
+              AT_WRAP([&] {
+                indexing_backward_kernel_many_indices<scalar_t, UNROLL><<<new_grid_many_indices, block, smem_dups_size, stream>>>(
+                  sorted_indices.const_data_ptr<int64_t>(),
+                  orig_indices.const_data_ptr<int64_t>(),
+                  expandedValue.const_data_ptr<scalar_t>(),
+                  src_.mutable_data_ptr<scalar_t>(),
+                  num_indices,
+                  sliceSize,
+                  strideBefore,
+                  nElemBefore,
+                  accumulate);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+              }),
+              AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+              // AT_EXPAND(AT_FLOAT8_TYPES),
+              // TODO(#113663): clean up accumulation behavior in float8 dtypes, accumulate=True
+              // should not be supported here, then reenable AT_FLOAT8_DTYPES
+              kFloat8_e4m3fn,
+              kFloat8_e5m2,
+              kFloat8_e4m3fnuz,
+              kFloat8_e5m2fnuz,
+              kComplexHalf,
+              kBComplex32,
+              kHalf,
+              kBool,
+              kBFloat16);
+          else
+#endif
+          AT_DISPATCH_V2(
+            expandedValue.scalar_type(),
+            "indexing_backward",
+            AT_WRAP([&] {
               indexing_backward_kernel<scalar_t, UNROLL><<<grid, block, 0, stream>>>(
                 sorted_indices.const_data_ptr<int64_t>(),
                 orig_indices.const_data_ptr<int64_t>(),
@@ -552,9 +1366,25 @@ void index_put_with_sort_kernel(Tensor & self, const c10::List<c10::optional<Ten
                 nElemBefore,
                 accumulate);
               C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
-          }
+            }),
+            AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+            // AT_EXPAND(AT_FLOAT8_TYPES),
+            // TODO(#113663): clean up accumulation behavior in float8 dtypes, accumulate=True
+            // should not be supported here, then reenable AT_FLOAT8_DTYPES
+            kFloat8_e4m3fn,
+            kFloat8_e5m2,
+            kFloat8_e4m3fnuz,
+            kFloat8_e5m2fnuz,
+            kComplexHalf,
+            kBComplex32,
+            kHalf,
+            kBool,
+            kBFloat16);
         }
+      }
+
+#undef KERNEL_GRID
+#undef KERNEL_SMEM
 
       if (permuted) {
         self.copy_(src_.permute(inversePerm));
@@ -564,33 +1394,22 @@ void index_put_with_sort_kernel(Tensor & self, const c10::List<c10::optional<Ten
   }
 }
 
-REGISTER_CUDA_DISPATCH(index_put_with_sort_stub, &index_put_with_sort_kernel);
+REGISTER_CUDA_DISPATCH(index_put_with_sort_stub, &index_put_with_sort_kernel)
 
-void index_put_with_sort_quantized(Tensor & self, const c10::List<c10::optional<Tensor>>& indices, const Tensor & value, double scale, int zero_point, bool unsafe) {
+void index_put_with_sort_quantized(Tensor & self, const c10::List<std::optional<Tensor>>& indices, const Tensor & value, double scale, int zero_point, bool unsafe) {
   if (indices.size() > (size_t)self.dim()) {
     TORCH_CHECK_INDEX(false, "too many indices for tensor of dimension ", self.dim(), " (got ", indices.size(), ")");
   }
   bool self_contiguous = self.is_contiguous();
   auto self_ = self_contiguous ? self : self.contiguous();
   Tensor linearIndex, src, expandedValue = value;
-  int64_t nElemBefore, strideBefore, sliceSize;
+  int64_t nElemBefore, strideBefore, sliceSize, dims_before, dims_indexed;
   std::vector<int64_t> inversePerm;
-  std::tie(linearIndex, src, nElemBefore, strideBefore, sliceSize, inversePerm) = makeLinearIndex(self_, indices, !unsafe);
+  std::tie(linearIndex, src, nElemBefore, strideBefore, sliceSize, inversePerm,
+  dims_before, dims_indexed) = makeLinearIndex(self_, indices, !unsafe);
+  auto vals_shape = valsShape(src.sizes(), dims_before, dims_indexed, linearIndex.sizes());
   int64_t num_indices = linearIndex.numel();
-
-  if (expandedValue.numel() < num_indices * nElemBefore * sliceSize) {
-    auto expanded_size = at::DimVector(expandedValue.sizes());
-    auto size1 = expandedValue.sizes();
-    auto size2 = linearIndex.sizes();
-    if (are_expandable(size1, size2)) {
-      expanded_size = infer_size_dimvector(size1, size2);
-    }
-    if (nElemBefore > 1) {
-      expanded_size.insert(expanded_size.begin(), nElemBefore);
-    }
-    expandedValue = expandedValue.expand(expanded_size);
-  }
-  expandedValue = expandedValue.contiguous();
+  expandedValue = expandedValue.expand(vals_shape).contiguous();
 
   if (num_indices > 0 && sliceSize > 0) {
       const bool permuted = !src.is_contiguous();
@@ -602,15 +1421,6 @@ void index_put_with_sort_quantized(Tensor & self, const c10::List<c10::optional<
 
       linearIndex.divide_(sliceSize, "trunc");
 
-      // cub on CUDA <= 11.2 have a bug that for small sizes
-      // cub's sort can be much slower than thrust's merge sort
-      // this bug is fixed in CUDA 11.3
-#if (defined(CUDA_VERSION) && CUDA_VERSION < 11030) || defined(USE_ROCM)
-      if (num_indices < 50000) {
-        index_put_with_sort_kernel_thrust_helper(linearIndex, orig_indices, sorted_indices, num_indices);
-      } else
-#endif
-      {
       // Sort the inputs into sorted with the corresponding indices
       auto range = at::arange(num_indices, linearIndex.options());
       // linearIndex can not be negative, and we take advantage of this
@@ -620,7 +1430,7 @@ void index_put_with_sort_quantized(Tensor & self, const c10::List<c10::optional<
         linearIndex.const_data_ptr<int64_t>(), sorted_indices.mutable_data_ptr<int64_t>(),
         range.const_data_ptr<int64_t>(), orig_indices.mutable_data_ptr<int64_t>(),
         num_indices, false, 0, nbits);
-      }
+
 
       TORCH_INTERNAL_ASSERT(
           linearIndex.numel()*sliceSize*nElemBefore == expandedValue.numel(),
@@ -631,7 +1441,7 @@ void index_put_with_sort_quantized(Tensor & self, const c10::List<c10::optional<
       const int warp_size = at::cuda::warp_size();
       dim3 grid(ceil_div(num_indices, (int64_t) indices_per_block),
            std::min<int>(at::cuda::getCurrentDeviceProperties()->maxGridSize[1], ceil_div(sliceSize, (int64_t) (warp_size*UNROLL))),
-           std::min(std::max<int>(1,nElemBefore), at::cuda::getCurrentDeviceProperties()->maxGridSize[2]));
+           std::clamp<int>(nElemBefore, 1, at::cuda::getCurrentDeviceProperties()->maxGridSize[2]));
       dim3 block(warp_size, indices_per_block);
 
       AT_DISPATCH_QINT_TYPES(
@@ -664,12 +1474,12 @@ void index_put_with_sort_quantized(Tensor & self, const c10::List<c10::optional<
   }
 }
 
-REGISTER_CUDA_DISPATCH(index_put_with_sort_quantized_stub, &index_put_with_sort_quantized);
+REGISTER_CUDA_DISPATCH(index_put_with_sort_quantized_stub, &index_put_with_sort_quantized)
 } //anonymous
 
 
 // Check tensor dimensions for index operations, and return the slice size.
-static ptrdiff_t getSliceSize(const Tensor & dst,
+static size_t getSliceSize(const Tensor & dst,
                               int dim,
                               const Tensor & index,
                               const Tensor & src)
@@ -679,7 +1489,7 @@ static ptrdiff_t getSliceSize(const Tensor & dst,
 
   TORCH_CHECK(index.dim() <= 1, "Index must be vector or scalar");
 
-  ptrdiff_t dstSliceSize = 1;
+  size_t dstSliceSize = 1;
   TORCH_CHECK(dim >= 0 && dim < dstDims, "Indexing dim ", dim, " is out of bounds");
   for (const auto d: c10::irange(dstDims)) {
     if (d != dim) {
@@ -691,7 +1501,7 @@ static ptrdiff_t getSliceSize(const Tensor & dst,
   TORCH_CHECK(index.numel() == src.size(dim),
              "length of src.size[dim] is not equal to length of indices");
 
-  ptrdiff_t srcSliceSize = 1;
+  size_t srcSliceSize = 1;
   bool mismatch = false;
 
   if (dstDims != srcDims) mismatch = true;
@@ -704,8 +1514,8 @@ static ptrdiff_t getSliceSize(const Tensor & dst,
   }
 
   TORCH_CHECK(dstSliceSize == srcSliceSize,
-             "Source/destination tensor have different slice sizes (%ld vs %ld)",
-             dstSliceSize, srcSliceSize);
+             "Source/destination tensor have different slice sizes (",
+             dstSliceSize, " vs ", srcSliceSize, ")");
 
   if (mismatch) {
     TORCH_WARN_ONCE(
@@ -740,7 +1550,6 @@ __global__ void indexFuncSmallIndex(cuda::detail::TensorInfo<T, IndexType> dst,
   // this is a good choice (small number of chosen indices), since
   // re-accessing indices in addition to src elements can be slow.
   for (IndexType srcIndex = 0; srcIndex < indices.sizes[0]; ++srcIndex) {
-    // Lua indices begin at 1
     IndexType dstIndex =
         indices.data[cuda::detail::IndexToOffset<const IndicesType, IndexType, IdxDim>::get(srcIndex, indices)];
     CUDA_KERNEL_ASSERT(dstIndex < dstAddDimSize);
@@ -799,7 +1608,6 @@ __global__ void indexFuncLargeIndex(cuda::detail::TensorInfo<T, IndexType> dst,
       srcIndex = linearIndex % innerSize;
     }
 
-    // Lua indices begin at 1
     IndexType dstIndex =
         indices.data[cuda::detail::IndexToOffset<const IndicesType, IndexType, IdxDim>::get(srcIndex, indices)];
     CUDA_KERNEL_ASSERT(dstIndex < dstAddDimSize);
@@ -852,6 +1660,293 @@ bool indexShouldBeMajor(cuda::detail::TensorInfo<scalar_t, unsigned int> &info,
   return false;
 }
 
+#if defined(USE_ROCM)
+// Sorted-reduction index_add_ for large dim-contiguous workloads on
+// gfx942/gfx950. Returns false when the caller should use indexFunc.
+static bool index_add_sorted_rocm(
+    const Tensor& result,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& source,
+    const Scalar& alpha) {
+  const auto dtype = result.scalar_type();
+  const bool supported_dtype =
+      dtype == at::kHalf || dtype == at::kBFloat16 || dtype == at::kFloat ||
+      dtype == at::kDouble;
+  if (!supported_dtype || !alpha.equal(1) || result.dim() == 0 ||
+      source.dim() != result.dim() || !result.is_contiguous() ||
+      !source.is_contiguous() || !index.is_contiguous() ||
+      index.numel() > std::numeric_limits<int>::max()) {
+    return false;
+  }
+  // The packed bf16/fp16 output atomics need a 4-byte-aligned destination.
+  if ((dtype == at::kBFloat16 || dtype == at::kHalf) &&
+      reinterpret_cast<std::uintptr_t>(result.const_data_ptr()) % 4 != 0) {
+    return false;
+  }
+
+  const int64_t num_indices = index.numel();
+  const int64_t num_rows = result.size(dim);
+  int64_t outer_size = 1;
+  int64_t inner_size = 1;
+  for (const auto d : c10::irange(result.dim())) {
+    if (static_cast<int64_t>(d) < dim) {
+      outer_size *= result.size(d);
+    } else if (static_cast<int64_t>(d) > dim) {
+      inner_size *= result.size(d);
+    }
+  }
+
+  const bool supported_inner_size =
+      inner_size == 128 || inner_size == 256;
+  if (num_indices < INDEX_ADD_SORTED_MIN_SORT_SIZE ||
+      !supported_inner_size) {
+    return false;
+  }
+
+  if (num_rows == 0 || num_rows > std::numeric_limits<int>::max()) {
+    return false;
+  }
+  const auto position_options = index.options().dtype(at::kInt);
+  const int64_t max_segments = std::min(num_indices, num_rows);
+  // Upper bound for grid sizing; the kernels pick the stride on device.
+  const int64_t num_boundaries =
+      (num_indices - 1) / INDEX_ADD_SORTED_SPLIT_CHUNK_SIZE;
+  const int64_t max_candidates = max_segments + num_boundaries;
+  // Queried last: it allocates on every call.
+  if (!at::detail::getCUDAHooks().isGPUArch({"gfx942", "gfx950"})) {
+    return false;
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t multiprocessor_count =
+      at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const Tensor sort_keys = at::empty({num_indices}, position_options);
+  const Tensor sorted_indices = at::empty({num_indices}, position_options);
+  const Tensor original_positions = at::empty({num_indices}, position_options);
+  const Tensor positions = at::empty({num_indices}, position_options);
+  const Tensor segment_offsets = at::empty({max_segments}, position_options);
+  const Tensor num_segments = at::empty({}, index.options().dtype(at::kLong));
+
+  constexpr int prepare_threads = 256;
+  const int prepare_grid = static_cast<int>(std::min<int64_t>(
+      ceil_div(num_indices, static_cast<int64_t>(prepare_threads)),
+      multiprocessor_count * 8));
+  AT_DISPATCH_INDEX_TYPES(
+      index.scalar_type(), "index_add_sorted_prepare_sort", [&] {
+        index_add_sorted_prepare_sort_kernel<index_t>
+            <<<prepare_grid, prepare_threads, 0, stream>>>(
+                index.const_data_ptr<index_t>(),
+                sort_keys.mutable_data_ptr<int32_t>(),
+                positions.mutable_data_ptr<int32_t>(),
+                num_indices,
+                num_rows);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  // rocPRIM's default config merge-sorts up to 1,048,576 items. On gfx950 that
+  // made index_select backward at M = 1,000,000 (bf16/fp16/fp32, D = 128/256)
+  // 59-135 us slower per call than onesweep (median +101 us), so force onesweep.
+  cuda::cub::radix_sort_pairs_onesweep(
+      sort_keys.const_data_ptr<int32_t>(),
+      sorted_indices.mutable_data_ptr<int32_t>(),
+      positions.const_data_ptr<int32_t>(),
+      original_positions.mutable_data_ptr<int32_t>(),
+      num_indices,
+      0,
+      cuda::cub::get_num_bits(num_rows));
+  cuda::cub::unique_by_key(
+      sorted_indices.const_data_ptr<int32_t>(),
+      cccl_counting_iterator<int32_t>{0},
+      segment_offsets.mutable_data_ptr<int32_t>(),
+      num_segments.mutable_data_ptr<int64_t>(),
+      num_indices);
+
+  // Every sorted call can contain a long run, so the long-run passes always
+  // run. The scratch tile must hold at least one feature per long chunk (two
+  // for packed bf16); budgeting the largest such footprint over all supported
+  // dtypes keeps the tile width positive without a dtype-specific check.
+  static_assert(
+      INDEX_ADD_SORTED_MIN_SORT_SIZE >=
+      INDEX_ADD_SORTED_LONG_RUN_SIZE);
+  constexpr int64_t kMinScratchBytesPerChunk = std::max<int64_t>(
+      2 * sizeof(c10::BFloat16), sizeof(double));
+  static_assert(
+      std::numeric_limits<int>::max() / INDEX_ADD_SORTED_CHUNK_SIZE +
+          std::numeric_limits<int>::max() /
+              INDEX_ADD_SORTED_LONG_RUN_SIZE <=
+      INDEX_ADD_SORTED_MAX_SCRATCH_BYTES / kMinScratchBytesPerChunk);
+  const int64_t max_long_chunks =
+      num_indices / INDEX_ADD_SORTED_CHUNK_SIZE +
+      num_indices / INDEX_ADD_SORTED_LONG_RUN_SIZE;
+  // The radix sort has consumed `positions`; reuse its storage.
+  const Tensor& long_chunk_counts = positions;
+  const Tensor long_chunk_offsets = at::empty({max_segments}, position_options);
+  constexpr int metadata_threads = 256;
+  const int metadata_grid = static_cast<int>(std::min<int64_t>(
+      ceil_div(max_segments, static_cast<int64_t>(metadata_threads)),
+      multiprocessor_count * 8));
+  index_add_sorted_long_chunk_counts_kernel
+      <<<metadata_grid, metadata_threads, 0, stream>>>(
+          segment_offsets.const_data_ptr<int32_t>(),
+          num_segments.const_data_ptr<int64_t>(),
+          long_chunk_counts.mutable_data_ptr<int32_t>(),
+          num_indices,
+          max_segments);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  cuda::cub::exclusive_sum(
+      long_chunk_counts.const_data_ptr<int32_t>(),
+      long_chunk_offsets.mutable_data_ptr<int32_t>(),
+      max_segments);
+
+  const bool use_packed_bfloat16 = dtype == at::kBFloat16 &&
+      memory::can_vectorize_up_to<c10::BFloat16>(reinterpret_cast<const char*>(
+          source.const_data_ptr<c10::BFloat16>())) >= 2;
+  const int64_t max_blocks = multiprocessor_count * 8;
+  const int64_t max_work = outer_size * max_candidates;
+  const int64_t feature_plane = outer_size * inner_size;
+
+  const auto with_feature_size = [&](const auto& launch) -> void {
+    if (inner_size == 128) {
+      launch(std::integral_constant<int64_t, 128>{});
+    } else {
+      launch(std::integral_constant<int64_t, 256>{});
+    }
+  };
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      source.scalar_type(),
+      "index_add_sorted",
+      [&] {
+        using acc_t = at::opmath_type<scalar_t>;
+        using index_t = int32_t;
+
+        int64_t scratch_feature_tile = std::min<int64_t>(
+            feature_plane,
+            INDEX_ADD_SORTED_MAX_SCRATCH_BYTES /
+                (max_long_chunks * static_cast<int64_t>(sizeof(scalar_t))));
+        if (use_packed_bfloat16) {
+          scratch_feature_tile -= scratch_feature_tile % 2;
+        }
+        TORCH_INTERNAL_ASSERT(scratch_feature_tile > 0);
+        const Tensor long_scratch =
+            at::empty({max_long_chunks, scratch_feature_tile}, result.options());
+
+        // Explicit return type: a deduced one would instantiate the bf16-only
+        // values_per_thread == 2 kernels from the discarded branch below.
+        const auto launch_long_passes = [&](auto values_per_thread_constant,
+                                            int block_size) -> void {
+          constexpr int values_per_thread =
+              decltype(values_per_thread_constant)::value;
+          const int long_grid = static_cast<int>(std::min<int64_t>(
+              max_long_chunks,
+              multiprocessor_count * (values_per_thread == 2 ? 16 : 8)));
+          for (int64_t feature_offset = 0; feature_offset < feature_plane;
+               feature_offset += scratch_feature_tile) {
+            const int64_t feature_count = std::min<int64_t>(
+                scratch_feature_tile, feature_plane - feature_offset);
+            index_add_sorted_long_first_pass_kernel<
+                scalar_t,
+                acc_t,
+                scalar_t,
+                values_per_thread><<<long_grid, block_size, 0, stream>>>(
+                source.const_data_ptr<scalar_t>(),
+                original_positions.const_data_ptr<int32_t>(),
+                segment_offsets.const_data_ptr<int32_t>(),
+                num_segments.const_data_ptr<int64_t>(),
+                long_chunk_counts.const_data_ptr<int32_t>(),
+                long_chunk_offsets.const_data_ptr<int32_t>(),
+                long_scratch.mutable_data_ptr<scalar_t>(),
+                num_indices,
+                max_segments,
+                max_long_chunks,
+                inner_size,
+                feature_offset,
+                feature_count);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            index_add_sorted_long_final_pass_kernel<
+                scalar_t,
+                acc_t,
+                scalar_t,
+                index_t,
+                values_per_thread><<<
+                long_grid,
+                dim3(
+                    block_size,
+                    INDEX_ADD_SORTED_FINAL_PASS_THREADS / block_size),
+                0,
+                stream>>>(
+                sorted_indices.const_data_ptr<index_t>(),
+                segment_offsets.const_data_ptr<int32_t>(),
+                long_chunk_counts.const_data_ptr<int32_t>(),
+                long_chunk_offsets.const_data_ptr<int32_t>(),
+                long_scratch.const_data_ptr<scalar_t>(),
+                result.mutable_data_ptr<scalar_t>(),
+                num_rows,
+                max_segments,
+                max_long_chunks,
+                inner_size,
+                feature_offset,
+                feature_count);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          }
+        };
+
+        const auto launch_dense = [&](auto vectorized_constant) -> void {
+          constexpr bool vectorized = decltype(vectorized_constant)::value &&
+              std::is_same_v<scalar_t, c10::BFloat16>;
+          with_feature_size([&](auto feature_size_constant) {
+            constexpr int64_t feature_size =
+                decltype(feature_size_constant)::value;
+            constexpr int64_t group_size = feature_size / 8;
+            constexpr int64_t groups_per_block = 256 / group_size;
+            const int dense_grid = static_cast<int>(std::min<int64_t>(
+                ceil_div(max_work, groups_per_block), max_blocks));
+            index_add_sorted_compact_dense_kernel<
+                scalar_t,
+                acc_t,
+                scalar_t,
+                index_t,
+                feature_size,
+                vectorized><<<
+                dense_grid,
+                dim3(group_size, groups_per_block),
+                0,
+                stream>>>(
+                source.const_data_ptr<scalar_t>(),
+                sorted_indices.const_data_ptr<index_t>(),
+                original_positions.const_data_ptr<int32_t>(),
+                segment_offsets.const_data_ptr<int32_t>(),
+                num_segments.const_data_ptr<int64_t>(),
+                long_chunk_counts.const_data_ptr<int32_t>(),
+                result.mutable_data_ptr<scalar_t>(),
+                num_indices,
+                num_rows,
+                outer_size);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          });
+        };
+
+        if (use_packed_bfloat16) {
+          if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+            launch_dense(std::true_type{});
+            launch_long_passes(std::integral_constant<int, 2>{}, 64);
+          } else {
+            TORCH_INTERNAL_ASSERT(false);
+          }
+          return;
+        }
+
+        launch_dense(std::false_type{});
+        launch_long_passes(
+            std::integral_constant<int, 1>{}, static_cast<int>(inner_size));
+      });
+  return true;
+}
+#endif
+
 void index_add_cuda_impl(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const Scalar& alpha, const Tensor& result) {
   if (!result.is_same(self)) {
     result.copy_(self);
@@ -866,9 +1961,9 @@ void index_add_cuda_impl(const Tensor& self, int64_t dim, const Tensor& index, c
   TORCH_CHECK(index.dim() <= MAX_TENSORINFO_DIMS, "tensor has too many (>", MAX_TENSORINFO_DIMS, ") dims");
 
   if (globalContext().deterministicAlgorithms()){
-    torch::List<c10::optional<Tensor>> indices;
+    torch::List<std::optional<Tensor>> indices;
     indices.reserve(dim + 1);
-    for (const auto i: c10::irange(dim)) {
+    for ([[maybe_unused]] const auto i : c10::irange(dim)) {
       indices.emplace_back();
     }
     indices.emplace_back(index.to(at::kLong));
@@ -881,19 +1976,53 @@ void index_add_cuda_impl(const Tensor& self, int64_t dim, const Tensor& index, c
   // total size of the tensor ignoring dimension `dim`;
   // -the number of index we are choosing, which is the total size
   // of the tensor `index`.
-  const ptrdiff_t sliceSize = getSliceSize(self_, dim, index, source_);
-  const ptrdiff_t sourceTotalSize = source.numel();
-  const int64_t selfAddDimSize = self_.size(dim);
-  const ptrdiff_t numIndex = index.numel();
-  const int64_t selfNumel = self_.numel();
+  const uint64_t sliceSize = getSliceSize(self_, dim, index, source_);
+  const uint64_t sourceTotalSize = source.numel();
+  const uint64_t selfAddDimSize = self_.size(dim);
+  const uint64_t numIndex = index.numel();
+  const uint64_t selfNumel = self_.numel();
 
   if (sliceSize == 0) {
     return;
   }
+#if defined(USE_ROCM)
+  if (index_add_sorted_rocm(result, dim, index, source, alpha)) {
+    return;
+  }
+#endif
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const bool indContig = index.is_contiguous();
 
   const int mpc = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+  // Fast path: index_add_(0, idx, src) with alpha == 1 is equivalent to
+  // self.scatter_add_(0, idx.view({n, 1, ...}).expand_as(src), src). Delegate
+  // so scatter_add's own TMA/vectorized eligibility check + dispatch is the
+  // single source of truth (see PR #182675). Pattern from
+  // pytorch/pytorch#180430.
+  // Gated on CUDA >= 12.8: pre-12.8 builds compile out the TMA branch in
+  // scatter_add and fall back to its vectorized atomicAdd path, which
+  // regresses skewed/high-contention workloads vs indexFunc{Small,Large}Index
+  // (warp-per-entry scheduling concentrates atomic contention on hot rows).
+  // Older builds therefore stay on the existing indexFunc dispatch.
+  // index_add supports {complex64, complex128, ComplexHalf, Bool} that
+  // scatter_add does not, so exclude those and let them use indexFunc.
+  // The dtype check is ordered FIRST so short-circuit evaluation skips
+  // alpha.equal(1) for complex `self`, where alpha may itself be a
+  // complex Scalar and the equality comparison would be ill-defined.
+  const auto stype = self_.scalar_type();
+  const bool dtype_supported_by_scatter_add =
+      !c10::isComplexType(stype) && stype != at::kBool;
+  if (dtype_supported_by_scatter_add && dim == 0 &&
+      alpha.equal(1) && numIndex > 0 &&
+      index.dim() <= 1 && indContig) {
+    std::vector<int64_t> idx_shape(source_.dim(), 1);
+    idx_shape[0] = static_cast<int64_t>(numIndex);
+    self_.scatter_add_(0, index.view(idx_shape).expand_as(source_), source_);
+    return;
+  }
+#endif
 
 #define SMALL_INDEX(TENSOR_TYPE, INDICES_TYPE, TYPE, SELF_DIM, SOURCE_DIM, IDX_DIM)     \
   indexFuncSmallIndex<TENSOR_TYPE, INDICES_TYPE, TYPE, SELF_DIM, SOURCE_DIM, IDX_DIM>   \
@@ -914,11 +2043,13 @@ void index_add_cuda_impl(const Tensor& self, int64_t dim, const Tensor& index, c
       selfAddDimSize, selfNumel, reduce_add, alpha_value);                  \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  const dim3 smallIndexGrid(std::min(ceil_div(sliceSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
-  const dim3 smallIndexBlock(std::min(sliceSize, (ptrdiff_t)128));
+  uint64_t defaultMaxBlockThreads = getDefaultMaxThreadsPerBlock();
+  const dim3 smallIndexGrid(std::min(ceil_div(sliceSize, (uint64_t)128), (uint64_t)(mpc * 8)));
+  const dim3 smallIndexBlock(std::min(sliceSize, (uint64_t)128));
 
-  const dim3 largeIndexGrid(std::min(ceil_div(sourceTotalSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
-  const dim3 largeIndexBlock(std::min(sourceTotalSize, (ptrdiff_t)128));
+  const dim3 largeIndexGrid(std::min(ceil_div(sourceTotalSize, (uint64_t)128), (uint64_t)(mpc * 8)));
+  //On ROCm, std::min -> ::min did not work as expected on when outTotalSize>=2147483648
+  dim3 largeIndexBlock( (sourceTotalSize < defaultMaxBlockThreads) ? sourceTotalSize : defaultMaxBlockThreads );
 
   if (cuda::detail::canUse32BitIndexMath(result) &&
       cuda::detail::canUse32BitIndexMath(source) &&
@@ -1054,11 +2185,11 @@ void index_reduce_func_cuda_impl(
   // total size of the tensor ignoring dimension `dim`;
   // -the number of index we are choosing, which is the total size
   // of the tensor `index`.
-  ptrdiff_t sliceSize = getSliceSize(self_, dim, index, source_);
-  ptrdiff_t sourceTotalSize = source.numel();
-  int64_t selfReduceDimSize = self_.size(dim);
-  ptrdiff_t numIndex = index.numel();
-  int64_t selfNumel = self_.numel();
+  uint64_t sliceSize = getSliceSize(self_, dim, index, source_);
+  uint64_t sourceTotalSize = source.numel();
+  uint64_t selfReduceDimSize = self_.size(dim);
+  uint64_t numIndex = index.numel();
+  uint64_t selfNumel = self_.numel();
 
   if (sliceSize == 0) {
     return;
@@ -1067,6 +2198,32 @@ void index_reduce_func_cuda_impl(
   bool indContig = index.is_contiguous();
 
   int mpc = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 11000
+  // Fast path: index_reduce_(0, idx, src, amin/amax) is equivalent to
+  // scatter_reduce_(0, idx.view({n, 1, ...}).expand_as(src), src). Reuse the
+  // scatter path so eligibility and architecture-specific dispatch remain in one place.
+  // For include_self=False, the identity initialization above has already
+  // replaced the indexed rows, so the delegated reduction includes that state.
+  const auto stype = self_.scalar_type();
+  const bool dtype_supported_by_scatter_reduce =
+      stype == at::kHalf || stype == at::kBFloat16;
+  const bool minmax_reduce =
+      reduce == ReductionType::MAX || reduce == ReductionType::MIN;
+  const bool contiguous_dim0_rows = self_.is_contiguous() && source_.is_contiguous();
+  const int device_major = at::cuda::getCurrentDeviceProperties()->major;
+  const bool row_size_supported = sliceSize * self_.element_size() >= 16 &&
+      (sliceSize * self_.element_size()) % 16 == 0;
+  if (dtype_supported_by_scatter_reduce && minmax_reduce && contiguous_dim0_rows &&
+      row_size_supported && device_major >= 8 && dim == 0 && numIndex > 0 && index.dim() == 1 &&
+      indContig && source_.dim() > 0 &&
+      source_.size(0) == static_cast<int64_t>(numIndex)) {
+    self_.scatter_reduce_(
+        0, index.view({static_cast<int64_t>(numIndex), 1}).expand_as(source_), source_,
+        reduce == ReductionType::MAX ? "amax" : "amin", /*include_self=*/true);
+    return;
+  }
+#endif
 
 #define SMALL_INDEX(TENSOR_TYPE, INDICES_TYPE, TYPE, SELF_DIM, SOURCE_DIM, IDX_DIM)                  \
   indexFuncSmallIndex<TENSOR_TYPE, INDICES_TYPE, TYPE, SELF_DIM, SOURCE_DIM, IDX_DIM>                \
@@ -1087,11 +2244,13 @@ void index_reduce_func_cuda_impl(
       selfReduceDimSize, selfNumel, reduce_func, alpha_value);                           \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  dim3 smallIndexGrid(std::min(ceil_div(sliceSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
-  dim3 smallIndexBlock(std::min(sliceSize, (ptrdiff_t)128));
+  uint64_t defaultMaxBlockThreads = getDefaultMaxThreadsPerBlock();
+  dim3 smallIndexGrid(std::min(ceil_div(sliceSize, (uint64_t)128), (uint64_t)(mpc * 8)));
+  dim3 smallIndexBlock(std::min(sliceSize, (uint64_t)128));
 
-  dim3 largeIndexGrid(std::min(ceil_div(sourceTotalSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
-  dim3 largeIndexBlock(std::min(sourceTotalSize, (ptrdiff_t)128));
+  dim3 largeIndexGrid(std::min(ceil_div(sourceTotalSize, (uint64_t)128), (uint64_t)(mpc * 8)));
+  //On ROCm, std::min -> ::min did not work as expected on when outTotalSize>=2147483648
+  dim3 largeIndexBlock( (sourceTotalSize < defaultMaxBlockThreads) ? sourceTotalSize : defaultMaxBlockThreads );
 
   if (cuda::detail::canUse32BitIndexMath(result) &&
       cuda::detail::canUse32BitIndexMath(source) &&
@@ -1174,6 +2333,23 @@ void index_reduce_func_cuda_impl(
 #undef LARGE_INDEX
 }
 
+TORCH_IMPL_FUNC(index_copy_cuda_out)
+(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const Tensor& result) {
+  // Like index_add, delegate row copies to scatter's fast-path dispatch.
+  if (dim == 0 && index.is_contiguous() && index.numel() > 1 &&
+      source.nbytes() / index.numel() >= kFastScatterMinSliceBytes &&
+      !globalContext().deterministicAlgorithms()) {
+    if (!result.is_same(self)) {
+      result.copy_(self);
+    }
+    std::vector<int64_t> index_shape(source.dim(), 1);
+    index_shape[0] = index.numel();
+    result.scatter_(dim, index.view(index_shape).expand_as(source), source);
+    return;
+  }
+  index_copy_out_impl(self, dim, index, source, result);
+}
+
 TORCH_IMPL_FUNC(index_add_cuda_out)
 (const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const Scalar& alpha, const Tensor& result) {
   index_add_cuda_impl(self, dim, index, source, alpha, result);
@@ -1184,7 +2360,7 @@ TORCH_IMPL_FUNC(index_reduce_cuda_out)
  int64_t dim,
  const Tensor& index,
  const Tensor& source,
- const c10::string_view reduce,
+ const std::string_view reduce,
  bool include_self,
  const Tensor& result) {
   TORCH_WARN_ONCE("index_reduce() is in beta and the API may change at any time.");
@@ -1253,52 +2429,6 @@ __global__ void indexSelectSmallIndex(cuda::detail::TensorInfo<T, IndexType> dst
   }
 }
 
-// We prefer this kernel to balance parallelism across index points,
-// if there are a large number of indices.
-// This kernel in fact works for all choices of problem size, but if
-// the number of indices chosen is small, then the
-// indexSelectSmallIndex kernel is a better choice to reduce memory
-// accesses.
-template <typename T, typename IndicesType, typename IndexType, int DstDim, int SrcDim, int IdxDim,
-          bool IndexIsMajor>
-__global__ void indexSelectLargeIndex(cuda::detail::TensorInfo<T, IndexType> dst,
-                                      cuda::detail::TensorInfo<const T, IndexType> src,
-                                      cuda::detail::TensorInfo<const IndicesType, IndexType> indices,
-                                      int dstSelectDim,
-                                      int srcSelectDim,
-                                      IndexType totalSize,
-                                      IndexType innerSize,
-                                      int64_t srcSelectDimSize) {
-  // We stride over the output including the indexed dimension
-  // (totalSize), and calculate the destination index point based on that
-  for (IndexType linearIndex = blockIdx.x * blockDim.x + threadIdx.x;
-       linearIndex < totalSize;
-       linearIndex += gridDim.x * blockDim.x) {
-    IndexType dstIndex, elementInSlice;
-    if (IndexIsMajor) {
-      dstIndex = linearIndex / innerSize;
-      elementInSlice = linearIndex % innerSize;
-    }
-    else {
-      elementInSlice = linearIndex / innerSize;
-      dstIndex = linearIndex % innerSize;
-    }
-
-    IndexType srcIndex =
-      indices.data[cuda::detail::IndexToOffset<const IndicesType, IndexType, IdxDim>::get(dstIndex, indices)];
-    CUDA_KERNEL_ASSERT(srcIndex < srcSelectDimSize);
-
-    IndexType dstOffset =
-      cuda::detail::IndexToOffset<T, IndexType, DstDim>::get(elementInSlice, dst);
-    dstOffset += dstIndex * dst.strides[dstSelectDim];
-
-    IndexType srcOffset =
-      cuda::detail::IndexToOffset<const T, IndexType, SrcDim>::get(elementInSlice, src);
-    srcOffset += srcIndex * src.strides[srcSelectDim];
-
-    dst.data[dstOffset] = src.data[srcOffset];
-  }
-}
 
 namespace {
 
@@ -1315,16 +2445,18 @@ tensorInfoLegacyIfScalar(cuda::detail::TensorInfo<T, IndexType> ti) {
   return ti;
 }
 
+
 }
+
 
 template <typename scalar_t>
 void index_select_out_cuda_impl(
     Tensor& out,
     const Tensor& self,
-    long dim,
+    int64_t dim,
     const Tensor& index) {
-  ptrdiff_t numIndices = index.numel();
-  int selfDims = self.dim() == 0 ? 1 : self.dim();
+  uint64_t numIndices = index.numel();
+  auto selfDims = self.dim() == 0 ? 1 : self.dim();
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -1345,7 +2477,7 @@ void index_select_out_cuda_impl(
     at::native::resize_output(out, newSize);
   }
 
-  ptrdiff_t outTotalSize = out.numel();
+  uint64_t outTotalSize = out.numel();
   if (outTotalSize == 0) {
     return;
   }
@@ -1357,8 +2489,8 @@ void index_select_out_cuda_impl(
   // total size of the tensor ignoring dimension `dim`;
   // -the number of indices we are choosing, which is the total size
   // of the tensor `indices`.
-  int64_t selfSelectDimSize = self.dim() == 0 ? 1 : self.size(dim);
-  ptrdiff_t sliceSize = outTotalSize / numIndices;
+  uint64_t selfSelectDimSize = self.dim() == 0 ? 1 : self.size(dim);
+  uint64_t sliceSize = outTotalSize / numIndices;
 
   int mpc = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
@@ -1370,25 +2502,18 @@ void index_select_out_cuda_impl(
       selfSelectDimSize);                                                               \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-#define LARGE_INDEX(TENSOR_TYPE, INDICES_TYPE, TYPE,                           \
-                    DST_DIM, SRC_DIM, IDX_DIM, IDX_IS_MAJOR)                   \
-  indexSelectLargeIndex<TENSOR_TYPE, INDICES_TYPE, TYPE,                       \
-                        DST_DIM, SRC_DIM, IDX_DIM, IDX_IS_MAJOR>               \
-    <<<largeIndexGrid, largeIndexBlock, 0, stream>>>(                          \
-      outInfo, selfInfo, indicesInfo,                                          \
-      outSelectDim, selfSelectDim, static_cast<TYPE>(outTotalSize),            \
-      static_cast<TYPE>((IDX_IS_MAJOR) ? sliceSize : numIndices),              \
-      selfSelectDimSize);                                                      \
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  uint64_t defaultMaxBlockThreads = getDefaultMaxThreadsPerBlock();
+  dim3 smallIndexGrid(std::min(ceil_div(sliceSize, defaultMaxBlockThreads), (uint64_t) (mpc * 8)));
+  dim3 smallIndexBlock(std::min(sliceSize, defaultMaxBlockThreads));
 
-  dim3 smallIndexGrid(std::min(ceil_div(sliceSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
-  dim3 smallIndexBlock(std::min(sliceSize, (ptrdiff_t)128));
-
-  dim3 largeIndexGrid(std::min(ceil_div(outTotalSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
-  dim3 largeIndexBlock(std::min(outTotalSize, (ptrdiff_t)128));
+  // SmallIndexKernel is more performant when the number of indices is small, and pre-loading
+  // the index reduces memory accesses. When the number of indices is large, we avoid that
+  // and increase parallelism by calling gather_out which is a generalization of index_select
   if (cuda::detail::canUse32BitIndexMath(out) &&
       cuda::detail::canUse32BitIndexMath(self) &&
-      cuda::detail::canUse32BitIndexMath(index)) {
+      cuda::detail::canUse32BitIndexMath(index) &&
+      numIndices <= 16
+      ) {
     auto outInfo = tensorInfoLegacyIfScalar(cuda::detail::getTensorInfo<scalar_t, unsigned int>(out));
     int outSelectDim = outInfo.collapseDims(dim);
     outInfo.reduceDim(outSelectDim);
@@ -1403,55 +2528,25 @@ void index_select_out_cuda_impl(
 
       // A reasonable choice for when to have each thread iterate over
       // indices to choose
-      if (numIndices <= 16) {
-        if (outInfo.dims == 1 && selfInfo.dims == 1 && indContig) {
-          SMALL_INDEX(scalar_t, index_t, unsigned int, 1, 1, -2);
-        } else if (outInfo.dims == 2 && selfInfo.dims == 2 && indContig) {
-          SMALL_INDEX(scalar_t, index_t, unsigned int, 2, 2, -2);
-        } else if (outInfo.dims == 3 && selfInfo.dims == 3 && indContig) {
-          SMALL_INDEX(scalar_t, index_t, unsigned int, 3, 3, -2);
-        } else {
-          SMALL_INDEX(scalar_t, index_t, unsigned int, -1, -1, -1);
-        }
+      if (outInfo.dims == 1 && selfInfo.dims == 1 && indContig) {
+        SMALL_INDEX(scalar_t, index_t, unsigned int, 1, 1, -2);
+      } else if (outInfo.dims == 2 && selfInfo.dims == 2 && indContig) {
+        SMALL_INDEX(scalar_t, index_t, unsigned int, 2, 2, -2);
+      } else if (outInfo.dims == 3 && selfInfo.dims == 3 && indContig) {
+        SMALL_INDEX(scalar_t, index_t, unsigned int, 3, 3, -2);
       } else {
-        bool indexIsMajor = indexShouldBeMajor(outInfo, outSelectDim);
-
-        if (outInfo.dims == 1 && selfInfo.dims == 1 && indContig) {
-          LARGE_INDEX(scalar_t, index_t, unsigned int, 1, 1, -2, true);
-        } else if (outInfo.dims == 2 && selfInfo.dims == 2 && indContig) {
-          if (indexIsMajor) {
-            LARGE_INDEX(scalar_t, index_t, unsigned int, 2, 2, -2, true);
-          } else {
-            LARGE_INDEX(scalar_t, index_t, unsigned int, 2, 2, -2, false);
-          }
-        } else if (outInfo.dims == 3 && selfInfo.dims == 3 && indContig) {
-          if (indexIsMajor) {
-            LARGE_INDEX(scalar_t, index_t, unsigned int, 3, 3, -2, true);
-          } else {
-            LARGE_INDEX(scalar_t, index_t, unsigned int, 3, 3, -2, false);
-          }
-        } else {
-          LARGE_INDEX(scalar_t, index_t, unsigned int, -1, -1, -1, true);
-        }
+        SMALL_INDEX(scalar_t, index_t, unsigned int, -1, -1, -1);
       }
     });
   } else {
-    auto outInfo = tensorInfoLegacyIfScalar(cuda::detail::getTensorInfo<scalar_t, uint64_t>(out));
-    int outSelectDim = outInfo.collapseDims(dim);
-    outInfo.reduceDim(outSelectDim);
-
-    auto selfInfo = tensorInfoLegacyIfScalar(cuda::detail::getTensorInfo<const scalar_t, uint64_t>(self));
-    int selfSelectDim = selfInfo.collapseDims(dim);
-    selfInfo.reduceDim(selfSelectDim);
-    AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "index_select_out_cuda_impl", [&] () {
-      auto indicesInfo = tensorInfoLegacyIfScalar(cuda::detail::getTensorInfo<const index_t, uint64_t>(index));
-      indicesInfo.collapseDims();
-
-      LARGE_INDEX(scalar_t, index_t, uint64_t, -1, -1, -1, true);
-    });
+    std::vector<int64_t> tmpSize(newSize.size(), 1);
+    if (self.dim() > 0) {
+      tmpSize[dim] = numIndices;
+    }
+    at::gather_out(out, self, dim, index.view(tmpSize).expand(newSize));
+    return;
   }
 #undef SMALL_INDEX
-#undef LARGE_INDEX
 }
 } // anonymous namespace
 
@@ -1460,7 +2555,7 @@ Tensor& index_select_out_cuda(
     int64_t dim,
     const Tensor& index,
     Tensor& out) {
-  static constexpr string_view DIM_WARNING =
+  static constexpr std::string_view DIM_WARNING =
       "Tensor too large or too many (> 25) dimensions";
   TORCH_CHECK(
       at::cuda::check_device({out, self, index}),
@@ -1472,10 +2567,10 @@ Tensor& index_select_out_cuda(
   dim = at::maybe_wrap_dim(dim, self);
   TORCH_CHECK(self.dim() <= MAX_TENSORINFO_DIMS, DIM_WARNING);
   TORCH_CHECK(index.dim() <= MAX_TENSORINFO_DIMS, DIM_WARNING);
-  if (self.is_quantized()){
+  if (self.is_quantized()) {
     TORCH_CHECK(
-      self.qscheme() == kPerTensorAffine,
-      "Only per_tensor quantized quantized tensors are supported by index_select.")
+        self.qscheme() == kPerTensorAffine,
+        "Only per_tensor quantized quantized tensors are supported by index_select.")
     AT_DISPATCH_QINT_TYPES(out.scalar_type(), "index_select_quant_cuda", [&] {
       index_select_out_cuda_impl<scalar_t>(out, self, dim, index);
     });
@@ -1483,13 +2578,17 @@ Tensor& index_select_out_cuda(
     AT_DISPATCH_V2(
         out.scalar_type(),
         "index_select_cuda",
-        AT_WRAP([&] { index_select_out_cuda_impl<scalar_t>(out, self, dim, index); }),
-        AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES),
+        AT_WRAP([&] {
+          index_select_out_cuda_impl<scalar_t>(out, self, dim, index);
+        }),
+        AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+        AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES),
+        AT_EXPAND(AT_FLOAT8_TYPES),
         kComplexHalf,
+        kBComplex32,
         kHalf,
         kBool,
-        kBFloat16
-        );
+        kBFloat16);
   }
 
   return out;
@@ -1513,8 +2612,8 @@ Tensor index_select_quantized_cuda(const Tensor& self, int64_t dim, const Tensor
 namespace {
 
 void masked_fill_kernel(TensorIterator& iter, const Scalar& value) {
-  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(
-      kBool, kHalf, kBFloat16, kComplexHalf, iter.common_dtype(), "masked_fill_", [&]() {
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND5(
+      kBool, kHalf, kBFloat16, kComplexHalf, kBComplex32, iter.common_dtype(), "masked_fill_", [&]() {
         const auto value_ = value.to<scalar_t>();
         gpu_kernel(
             iter, [value_] GPU_LAMBDA(scalar_t self, bool mask) -> scalar_t {
@@ -1549,7 +2648,7 @@ void masked_fill_kernel_quantized(TensorIterator& iter, const Scalar& value, dou
     });
 }
 
-REGISTER_CUDA_DISPATCH(masked_fill_kernel_quantized_stub, &masked_fill_kernel_quantized);
+REGISTER_CUDA_DISPATCH(masked_fill_kernel_quantized_stub, &masked_fill_kernel_quantized)
 
 } // anonymous namespace
 
@@ -1558,7 +2657,6 @@ Tensor & masked_fill__cuda(Tensor& self, const Tensor & mask, const Scalar& valu
     mask.device(), " and self on ", self.device());
   TORCH_CHECK(mask.scalar_type() == kBool,
     "masked_fill only supports boolean masks, but got dtype ", mask.scalar_type());
-  auto maybe_outnames = namedinference::broadcast_to_outnames(self, mask, "masked_fill_");
   if (at::has_internal_overlap(self) == MemOverlap::Yes) {
     TORCH_WARN(
       "Use of masked_fill_ on expanded tensors is deprecated. "
@@ -1579,7 +2677,6 @@ Tensor & masked_fill__cuda(Tensor& self, const Tensor & mask, const Scalar& valu
       .build();
 
   masked_fill_kernel(iter, value);
-  namedinference::propagate_names_if_nonempty(self, maybe_outnames);
   return self;
 }
 
@@ -1594,36 +2691,6 @@ Tensor & masked_fill__cuda(Tensor& self, const Tensor & mask, const Tensor & val
   return masked_fill__cuda(self, mask, value.item());
 }
 
-namespace {
-
-// ForwardIt: only legacy random access iterator is supported.
-template<class ForwardIt, class T, bool is_lower = true>
-static __host__ __device__ __forceinline__
-ForwardIt find_bound(ForwardIt first, ForwardIt last, const T& value) {
-    ForwardIt it;
-    typename std::iterator_traits<ForwardIt>::difference_type count, step;
-    // NOTE: std::distance(first, last) compiles but produces wrong results here,
-    // so only legacy random access iterators are safe in this code.
-    count = last - first;
-
-    while (count > 0) {
-      it = first;
-      step = count / 2;
-      // avoiding std::advance(it, step),
-      // although it does work unlike std::distance
-      it += step;
-      if (is_lower ? *it < value : value >= *it) {
-        first = ++it;
-        count -= step + 1;
-      }
-      else {
-        count = step;
-      }
-    }
-    return first;
-}
-
-}
 
 Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
   const auto ndim = self.dim();
@@ -1683,12 +2750,12 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
 
     const auto dim_indices = indices[dim].contiguous();
     const auto idx_nneg_index = at::arange(index_len, nneg_index.options());
-    const auto idx_dim_indices = at::arange(nnz, dim_indices.options());
+    auto idx_dim_indices = at::arange(nnz, dim_indices.options());
 
     Tensor sorted_dim_indices, argsort_dim_indices;
     std::tie(sorted_dim_indices, argsort_dim_indices) = [&]() -> std::tuple<Tensor, Tensor> {
       if (dim == 0 && self.is_coalesced()) {
-        return std::make_tuple(dim_indices, idx_dim_indices);
+        return std::make_tuple(dim_indices, std::move(idx_dim_indices));
       }
       else {
         return dim_indices.sort();
@@ -1698,8 +2765,8 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
     Tensor intrsc_counts_nneg_index;
     Tensor intrsc_first_match_nneg_index;
     std::tie(intrsc_counts_nneg_index, intrsc_first_match_nneg_index) = [&]() -> std::tuple<Tensor, Tensor> {
-      auto intrsc_counts_nneg_index = at::zeros_like(nneg_index);
-      auto intrsc_first_match_nneg_index = at::zeros_like(nneg_index);
+      auto intrsc_counts_nneg_index = at::empty_like(nneg_index);
+      auto intrsc_first_match_nneg_index = at::empty_like(nneg_index);
 
       auto iter = TensorIteratorConfig()
         .add_output(intrsc_first_match_nneg_index)
@@ -1715,12 +2782,12 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
               [ptr_intrsc_counts_nneg_index, ptr_sorted_dim_indices, nnz] GPU_LAMBDA (
                 index_t idx_val, index_t idx_idx
               ) -> index_t {
-                auto* lb = find_bound<const index_t*, index_t, true>(
+                auto* lb = at::cuda::detail::find_bound<const index_t*, index_t, true>(
                   ptr_sorted_dim_indices,
                   ptr_sorted_dim_indices + nnz,
                   idx_val
                 );
-                auto* ub = find_bound<const index_t*, index_t, false>(
+                auto* ub = at::cuda::detail::find_bound<const index_t*, index_t, false>(
                   ptr_sorted_dim_indices,
                   ptr_sorted_dim_indices + nnz,
                   idx_val
@@ -1733,7 +2800,9 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
           );
       });
 
-      return std::make_tuple(intrsc_counts_nneg_index, intrsc_first_match_nneg_index);
+      return std::make_tuple(
+          std::move(intrsc_counts_nneg_index),
+          std::move(intrsc_first_match_nneg_index));
     }();
 
     // Unavoidable sync since the shape of the result is not known in advance
@@ -1744,8 +2813,7 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
       return make_output(empty_idx, empty_idx);
     }
 
-    Tensor selected_dim_indices, res_dim_indices;
-    std::tie(selected_dim_indices, res_dim_indices) = [&]() -> std::tuple<Tensor, Tensor> {
+    auto [selected_dim_indices, res_dim_indices] = [&]() -> std::tuple<Tensor, Tensor> {
       auto res_dim_indices = at::empty({res_len}, nneg_index.options());
       auto selected_dim_indices = at::empty_like(res_dim_indices);
       auto selected_dim_indices_offsets = intrsc_counts_nneg_index.cumsum(0)
@@ -1787,7 +2855,8 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
           );
       });
 
-      return std::make_tuple(selected_dim_indices, res_dim_indices);
+      return std::make_tuple(
+          std::move(selected_dim_indices), std::move(res_dim_indices));
     }();
 
     return make_output(selected_dim_indices, res_dim_indices);

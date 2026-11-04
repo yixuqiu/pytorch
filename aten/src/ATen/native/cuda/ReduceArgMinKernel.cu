@@ -11,9 +11,7 @@
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/native/cuda/Reduce.cuh>
 
-#include <ATen/Dispatch.h>
-#include <ATen/NumericUtils.h>
-#include <ATen/cuda/NumericLimits.cuh>
+#include <thrust/pair.h>
 
 namespace at::native {
 
@@ -41,6 +39,6 @@ void argmin_kernel_cuda(TensorIterator& iter) {
   }
 }
 
-REGISTER_DISPATCH(argmin_stub, &argmin_kernel_cuda);
+REGISTER_DISPATCH(argmin_stub, &argmin_kernel_cuda)
 
 } // namespace at::native

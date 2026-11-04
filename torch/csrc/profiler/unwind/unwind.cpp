@@ -1,34 +1,35 @@
+#include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
+#include <c10/util/env.h>
 #include <torch/csrc/profiler/unwind/unwind.h>
-#include <torch/csrc/utils/cpp_stacktraces.h>
 
-#if !defined(__linux__) || !defined(__x86_64__) || !defined(__has_include) || \
-    !__has_include("ext/stdio_filebuf.h")
+#if !defined(__linux__) || !(defined(__x86_64__) || defined(__aarch64__)) || \
+    !defined(__has_include) || !__has_include("ext/stdio_filebuf.h")
 namespace torch::unwind {
 std::vector<void*> unwind() {
-  TORCH_CHECK(
-      false,
-      "record_context_cpp is not support on non-linux non-x86_64 platforms");
+  TORCH_WARN_ONCE(
+      "record_context_cpp is not supported on this platform (requires linux x86_64 or aarch64)");
+  return {};
 }
 
-c10::optional<std::pair<std::string, uint64_t>> libraryFor(void* addr) {
-  TORCH_CHECK(
-      false,
-      "record_context_cpp is not support on non-linux non-x86_64 platforms");
+std::optional<std::pair<std::string, uint64_t>> libraryFor(void* addr) {
+  TORCH_WARN_ONCE(
+      "record_context_cpp is not supported on this platform (requires linux x86_64 or aarch64)");
+  return {};
 }
 
 #ifndef FBCODE_CAFFE2
-std::vector<Frame> symbolize(const std::vector<void*>& frames) {
-  TORCH_CHECK(
-      false,
-      "record_context_cpp is not support on non-linux non-x86_64 platforms");
+std::vector<Frame> symbolize(const std::vector<void*>& frames, Mode mode) {
+  TORCH_WARN_ONCE(
+      "record_context_cpp is not supported on this platform (requires linux x86_64 or aarch64)");
+  return {};
 }
 #endif
 
 Stats stats() {
-  TORCH_CHECK(
-      false,
-      "record_context_cpp is not support on non-linux non-x86_64 platforms");
+  TORCH_WARN_ONCE(
+      "record_context_cpp is not supported on this platform (requires linux x86_64 or aarch64)");
+  return {};
 }
 
 } // namespace torch::unwind
@@ -36,28 +37,47 @@ Stats stats() {
 #else
 
 #include <c10/util/flat_hash_map.h>
+#include <dlfcn.h>
 #include <elf.h>
 #include <link.h>
 #include <linux/limits.h>
+#include <pthread.h>
 #include <algorithm>
 #include <climits>
+#include <cstring>
+#include <limits>
+#include <numeric>
 #include <vector>
 
 #include <c10/util/irange.h>
-#include <cxxabi.h>
 #include <torch/csrc/profiler/unwind/communicate.h>
-#include <torch/csrc/profiler/unwind/dwarf_enums.h>
 #include <torch/csrc/profiler/unwind/eh_frame_hdr.h>
+#include <torch/csrc/profiler/unwind/fast_symbolizer.h>
 #include <torch/csrc/profiler/unwind/fde.h>
 #include <torch/csrc/profiler/unwind/unwinder.h>
 #include <shared_mutex>
 
+#if defined(__aarch64__)
+extern "C" void unwind_c(
+    std::vector<void*>* result,
+    uintptr_t fp,
+    uintptr_t lr);
+#else
+extern "C" void unwind_c(std::vector<void*>* result, int64_t rsp, int64_t rbp);
+#endif
+extern "C" void unwind_entry(std::vector<void*>* result);
+
+namespace torch::unwind {
 struct UpgradeExclusive {
   UpgradeExclusive(std::shared_lock<std::shared_timed_mutex>& rdlock)
       : rdlock_(rdlock) {
     rdlock_.unlock();
     rdlock_.mutex()->lock();
   }
+  UpgradeExclusive(const UpgradeExclusive&) = delete;
+  UpgradeExclusive(UpgradeExclusive&&) = delete;
+  UpgradeExclusive& operator=(const UpgradeExclusive&) = delete;
+  UpgradeExclusive& operator=(UpgradeExclusive&&) = delete;
   ~UpgradeExclusive() {
     rdlock_.mutex()->unlock();
     rdlock_.lock();
@@ -72,15 +92,20 @@ struct LibraryInfo {
   LibraryInfo(
       std::string name,
       uint64_t load_bias,
+      uint64_t first_addr,
       uint64_t last_addr,
       void* eh_frame_hdr_ptr_)
       : name_(std::move(name)),
         load_bias_(load_bias),
+        first_addr_(first_addr),
         last_addr_(last_addr),
         eh_frame_hdr_(eh_frame_hdr_ptr_) {}
 
   uint64_t load_bias() const {
     return load_bias_;
+  }
+  uint64_t first_addr() const {
+    return first_addr_;
   }
   uint64_t last_addr() const {
     return last_addr_;
@@ -89,7 +114,8 @@ struct LibraryInfo {
     void* fde_data = eh_frame_hdr_.entryForAddr(addr);
     FDE fde(fde_data, name().c_str(), load_bias());
     TableState state = fde.readUpTo(addr);
-    return Unwinder(state.cfa, state.registers[D_RIP], state.registers[D_RBP]);
+    return Unwinder(
+        state.cfa, state.registers[D_RET_ADDR], state.registers[D_FRAME_PTR]);
   }
   const std::string& name() const {
     return name_;
@@ -97,7 +123,8 @@ struct LibraryInfo {
 
  private:
   std::string name_;
-  uint64_t load_bias_; // addr >= load_bias_
+  uint64_t load_bias_;
+  uint64_t first_addr_; // addr >= first_addr_
   uint64_t last_addr_; // addr < last_addr_
   EHFrameHdr eh_frame_hdr_;
 };
@@ -114,15 +141,17 @@ static const char* process_name() {
 }
 
 struct Version {
-  uint64_t adds_ = LONG_LONG_MAX;
-  uint64_t subs_ = LONG_LONG_MAX;
+  uint64_t adds_ = LLONG_MAX;
+  uint64_t subs_ = LLONG_MAX;
 };
 
 struct UnwindCache {
   Version currentVersion() {
     Version r;
     dl_iterate_phdr(
-        [](struct dl_phdr_info* info, size_t size, void* data) {
+        [](struct dl_phdr_info* info,
+           size_t size [[maybe_unused]],
+           void* data) {
           Version* v = (Version*)data;
           v->adds_ = info->dlpi_adds;
           v->subs_ = info->dlpi_subs;
@@ -136,27 +165,31 @@ struct UnwindCache {
     all_libraries_.clear();
     ip_cache_.clear();
     dl_iterate_phdr(
-        [](struct dl_phdr_info* info, size_t size, void* data) {
+        [](struct dl_phdr_info* info,
+           size_t size [[maybe_unused]],
+           void* data) {
           auto self = (UnwindCache*)data;
+          uint64_t load_bias = info->dlpi_addr;
+          uint64_t first_addr = std::numeric_limits<uint64_t>::max();
           uint64_t last_addr = 0;
           auto segments = (Elf64_Phdr*)info->dlpi_phdr;
           for (auto i : c10::irange(info->dlpi_phnum)) {
             if (segments[i].p_type == PT_LOAD) {
-              auto begin = ((uint64_t)info->dlpi_addr + segments[i].p_vaddr);
-              auto end = (begin + segments[i].p_memsz);
+              auto begin = load_bias + segments[i].p_vaddr;
+              auto end = begin + segments[i].p_memsz;
+              first_addr = std::min(begin, first_addr);
               last_addr = std::max(end, last_addr);
-            }
-            if (segments[i].p_type == PT_GNU_EH_FRAME) {
+            } else if (segments[i].p_type == PT_GNU_EH_FRAME) {
               std::string library_name = info->dlpi_name;
               if (library_name.empty()) {
                 library_name = process_name();
               }
-              auto eh_frame_hdr =
-                  // NOLINTNEXTLINE(performance-no-int-to-ptr)
-                  (void*)(segments[i].p_vaddr + info->dlpi_addr);
+              // NOLINTNEXTLINE(performance-no-int-to-ptr)
+              auto eh_frame_hdr = (void*)(load_bias + segments[i].p_vaddr);
               self->all_libraries_.emplace_back(
                   std::move(library_name),
-                  info->dlpi_addr,
+                  load_bias,
+                  first_addr,
                   last_addr,
                   eh_frame_hdr);
               return 0;
@@ -170,7 +203,7 @@ struct UnwindCache {
         all_libraries_.begin(),
         all_libraries_.end(),
         [](const LibraryInfo& lhs, const LibraryInfo& rhs) {
-          return lhs.load_bias() < rhs.load_bias();
+          return lhs.first_addr() < rhs.first_addr();
         });
   }
   void checkRefresh(std::shared_lock<std::shared_timed_mutex>& rdlock) {
@@ -197,7 +230,7 @@ struct UnwindCache {
     Unwinder unwinder = Unwinder::unknown();
     try {
       unwinder = libraryFor(addr).unwinderFor(addr);
-    } catch (UnwindError& err) {
+    } catch ([[maybe_unused]] unwind::UnwindError& err) {
       // because unwinders are cached this will only print
       // once per frame that cannot be unwound.
       TORCH_WARN("Unsupported unwinding pattern: ", err.what());
@@ -226,7 +259,7 @@ struct UnwindCache {
   const LibraryInfo& libraryFor(uint64_t addr) {
     auto* r = findLibraryFor(addr);
     if (!r) {
-      for (const auto& l : libraries_with_no_unwind_) {
+      for ([[maybe_unused]] const auto& l : libraries_with_no_unwind_) {
         TORCH_WARN("Did not find a PT_GNU_EH_FRAME segment for ", l);
       }
       libraries_with_no_unwind_.clear();
@@ -247,21 +280,21 @@ struct UnwindCache {
     uint64_t low = 0;
     uint64_t high = all_libraries_.size();
     while (low + 1 < high) {
-      auto mid = (low + high) / 2;
-      if (addr < all_libraries_.at(mid).load_bias()) {
+      auto mid = std::midpoint(low, high);
+      if (addr < all_libraries_.at(mid).first_addr()) {
         high = mid;
       } else {
         low = mid;
       }
     }
     LibraryInfo* r = &all_libraries_.at(low);
-    if (addr < r->load_bias() || addr >= r->last_addr()) {
+    if (addr < r->first_addr() || addr >= r->last_addr()) {
       return nullptr;
     }
     return r;
   }
 
-  // sorted by load_bias
+  // sorted by first_addr
   std::vector<LibraryInfo> all_libraries_;
   ska::flat_hash_map<uint64_t, Unwinder> ip_cache_;
 
@@ -276,77 +309,43 @@ struct UnwindCache {
 static UnwindCache unwind_cache;
 static std::shared_timed_mutex cache_mutex_;
 
-extern "C" void unwind_c(std::vector<void*>* result, int64_t rsp, int64_t rbp);
-extern "C" void unwind_c(std::vector<void*>* result, int64_t rsp, int64_t rbp) {
-  std::shared_lock lock(cache_mutex_);
-  UnwindState state{};
-  // NOLINTNEXTLINE(performance-no-int-to-ptr)
-  state.rip = *(int64_t*)(rsp);
-  // +8 because we saved rsp after the return address was already pushed
-  // to the stack
-  state.rsp = rsp + 8;
-  state.rbp = rbp;
-  unwind_cache.checkRefresh(lock);
-  while (true) { // unwind for _start sets rip as being undefined
-    // NOLINTNEXTLINE(performance-no-int-to-ptr)
-    result->push_back((void*)state.rip);
-    const Unwinder& uw = unwind_cache.unwinderFor(state.rip, lock);
-    if (uw.terminator()) {
-      if (uw.isUnknown()) {
-        result->push_back(nullptr);
-      }
-      break;
-    }
-    state = uw.run(state);
-  }
-}
-
-extern "C" void unwind_entry(std::vector<void*>* result);
-
-// calling convention puts the first three pointer/int64_t arguments in
-// rdi rsi rdx (all caller-saved)
-// rdi already holds the pointer to the result vector
-// we add arguments for current rsp and rbp and then tail call
-// into unwind_c
-__asm__(
-    ".global unwind_entry\n"
-    "unwind_entry:\n"
-    "mov %rsp, %rsi;\n"
-    "mov %rbp, %rdx;\n"
-    "jmp unwind_c;\n");
-
-namespace torch::unwind {
 std::vector<void*> unwind() {
   std::vector<void*> frames;
   unwind_entry(&frames);
   return frames;
 }
 
-c10::optional<std::pair<std::string, uint64_t>> libraryFor(void* addr) {
+std::optional<std::pair<std::string, uint64_t>> libraryFor(void* addr) {
   if (!addr) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   std::shared_lock lock(cache_mutex_);
   const LibraryInfo* library_info = unwind_cache.findLibraryFor((uint64_t)addr);
   if (!library_info) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   return std::make_pair(
       library_info->name(), (uint64_t)addr - library_info->load_bias());
 }
 
+static std::string dladdr_lookup(void* addr) {
+  Dl_info dlinfo;
+  std::string funcname = "??";
+  if (dladdr(addr, &dlinfo) && dlinfo.dli_sname) {
+    funcname = demangle(dlinfo.dli_sname);
+  }
+  return funcname;
+}
+
 struct Symbolizer {
   Symbolizer() {
-    auto envar = std::getenv("TORCH_ADDR2LINE_BINARY");
-    if (envar != nullptr) {
+    auto envar = c10::utils::get_env("TORCH_ADDR2LINE_BINARY");
+    if (envar.has_value()) {
       // currently we take user's input as is without checking
-      addr2line_binary_ = envar;
+      addr2line_binary_ = std::move(envar.value());
       TORCH_WARN("Use custom addr2line binary: ", addr2line_binary_);
     } else {
       addr2line_binary_ = "addr2line"; // default
-    }
-    if (torch::get_disable_addr2line()) {
-      addr2line_binary_ = nullptr;
     }
   }
   static std::lock_guard<std::mutex> guard() {
@@ -367,22 +366,15 @@ struct Symbolizer {
       frame_map_[addr] = Frame{"??", "<unwind unsupported>", 0};
       return;
     }
-    if (addr2line_binary_ == nullptr) {
-      Dl_info dlinfo;
-      std::string funcname = "??";
-      if (dladdr(addr, &dlinfo) && dlinfo.dli_sname) {
-        funcname = demangle(dlinfo.dli_sname);
-      }
-      frame_map_[addr] = Frame{
-          maybe_library->first, std::move(funcname), maybe_library->second - 1};
-      return;
-    }
     has_pending_results_ = true;
+    // placeholder so repeated addresses in this batch are not re-queried
+    // before the pending results have been read back
+    frame_map_[addr] = Frame{"??", "??", 0};
     auto& entry = getOrCreate(maybe_library->first);
     entry.queried.push_back(addr);
     auto libaddress = maybe_library->second - 1;
     // NOLINTNEXTLINE(performance-no-int-to-ptr)
-    entry.comm->out() << (void*)libaddress << "\n";
+    entry.comm->out() << (void*)libaddress << '\n';
     // we need to make sure we don't write more than 64k bytes to
     // a pipe before reading the results. Otherwise the buffer may
     // get filled and block before we read the results.
@@ -408,7 +400,7 @@ struct Symbolizer {
 
  private:
   static constexpr int BLOCK = 1024;
-  const char* addr2line_binary_;
+  std::string addr2line_binary_;
   struct Entry {
     std::unique_ptr<Communicate> comm;
     std::vector<void*> queried;
@@ -423,12 +415,13 @@ struct Symbolizer {
     if (it == entries_.end()) {
       // NOLINTNEXTLINE(*-c-arrays*)
       const char* args[] = {
-          addr2line_binary_, "-C", "-f", "-e", name.c_str(), nullptr};
+          addr2line_binary_.c_str(), "-C", "-f", "-e", name.c_str(), nullptr};
       it = entries_
                .insert_or_assign(
                    name,
                    Entry{
-                       std::make_unique<Communicate>(addr2line_binary_, args),
+                       std::make_unique<Communicate>(
+                           addr2line_binary_.c_str(), args),
                        {}})
                .first;
     }
@@ -448,23 +441,59 @@ struct Symbolizer {
       frame_map_[e.queried[e.completed]] = std::move(frame);
     }
   }
-  std::string demangle(const std::string& mangled_name) {
-    int status = 0;
-    char* realname =
-        abi::__cxa_demangle(mangled_name.c_str(), nullptr, nullptr, &status);
-    if (status == 0) {
-      std::string demangled_name(realname);
-      // NOLINTNEXTLINE
-      free(realname);
-      return demangled_name;
-    } else {
-      return mangled_name;
-    }
-  }
 };
 
-#ifndef FBCODE_CAFFE2
-std::vector<Frame> symbolize(const std::vector<void*>& frames) {
+static std::vector<Frame> symbolize_fast(
+    const std::vector<void*>& frames,
+    Mode mode) {
+  static std::mutex cache_mutex;
+  static std::array<ska::flat_hash_map<void*, Frame>, 2> frame_maps;
+  auto& frame_map = frame_maps[mode == Mode::fast ? 0 : 1];
+
+  std::vector<uint32_t> indices_to_lookup;
+  std::vector<Frame> results;
+  results.reserve(frames.size());
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    for (auto i : c10::irange(frames.size())) {
+      void* f = frames.at(i);
+      auto it = frame_map.find(f);
+      if (it == frame_map.end()) {
+        indices_to_lookup.push_back(i);
+        results.emplace_back(Frame{"??", "??", 0});
+      } else {
+        results.emplace_back(it->second);
+      }
+    }
+  }
+  if (!indices_to_lookup.empty()) {
+    // do symbolizer work
+    FastSymbolizer symbolizer;
+    for (auto i : indices_to_lookup) {
+      void* addr = frames.at(i);
+      Frame& f = results.at(i);
+      auto library = libraryFor(frames.at(i));
+      if (library) {
+        if (mode == Mode::fast) {
+          f = symbolizer.symbolize(library->first, library->second - 1);
+        } else {
+          f = Frame{library->first, "??", library->second - 1};
+        }
+      }
+      if (f.funcname == "??") {
+        f.funcname = dladdr_lookup(addr);
+      }
+    }
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    for (auto i : indices_to_lookup) {
+      frame_map.emplace(frames.at(i), results.at(i));
+    }
+  }
+  return results;
+}
+
+static std::vector<Frame> symbolize_addr2line(
+    const std::vector<void*>& frames) {
   auto guard = Symbolizer::guard();
   Symbolizer& s = Symbolizer::get();
   for (auto f : frames) {
@@ -477,6 +506,16 @@ std::vector<Frame> symbolize(const std::vector<void*>& frames) {
   }
   return results;
 }
+
+// fbcode will use llvm symbolize since there is an llvm dependency already
+#ifndef FBCODE_CAFFE2
+std::vector<Frame> symbolize(const std::vector<void*>& frames, Mode mode) {
+  if (mode == Mode::addr2line) {
+    return symbolize_addr2line(frames);
+  } else {
+    return symbolize_fast(frames, mode);
+  }
+}
 #endif
 
 Stats stats() {
@@ -484,4 +523,150 @@ Stats stats() {
 }
 
 } // namespace torch::unwind
+
+#if defined(__aarch64__)
+// aarch64 uses frame-pointer chain walking instead of DWARF unwinding.
+// Each frame has: *(FP) = caller's FP, *(FP+8) = saved LR (return address).
+// This is simpler and avoids issues with tail calls producing stale x30
+// values in DWARF-based unwinding.  GCC/Clang on aarch64 emit frame
+// pointers by default even at -O2.
+//
+// External libraries (CPython, libc, CUDA runtime) may be built without
+// frame pointers, making x29 an arbitrary callee-saved value.  We obtain
+// the current thread's stack bounds and reject any fp outside that range
+// to avoid dereferencing garbage pointers.
+//
+// No cache_mutex_ needed: frame-pointer walking reads only the stack,
+// unlike the x86 path which queries the DWARF FDE cache.
+
+// Stack bounds are essentially immutable over a thread's lifetime (base and
+// size are fixed at pthread_create for spawned threads).  On glibc aarch64
+// the main thread is the pathological case: pthread_getattr_np() parses
+// /proc/self/maps on every call because the main-thread stack isn't recorded
+// in TLS at pthread_create.  Cache once per thread to avoid that parse on
+// every unwind.  This mirrors the process-global caches the x86 unwinder
+// uses for /proc-derived data (library list, exe path); here the data is
+// per-thread, so thread_local is the right scope.
+//
+// Edge case: main thread's stack can grow up to RLIMIT_STACK, and this cache
+// freezes the bounds at first observation.  If the stack later grows past
+// cached lo, unwind_c will terminate early on those frames rather than
+// follow them - truncated backtrace, not incorrect.  In practice main-thread
+// stack reaches steady-state depth during init, long before heavy unwinding.
+namespace {
+struct StackBounds {
+  uintptr_t lo = 0;
+  uintptr_t hi = 0;
+  bool initialized = false;
+};
+thread_local StackBounds tls_stack_bounds;
+} // namespace
+
+static bool get_stack_bounds(uintptr_t& lo, uintptr_t& hi) {
+  auto& b = tls_stack_bounds;
+  if (!b.initialized) {
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+      return false;
+    }
+    void* base = nullptr;
+    size_t size = 0;
+    int rc = pthread_attr_getstack(&attr, &base, &size);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+      return false;
+    }
+    b.lo = reinterpret_cast<uintptr_t>(base);
+    b.hi = b.lo + size;
+    b.initialized = true;
+  }
+  lo = b.lo;
+  hi = b.hi;
+  return true;
+}
+
+extern "C" C10_USED void unwind_c(
+    std::vector<void*>* result,
+    uintptr_t fp,
+    uintptr_t lr) {
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  result->push_back((void*)lr);
+
+  uintptr_t stack_lo = 0, stack_hi = 0;
+  if (!get_stack_bounds(stack_lo, stack_hi)) {
+    return;
+  }
+
+  constexpr int kMaxFrames = 4096;
+  int depth = 0;
+  while (fp != 0 && (fp & 0xF) == 0 && depth++ < kMaxFrames) {
+    if (fp < stack_lo || fp + 16 > stack_hi) {
+      break;
+    }
+    uintptr_t saved_lr;
+    std::memcpy(
+        &saved_lr, reinterpret_cast<const void*>(fp + 8), sizeof(saved_lr));
+    if (saved_lr == 0) {
+      break;
+    }
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    result->push_back((void*)saved_lr);
+    uintptr_t next_fp;
+    std::memcpy(&next_fp, reinterpret_cast<const void*>(fp), sizeof(next_fp));
+    if (next_fp <= fp) {
+      break;
+    }
+    fp = next_fp;
+  }
+}
+
+// x0 already holds the result pointer.
+// Pass FP (x29) and LR (x30), then tail-call unwind_c.
+__asm__(
+    ".global unwind_entry\n"
+    "unwind_entry:\n"
+    "mov x1, x29\n"
+    "mov x2, x30\n"
+    "b unwind_c\n");
+#else
+extern "C" C10_USED void unwind_c(
+    std::vector<void*>* result,
+    int64_t rsp,
+    int64_t rbp) {
+  std::shared_lock lock(torch::unwind::cache_mutex_);
+  torch::unwind::UnwindState state{};
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  state.pc = *(int64_t*)rsp;
+  // +8 because we saved rsp after the return address was already pushed
+  // to the stack
+  state.sp = rsp + 8;
+  state.fp = rbp;
+  torch::unwind::unwind_cache.checkRefresh(lock);
+  while (true) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    result->push_back((void*)state.pc);
+    const torch::unwind::Unwinder& uw =
+        torch::unwind::unwind_cache.unwinderFor(state.pc, lock);
+    if (uw.terminator()) {
+      if (uw.isUnknown()) {
+        result->push_back(nullptr);
+      }
+      break;
+    }
+    state = uw.run(state);
+  }
+}
+
+// x86-64 calling convention: rdi rsi rdx (all caller-saved)
+// rdi already holds the pointer to the result vector
+// we add arguments for current rsp and rbp and then tail call
+// into unwind_c
+__asm__(
+    ".global unwind_entry\n"
+    "unwind_entry:\n"
+    "mov %rsp, %rsi;\n"
+    "mov %rbp, %rdx;\n"
+    "jmp unwind_c;\n");
+#endif
+
 #endif

@@ -2,6 +2,7 @@
 #include <iostream>
 #include <memory>
 
+#include <c10/util/Exception.h>
 #include <c10/util/Registry.h>
 
 // Note: we use a different namespace to test if the macros defined in
@@ -16,6 +17,7 @@ class Foo {
   virtual ~Foo() = default;
 };
 
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 C10_DECLARE_REGISTRY(FooRegistry, Foo, int);
 C10_DEFINE_REGISTRY(FooRegistry, Foo, int);
 #define REGISTER_FOO(clsname) C10_REGISTER_CLASS(FooRegistry, clsname, clsname)
@@ -48,22 +50,22 @@ TEST(RegistryTest, ReturnNullOnNonExistingCreator) {
 }
 
 // C10_REGISTER_CLASS_WITH_PRIORITY defines static variable
-void RegisterFooDefault() {
+static void RegisterFooDefault() {
   C10_REGISTER_CLASS_WITH_PRIORITY(
       FooRegistry, FooWithPriority, c10::REGISTRY_DEFAULT, Foo);
 }
 
-void RegisterFooDefaultAgain() {
+static void RegisterFooDefaultAgain() {
   C10_REGISTER_CLASS_WITH_PRIORITY(
       FooRegistry, FooWithPriority, c10::REGISTRY_DEFAULT, Foo);
 }
 
-void RegisterFooBarFallback() {
+static void RegisterFooBarFallback() {
   C10_REGISTER_CLASS_WITH_PRIORITY(
       FooRegistry, FooWithPriority, c10::REGISTRY_FALLBACK, Bar);
 }
 
-void RegisterFooBarPreferred() {
+static void RegisterFooBarPreferred() {
   C10_REGISTER_CLASS_WITH_PRIORITY(
       FooRegistry, FooWithPriority, c10::REGISTRY_PREFERRED, Bar);
 }
@@ -74,7 +76,7 @@ TEST(RegistryTest, RegistryPriorities) {
 
   // throws because Foo is already registered with default priority
   // NOLINTNEXTLINE(hicpp-avoid-goto,cppcoreguidelines-avoid-goto)
-  EXPECT_THROW(RegisterFooDefaultAgain(), std::runtime_error);
+  EXPECT_THROW(RegisterFooDefaultAgain(), c10::Error);
 
 #ifdef __GXX_RTTI
   // not going to register Bar because Foo is registered with Default priority

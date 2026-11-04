@@ -1,6 +1,7 @@
-from typing import Type
+# mypy: allow-untyped-defs
 
 from torch import optim
+
 from .functional_adadelta import _FunctionalAdadelta
 from .functional_adagrad import _FunctionalAdagrad
 from .functional_adam import _FunctionalAdam
@@ -9,6 +10,7 @@ from .functional_adamw import _FunctionalAdamW
 from .functional_rmsprop import _FunctionalRMSprop
 from .functional_rprop import _FunctionalRprop
 from .functional_sgd import _FunctionalSGD
+
 
 # dict to map a user passed in optimizer_class to a functional
 # optimizer class if we have already defined inside the
@@ -28,10 +30,15 @@ functional_optim_map = {
 
 def register_functional_optim(key, optim):
     """
-    Interface to insert a new functional optimizer to functional_optim_map
-    ``fn_optim_key`` and ``fn_optimizer`` are user defined. The optimizer and key
-    need not be of :class:`torch.optim.Optimizer` (e.g. for custom optimizers)
+    Interface to insert a new functional optimizer to functional_optim_map.
+    ``key`` and ``optim`` are user defined. The optimizer and key
+    need not be of :class:`torch.optim.Optimizer` (e.g. for custom optimizers).
+    Does nothing if ``key`` is already registered.
+    ``optim`` must accept an empty params list and
+    ``_allow_empty_param_list=True``, as ``as_functional_optim`` passes both.
+
     Example::
+
         >>> # import the new functional optimizer
         >>> # xdoctest: +SKIP
         >>> from xyz import fn_optimizer
@@ -43,18 +50,18 @@ def register_functional_optim(key, optim):
         functional_optim_map[key] = optim
 
 
-def as_functional_optim(optim_cls: Type, *args, **kwargs):
+def as_functional_optim(optim_cls: type, *args, **kwargs):
     try:
         functional_cls = functional_optim_map[optim_cls]
     except KeyError as e:
         raise ValueError(
-            f"Optimizer {optim_cls} does not have a functional " f"counterpart!"
+            f"Optimizer {optim_cls} does not have a functional counterpart!"
         ) from e
 
     return _create_functional_optim(functional_cls, *args, **kwargs)
 
 
-def _create_functional_optim(functional_optim_cls: Type, *args, **kwargs):
+def _create_functional_optim(functional_optim_cls: type, *args, **kwargs):
     return functional_optim_cls(
         [],
         *args,

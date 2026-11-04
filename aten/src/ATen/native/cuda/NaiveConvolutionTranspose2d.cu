@@ -12,6 +12,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <ATen/native/ConvUtils.h>
+#include <utility>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -88,7 +89,7 @@ static inline void slow_conv_transpose2d_shape_check(
       check_dim_size(bias, 1, 0, weight.size(1));
     }
   } else if (!weight_nullable) {
-    AT_ERROR("weight tensor is expected to be non-nullable");
+    TORCH_CHECK(false, "weight tensor is expected to be non-nullable");
   }
 
   int ndim = input.dim();
@@ -115,7 +116,7 @@ static inline void slow_conv_transpose2d_shape_check(
       (dilation_width * (kernel_width - 1) + 1) + output_padding_width;
 
   if (output_width < 1 || output_height < 1) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Given input size per channel: (",
         input_height,
         " x ",
@@ -735,7 +736,6 @@ std::tuple<Tensor&, Tensor&, Tensor&> slow_conv_transpose2d_backward_out_cuda(co
 
   if (grad_bias.defined()) {
     grad_bias.resize_({weight.size(1)});
-    grad_bias.zero_();
   }
 
   if (grad_weight.defined() || grad_bias.defined()) {
@@ -808,7 +808,6 @@ std::tuple<Tensor, Tensor, Tensor> slow_conv_transpose2d_backward_cuda(
 
   if (grad_bias.defined()) {
     grad_bias.resize_({weight.size(1)});
-    grad_bias.zero_();
   }
 
   if (grad_weight.defined() || grad_bias.defined()) {
@@ -825,9 +824,10 @@ std::tuple<Tensor, Tensor, Tensor> slow_conv_transpose2d_backward_cuda(
         1);
   }
 
-  return std::tuple<Tensor, Tensor, Tensor>(grad_input, grad_weight, grad_bias);
+  return std::tuple<Tensor, Tensor, Tensor>(
+      std::move(grad_input), std::move(grad_weight), std::move(grad_bias));
 }
 
-REGISTER_CUDA_DISPATCH(slow_conv_transpose2d_backward_stub, &slow_conv_transpose2d_backward_cuda);
+REGISTER_CUDA_DISPATCH(slow_conv_transpose2d_backward_stub, &slow_conv_transpose2d_backward_cuda)
 
 } // namespace at::native

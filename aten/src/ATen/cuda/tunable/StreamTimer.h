@@ -1,6 +1,6 @@
 // Original TunableOp is from onnxruntime.
 // https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/core/framework/tunable.h
-// https://github.com/microsoft/onnxruntime/tree/main/onnxruntime/core/providers/rocm/tunable
+// https://github.com/microsoft/onnxruntime/tree/main/onnxruntime/core/providers/cuda/tunable
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 //
@@ -18,7 +18,11 @@ namespace at::cuda::tunable {
 class StreamTimer : public ITimer {
   public:
     StreamTimer();
-    virtual ~StreamTimer();
+    StreamTimer(const StreamTimer&) = delete;
+    StreamTimer& operator=(const StreamTimer&) = delete;
+    StreamTimer(StreamTimer&&) = delete;
+    StreamTimer& operator=(StreamTimer&&) = delete;
+    ~StreamTimer() override;
 
     void Start() override;
 
@@ -27,8 +31,28 @@ class StreamTimer : public ITimer {
     float Duration() override;
 
   private:
-    cudaEvent_t start_;
-    cudaEvent_t end_;
+    cudaEvent_t start_{};
+    cudaEvent_t end_{};
+};
+
+class StreamTimerNoSync : public ITimer {
+  public:
+    StreamTimerNoSync();
+    StreamTimerNoSync(const StreamTimerNoSync&) = delete;
+    StreamTimerNoSync& operator=(const StreamTimerNoSync&) = delete;
+    StreamTimerNoSync(StreamTimerNoSync&&) = delete;
+    StreamTimerNoSync& operator=(StreamTimerNoSync&&) = delete;
+    ~StreamTimerNoSync() override;
+
+    void Start() override;
+
+    void End() override;
+
+    float Duration() override;
+
+  private:
+    cudaEvent_t start_{};
+    cudaEvent_t end_{};
 };
 
 } // namespace at::cuda::tunable

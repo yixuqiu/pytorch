@@ -1,7 +1,8 @@
+# mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 """
-The following example demonstrates how to use Pytorch Distributed Checkpoint to save a FSDP model.
+The following example demonstrates how to use PyTorch Distributed Checkpoint to save a FSDP model.
 
 This is the current recommended way to checkpoint FSDP.
 torch.save() and torch.load() is not recommended when checkpointing sharded models.
@@ -15,11 +16,11 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dist_cp
 import torch.multiprocessing as mp
 from torch.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
-
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
-CHECKPOINT_DIR = f"/scratch/{os.environ['LOGNAME']}/checkpoint"
+
+CHECKPOINT_DIR = f"/scratch/{os.environ.get('LOGNAME', '')}/checkpoint"
 
 
 def opt_at(opt, idx):
@@ -36,15 +37,14 @@ def init_model():
 
 
 def print_params(stage, model_1, model_2, optim_1, optim_2):
-    with FSDP.summon_full_params(model_1):
-        with FSDP.summon_full_params(model_2):
-            print(
-                f"{stage} --- rank: {dist.get_rank()}\n"
-                f"model.weight: {model_1.weight}\n"
-                f"model_2.weight:{model_2.weight}\n"
-                f"model.bias: {model_1.bias}\n"
-                f"model_2.bias: {model_2.bias}\n"
-            )
+    with FSDP.summon_full_params(model_1), FSDP.summon_full_params(model_2):
+        print(
+            f"{stage} --- rank: {dist.get_rank()}\n"
+            f"model.weight: {model_1.weight}\n"
+            f"model_2.weight:{model_2.weight}\n"
+            f"model.bias: {model_1.bias}\n"
+            f"model_2.bias: {model_2.bias}\n"
+        )
 
     print(
         f"{stage} --- rank: {dist.get_rank()}\n"

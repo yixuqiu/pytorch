@@ -12,8 +12,7 @@
 #include <ATen/ops/int_repr_native.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 Tensor int_repr_quantized_cuda(const Tensor& self) {
   Tensor dst;
@@ -25,7 +24,7 @@ Tensor int_repr_quantized_cuda(const Tensor& self) {
     auto iter = TensorIteratorConfig()
       .check_all_same_dtype(false)
       .add_output(dst)
-      .add_input(self)
+      .add_const_input(self)
       .build();
     gpu_kernel(iter, [] GPU_LAMBDA(scalar_t value) -> underlying_t {
       return value.val_;
@@ -34,5 +33,4 @@ Tensor int_repr_quantized_cuda(const Tensor& self) {
   return dst;
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

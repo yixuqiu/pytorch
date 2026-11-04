@@ -1,14 +1,9 @@
-#include <torch/csrc/jit/codegen/onednn/LlgaTensorImpl.h>
 #include <torch/csrc/jit/codegen/onednn/graph_helper.h>
 
-#include <ATen/core/functional.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 
-namespace torch {
-namespace jit {
-namespace fuser {
-namespace onednn {
+namespace torch::jit::fuser::onednn {
 
 using opkind = dnnl::graph::op::kind;
 
@@ -22,11 +17,11 @@ static void fixConvOptionalBias(Node* node) {
   }
 }
 
-static c10::optional<size_t> getDimensions(Value* v) {
+static std::optional<size_t> getDimensions(Value* v) {
   if (v->type()->isSubtypeOf(TensorType::get())) {
     return v->type()->cast<TensorType>()->sizes().size();
   } else {
-    return c10::nullopt;
+    return std::nullopt;
   }
 }
 
@@ -73,7 +68,7 @@ Operator LlgaGraphHelper::makeBinaryOp(Node* node, opkind kind) {
 // third_party/ideep/mkl-dnn/src/interface/op_def.hpp.
 Operator LlgaGraphHelper::createOperator(Node* node) {
   auto nodeKind = node->kind();
-  // we're using an if-else clause instead of a switch staement
+  // we're using an if-else clause instead of a switch statement
   // because we would soon be adding custom ops with function schemas.
   // We would have to use Symbol::fromQualString at that time anyway,
   // but we are okay with this choice, since this code is not in the hot-path.
@@ -246,7 +241,7 @@ Operator LlgaGraphHelper::createOperator(Node* node) {
             dnnl::graph::op::attr::rounding_type, std::string(rounding_type))
         .setAttr(dnnl::graph::op::attr::data_format, std::string("NCX"));
   } else if (nodeKind == Symbol::fromQualString("aten::avg_pool2d")) {
-    // TODO: do we need add checks for all Constants?
+    // TODO: do we need to add checks for all Constants?
     REQUIRE(node->namedInput("kernel_size")->node()->kind() == prim::Constant);
     auto rounding_type =
         toIValue(node->namedInput("ceil_mode"))->toBool() ? "ceil" : "floor";
@@ -348,16 +343,16 @@ static void mayAddListConstructIntoConcatPartition(
     Node* n,
     OpPartitionMap& opToOwningPartition) {
   // Since prim::ListConstruct is not visible to the LLGA,
-  // it will not be in any partition returned from partfuseritioning results.
+  // it will not be in any partition returned from partitioning results.
   // We need rewrite opToOwningPartition to make the prim::ListConstruct to be
   // 'virtually' in the same partition with the aten::cat, so that
   // prim::ListConstruct can be fused into the fusion group by graph fuser.
   // We emphasize on 'virtually' because get_num_ops() for cat's partition
   // would still return 1.
   if (n->kind() == aten::cat && opToOwningPartition.has(n)) {
-    auto listConstrcut = n->namedInput("tensors")->node();
+    auto listConstruct = n->namedInput("tensors")->node();
     auto partitionId = opToOwningPartition.get(n);
-    opToOwningPartition.add(listConstrcut, partitionId);
+    opToOwningPartition.add(listConstruct, partitionId);
   }
 }
 
@@ -405,8 +400,7 @@ LlgaGraphHelper::LlgaGraphHelper(
     dnnl::graph::partition::policy policy) {
   auto deviceType = inferDevice(graph);
   auto engineKind = getLlgaEngineKind(deviceType);
-  dnnl_graph_ =
-      std::unique_ptr<dnnl::graph::graph>(new dnnl::graph::graph(engineKind));
+  dnnl_graph_ = std::make_unique<dnnl::graph::graph>(engineKind);
   aliasDb_ = std::make_unique<torch::jit::AliasDb>(graph);
   GRAPH_DEBUG("Constructing LLGA graph");
   // TODO: select nodes in top-level block for now
@@ -616,7 +610,4 @@ bool LlgaNodeWrapper::useOpaqueLayout(size_t offset) const {
   return n->is(attr::output_layouts)[offset] == OPAQUE_LAYOUT;
 }
 
-} // namespace onednn
-} // namespace fuser
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::fuser::onednn

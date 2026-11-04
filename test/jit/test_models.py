@@ -7,25 +7,23 @@ import unittest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.testing._internal.common_cuda import tf32_on_and_off
 from torch.testing._internal.common_utils import (
     enable_profiling_mode_for_profiling_tests,
     GRAPH_EXECUTOR,
     ProfilingMode,
+    raise_on_run_directly,
     set_default_dtype,
+    slowTest,
+    suppress_warnings,
 )
+
 
 # Make the helper files in test/ importable
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
-from torch.testing._internal.common_utils import slowTest, suppress_warnings
 from torch.testing._internal.jit_utils import JitTestCase, RUN_CUDA
 
-if __name__ == "__main__":
-    raise RuntimeError(
-        "This test file is not meant to be run directly, use:\n\n"
-        "\tpython test/test_jit.py TESTNAME\n\n"
-        "instead."
-    )
 
 try:
     import torchvision
@@ -39,7 +37,7 @@ skipIfNoTorchVision = unittest.skipIf(not HAS_TORCHVISION, "no torchvision")
 
 
 class MnistNet(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
         self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
@@ -82,7 +80,7 @@ class TestModels(JitTestCase):
                     nn.ReLU(True),
                     # state size. (ngf) x 32 x 32
                     nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
-                    nn.Tanh()
+                    nn.Tanh(),
                     # state size. (nc) x 64 x 64
                 )
 
@@ -146,7 +144,7 @@ class TestModels(JitTestCase):
     @staticmethod
     def _test_neural_style(self, device, check_export_import=True):
         class TransformerNet(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 # Initial convolution layers
                 self.conv1 = ConvLayer(3, 32, kernel_size=9, stride=1)
@@ -318,7 +316,7 @@ class TestModels(JitTestCase):
     @staticmethod
     def _test_reinforcement_learning(self, device, test_export_import=True):
         class Policy(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.affine1 = nn.Linear(4, 128)
                 self.affine2 = nn.Linear(128, 2)
@@ -374,7 +372,7 @@ class TestModels(JitTestCase):
                 batch_size = inputs.size()[1]
                 state_shape = self.config.n_cells, batch_size, self.config.d_hidden
                 h0 = c0 = inputs.new_zeros(state_shape)
-                outputs, (ht, ct) = self.rnn(inputs, (h0, c0))
+                _, (ht, _) = self.rnn(inputs, (h0, c0))
                 return (
                     ht[-1]
                     if not self.config.birnn
@@ -485,6 +483,7 @@ class TestModels(JitTestCase):
         self._test_super_resolution(self, device="cpu")
 
     @unittest.skipIf(not RUN_CUDA, "no CUDA")
+    @tf32_on_and_off(0.02)
     def test_super_resolution_cuda(self):
         # XXX: export_import on CUDA modules doesn't work (#11480)
         self._test_super_resolution(self, device="cuda", check_export_import=False)
@@ -492,7 +491,7 @@ class TestModels(JitTestCase):
     @suppress_warnings
     def test_time_sequence_prediction(self):
         class Sequence(torch.jit.ScriptModule):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.lstm1 = nn.LSTMCell(1, 51)
                 self.lstm2 = nn.LSTMCell(51, 51)
@@ -527,7 +526,7 @@ class TestModels(JitTestCase):
                 return outputs
 
         class Traced(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.seq = Sequence()
 
@@ -542,7 +541,7 @@ class TestModels(JitTestCase):
     @staticmethod
     def _test_vae(self, device, check_export_import=True):
         class VAE(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
 
                 self.fc1 = nn.Linear(784, 400)
@@ -591,7 +590,6 @@ class TestModels(JitTestCase):
     @slowTest
     @skipIfNoTorchVision
     def test_script_module_trace_resnet18(self):
-        x = torch.ones(1, 3, 224, 224)
         m_orig = torch.jit.trace(
             torchvision.models.resnet18(), torch.ones(1, 3, 224, 224)
         )
@@ -753,3 +751,7 @@ class TestModels(JitTestCase):
         m = self.createFunctionFromGraph(g)
         with torch.random.fork_rng(devices=[]):
             self.assertEqual(outputs, m(*inputs))
+
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_jit.py")

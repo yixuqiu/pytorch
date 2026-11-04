@@ -103,6 +103,10 @@ QNNPACK_SOURCES = {
         "q8conv/8x8-aarch64-neon.S",
         "q8gemm/8x8-aarch64-neon.S",
         "q8gemm/8x8-dq-aarch64-neon.S",
+        "q8gemm/4x8-dq-aarch64-neon.S",
+        "q8gemm/3x8-dq-aarch64-neon.S",
+        "q8gemm/2x8-dq-aarch64-neon.S",
+        "q8gemm/1x8-dq-aarch64-neon.S",
     ],
 }
 
@@ -124,9 +128,9 @@ if __name__ == "__main__":
                 # because they are ignored by arc focus & buck project.
 
                 if condition is None:
-                    print("#include <%s>" % filename, file=wrapper)
+                    print(f"#include <{filename}>", file=wrapper)
                 else:
                     # Include source file only if condition is satisfied
-                    print("#if %s" % condition, file=wrapper)
-                    print("#include <%s>" % filename, file=wrapper)
-                    print("#endif /* %s */" % condition, file=wrapper)
+                    print(f"#if {condition}", file=wrapper)
+                    print(f"#include <{filename}>", file=wrapper)
+                    print(f"#endif /* {condition} */", file=wrapper)

@@ -3,15 +3,12 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
-#include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <c10/util/Logging.h>
 #include <c10/util/irange.h>
-#include <c10/util/string_utils.h>
 
 #include <ATen/core/functional.h>
 #include <torch/csrc/jit/jit_log.h>
@@ -26,11 +23,6 @@
 #include <torch/csrc/jit/tensorexpr/ir_simplifier.h>
 #include <torch/csrc/jit/tensorexpr/ir_verifier.h>
 #include <torch/csrc/jit/tensorexpr/tensor.h>
-
-#include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
 namespace torch::jit::tensorexpr {
 
@@ -47,7 +39,6 @@ LoopNest::LoopNest(StmtPtr stmt, std::unordered_set<BufPtr> output_bufs)
   verify(root_stmt_);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 LoopNest::LoopNest(
     const std::vector<Tensor>& output_tensors,
     const std::vector<Tensor>& tensors_to_compute) {
@@ -56,7 +47,6 @@ LoopNest::LoopNest(
   verify(root_stmt_);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 LoopNest::LoopNest(const std::vector<Tensor>& output_tensors) {
   initialize(output_tensors, output_tensors);
   GRAPH_DEBUG("Origin Stmt in LoopNest:\n", std::to_string(root_stmt_));
@@ -69,8 +59,8 @@ std::vector<BufPtr> LoopNest::getIntermediateBufs() const {
   auto input_bufs = getInputBufs();
   auto bufs = NodeFinder<Buf>::find(root_stmt_);
   for (const auto& buf : bufs) {
-    if (!output_bufs_.count(buf) && !input_bufs.count(buf) &&
-        !result_set.count(buf)) {
+    if (!output_bufs_.contains(buf) && !input_bufs.contains(buf) &&
+        !result_set.contains(buf)) {
       result.push_back(buf);
       result_set.insert(buf);
     }
@@ -98,11 +88,11 @@ const std::unordered_set<BufPtr> LoopNest::getInputBufs() const {
 
 class IndexFlattener : public IRMutator {
  public:
-  StmtPtr flatten(StmtPtr s) {
+  StmtPtr flatten(const StmtPtr& s) {
     return s->accept_mutator(this);
   }
 
-  ExprPtr mutate(LoadPtr v) override {
+  ExprPtr mutate(const LoadPtr& v) override {
     if (v->indices().size() == 1) {
       return v;
     }
@@ -113,7 +103,7 @@ class IndexFlattener : public IRMutator {
             v->buf()->dims(), v->indices(), v->buf()->strides())}));
   }
 
-  StmtPtr mutate(StorePtr v) override {
+  StmtPtr mutate(const StorePtr& v) override {
     ExprPtr value = v->value();
     ExprPtr new_value = value->accept_mutator(this);
     if (v->indices().size() == 1 && value == new_value) {
@@ -140,23 +130,23 @@ std::string sanitizeName(const std::string& input_name) {
     } else {
       if (i == 0) {
         // Don't start names with underscore
-        sanitized_name << "v";
+        sanitized_name << 'v';
       }
-      sanitized_name << "_";
+      sanitized_name << '_';
     }
   }
-  return sanitized_name.str();
+  return std::move(sanitized_name).str();
 }
 
 class VarNameSanitizer : public IRMutator {
  public:
-  ExprPtr mutate(BufPtr v) override {
-    if (seen_bufs_.count(v)) {
+  ExprPtr mutate(const BufPtr& v) override {
+    if (seen_bufs_.contains(v)) {
       return v;
     }
     const std::string& name = v->name_hint();
     auto new_name = sanitizeName(name);
-    if (taken_names_.count(new_name)) {
+    if (taken_names_.contains(new_name)) {
       new_name = getNextAvailableName(new_name);
     }
     v->set_name_hint(new_name);
@@ -165,13 +155,13 @@ class VarNameSanitizer : public IRMutator {
     return v;
   }
 
-  ExprPtr mutate(VarPtr v) override {
-    if (seen_vars_.count(v)) {
+  ExprPtr mutate(const VarPtr& v) override {
+    if (seen_vars_.contains(v)) {
       return v;
     }
     const std::string& name = v->name_hint();
     auto new_name = sanitizeName(name);
-    if (taken_names_.count(new_name)) {
+    if (taken_names_.contains(new_name)) {
       new_name = getNextAvailableName(new_name);
     }
     v->set_name_hint(new_name);
@@ -180,9 +170,9 @@ class VarNameSanitizer : public IRMutator {
     return v;
   }
 
-  StmtPtr mutate(ForPtr v) override {
+  StmtPtr mutate(const ForPtr& v) override {
     auto new_name = getNextAvailableName(getIndexVarNameAtLevel(level_));
-    if (seen_index_vars_.count(v->var())) {
+    if (seen_index_vars_.contains(v->var())) {
       auto new_var = alloc<Var>("", v->var()->dtype());
       Substitute(v, {{v->var(), new_var}});
     }
@@ -199,8 +189,8 @@ class VarNameSanitizer : public IRMutator {
   }
 
   std::string getIndexVarNameAtLevel(int level_) {
-    int names_num = index_var_names_.size();
-    int counter = level_ / names_num;
+    auto names_num = index_var_names_.size();
+    auto counter = level_ / names_num;
     if (counter == 0) {
       return index_var_names_[level_ % names_num];
     } else {
@@ -210,7 +200,7 @@ class VarNameSanitizer : public IRMutator {
   std::string getNextAvailableName(const std::string& base_name) {
     std::string name = base_name;
     int counter = 0;
-    while (taken_names_.count(name)) {
+    while (taken_names_.contains(name)) {
       counter++;
       name = base_name + "_" + std::to_string(counter);
     }
@@ -273,77 +263,77 @@ class Vectorizer : public IRMutator {
     return success_;
   }
 
-  ExprPtr mutate(AddPtr v) override {
+  ExprPtr mutate(const AddPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) + ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(SubPtr v) override {
+  ExprPtr mutate(const SubPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) - ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(MulPtr v) override {
+  ExprPtr mutate(const MulPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) * ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(DivPtr v) override {
+  ExprPtr mutate(const DivPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) / ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(ModPtr v) override {
+  ExprPtr mutate(const ModPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) % ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(AndPtr v) override {
+  ExprPtr mutate(const AndPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) & ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(OrPtr v) override {
+  ExprPtr mutate(const OrPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) | ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(XorPtr v) override {
+  ExprPtr mutate(const XorPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) ^ ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(LshiftPtr v) override {
+  ExprPtr mutate(const LshiftPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) << ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(RshiftPtr v) override {
+  ExprPtr mutate(const RshiftPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(inputs[0]) >> ExprHandle(inputs[1]);
     });
   }
 
-  ExprPtr mutate(MaxPtr v) override {
+  ExprPtr mutate(const MaxPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return Max::make(
@@ -351,7 +341,7 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  ExprPtr mutate(MinPtr v) override {
+  ExprPtr mutate(const MinPtr& v) override {
     std::vector<ExprPtr> inputs = {v->lhs(), v->rhs()};
     return try_vectorize(v, inputs, [&]() {
       return Min::make(
@@ -359,7 +349,7 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  ExprPtr mutate(CompareSelectPtr v) override {
+  ExprPtr mutate(const CompareSelectPtr& v) override {
     std::vector<ExprPtr> inputs = {
         v->lhs(), v->rhs(), v->ret_val1(), v->ret_val2()};
     return try_vectorize(v, inputs, [&]() {
@@ -373,7 +363,7 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  ExprPtr mutate(BitCastPtr v) override {
+  ExprPtr mutate(const BitCastPtr& v) override {
     std::vector<ExprPtr> inputs = {v->src_value()};
     return try_vectorize(v, inputs, [&]() {
       return BitCast::make(
@@ -381,7 +371,7 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  ExprPtr mutate(CastPtr v) override {
+  ExprPtr mutate(const CastPtr& v) override {
     std::vector<ExprPtr> inputs = {v->src_value()};
     return try_vectorize(v, inputs, [&]() {
       return Cast::make(
@@ -389,7 +379,7 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  ExprPtr mutate(VarPtr v) override {
+  ExprPtr mutate(const VarPtr& v) override {
     if (v == var_) {
       return Ramp::make(
                  ExprHandle(start_), ExprHandle(immLike(start_, 1)), lanes_)
@@ -399,7 +389,7 @@ class Vectorizer : public IRMutator {
     return v;
   }
 
-  ExprPtr mutate(RampPtr v) override {
+  ExprPtr mutate(const RampPtr& v) override {
     ExprPtr base = v->base();
     ExprPtr stride = v->stride();
 
@@ -415,7 +405,7 @@ class Vectorizer : public IRMutator {
     return v;
   }
 
-  ExprPtr mutate(LoadPtr v) override {
+  ExprPtr mutate(const LoadPtr& v) override {
     Dtype dtype(v->dtype().scalar_type(), lanes_);
     BufPtr buf = v->buf();
     std::vector<ExprPtr> inputs = {v->flat_index()};
@@ -424,7 +414,7 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  ExprPtr mutate(ReduceOpPtr v) override {
+  ExprPtr mutate(const ReduceOpPtr& v) override {
     Dtype dtype(v->dtype().scalar_type(), lanes_);
 
     std::vector<ExprPtr> inputs = {v->body()};
@@ -436,7 +426,7 @@ class Vectorizer : public IRMutator {
     return out;
   }
 
-  ExprPtr mutate(BroadcastPtr v) override {
+  ExprPtr mutate(const BroadcastPtr& v) override {
     ExprPtr val = v->value();
     ExprPtr new_val = val->accept_mutator(this);
     if (new_val == val) {
@@ -448,7 +438,7 @@ class Vectorizer : public IRMutator {
     return v;
   }
 
-  ExprPtr mutate(IfThenElsePtr v) override {
+  ExprPtr mutate(const IfThenElsePtr& v) override {
     ExprPtr condition = v->condition();
     ExprPtr new_condition = condition->accept_mutator(this);
     if (new_condition != condition) {
@@ -464,14 +454,14 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  ExprPtr mutate(IntrinsicsPtr v) override {
+  ExprPtr mutate(const IntrinsicsPtr& v) override {
     std::vector<ExprPtr> inputs = v->params();
     return try_vectorize(v, inputs, [&]() {
       return ExprHandle(alloc<Intrinsics>(v->op_type(), inputs));
     });
   }
 
-  StmtPtr mutate(StorePtr v) override {
+  StmtPtr mutate(const StorePtr& v) override {
     BufPtr buf = v->buf();
     std::vector<ExprPtr> inputs = {v->flat_index(), v->value()};
     return try_vectorize(v, inputs, [&]() {
@@ -480,7 +470,7 @@ class Vectorizer : public IRMutator {
     });
   }
 
-  StmtPtr mutate(ForPtr v) override {
+  StmtPtr mutate(const ForPtr& v) override {
     VarPtr var = v->var();
     ExprPtr start = v->start();
     ExprPtr stop = v->stop();
@@ -505,7 +495,7 @@ class Vectorizer : public IRMutator {
     return alloc<For>(var, new_start, new_stop, new_body, loop_options);
   }
 
-  StmtPtr mutate(BlockPtr v) override {
+  StmtPtr mutate(const BlockPtr& v) override {
     // IRMutator does in-place mutations. But the logic in vectorization checks
     // for success by looking for a new stmt. So, we override the in-place
     // mutations and create a clone here if any of its statements change.
@@ -546,7 +536,7 @@ class Vectorizer : public IRMutator {
       return vec_ctor();
     }
 
-    return (StmtPtr)s;
+    return s;
   }
 
   bool vectorize_inputs(std::vector<ExprPtr>& inputs) {
@@ -581,12 +571,12 @@ class Vectorizer : public IRMutator {
   }
 
   VarPtr var_ = nullptr;
-  int lanes_ = 0;
+  int64_t lanes_ = 0;
   ExprPtr start_ = nullptr;
   bool success_ = true;
 };
 
-bool LoopNest::vectorize(ForPtr f) {
+bool LoopNest::vectorize(const ForPtr& f) {
   BlockPtr b = to<Block>(f->get_parent());
   if (!b) {
     return false;
@@ -656,10 +646,9 @@ class FunctionInliner : public IRMutator {
  public:
   FunctionInliner(StorePtr producer, std::unordered_set<BufPtr> outputs)
       : buf_(producer->buf()),
-        producer_(producer),
-        outputs_(std::move(outputs)),
-        success_(true) {
-    for (const auto& i : producer->indices()) {
+        producer_(std::move(producer)),
+        outputs_(std::move(outputs)) {
+    for (const auto& i : producer_->indices()) {
       if (auto index_var = to<Var>(i)) {
         index_vars_.insert(index_var);
         producer_index_vars_.push_back(index_var);
@@ -681,7 +670,7 @@ class FunctionInliner : public IRMutator {
   }
 
  private:
-  ExprPtr mutate_loads(BufPtr buf, std::vector<ExprPtr> dims) {
+  ExprPtr mutate_loads(const BufPtr& buf, std::vector<ExprPtr> dims) {
     std::vector<VarPtr> index_vars;
     if (buf->ndim() != producer_index_vars_.size()) {
       // Dimensions of producer and consumer expressions do not match in inliner
@@ -701,7 +690,7 @@ class FunctionInliner : public IRMutator {
         success_ = false;
         return nullptr;
       }
-      // Add a mapping for each function parameter to it's source name.
+      // Add a mapping for each function parameter to its source name.
       inline_mapping_[func_callee_arg] = func_caller_param;
       GRAPH_DEBUG(
           "ComputeInline: Inline mapping: ",
@@ -734,7 +723,7 @@ class FunctionInliner : public IRMutator {
     return result;
   }
 
-  ExprPtr mutate(LoadPtr v) override {
+  ExprPtr mutate(const LoadPtr& v) override {
     if (!success()) {
       return v;
     }
@@ -758,7 +747,7 @@ class FunctionInliner : public IRMutator {
   }
 
   // Replace the target variable with the caller expressions.
-  ExprPtr mutate(VarPtr v) override {
+  ExprPtr mutate(const VarPtr& v) override {
     if (!success()) {
       return v;
     }
@@ -773,7 +762,7 @@ class FunctionInliner : public IRMutator {
   }
 
   // Handle random intrinsics which should be cached.
-  ExprPtr mutate(IntrinsicsPtr v) override {
+  ExprPtr mutate(const IntrinsicsPtr& v) override {
     if (!success()) {
       return v;
     }
@@ -793,13 +782,13 @@ class FunctionInliner : public IRMutator {
   }
 
   // Remove the buffer write from the inlined function.
-  StmtPtr mutate(StorePtr v) override {
+  StmtPtr mutate(const StorePtr& v) override {
     if (!success()) {
       return v;
     }
     // If the buf_ is in the outputs set, keep its statement intact. Otherwise,
     // remove it.
-    if (v == producer_ && !outputs_.count(buf_)) {
+    if (v == producer_ && !outputs_.contains(buf_)) {
       in_producer_ = true;
       producer_ = to<Store>(IRMutator::mutate(v));
       if (!producer_) {
@@ -815,7 +804,7 @@ class FunctionInliner : public IRMutator {
   }
 
   // Any Random Intrinsics that were turned into vars must be inserted here.
-  StmtPtr mutate(BlockPtr v) override {
+  StmtPtr mutate(const BlockPtr& v) override {
     if (!success()) {
       return v;
     }
@@ -836,7 +825,7 @@ class FunctionInliner : public IRMutator {
     return Block::make(stmts);
   }
 
-  StmtPtr mutate(ForPtr v) override {
+  StmtPtr mutate(const ForPtr& v) override {
     if (!success()) {
       return v;
     }
@@ -880,12 +869,12 @@ class FunctionInliner : public IRMutator {
 };
 
 static StmtPtr computeInlineImpl(
-    BufPtr b,
-    StmtPtr stmt,
+    const BufPtr& b,
+    const StmtPtr& stmt,
     const std::unordered_set<BufPtr>& output_bufs) {
   // If buf is used or defined in an ExternalCall, we cannot inline it
   auto buf_load_store_uses = findLoadOrStoreUses(stmt);
-  if (!buf_load_store_uses.count(b)) {
+  if (!buf_load_store_uses.contains(b)) {
     return nullptr;
   }
   for (auto& use : buf_load_store_uses.at(b)) {
@@ -927,7 +916,7 @@ static StmtPtr computeInlineImpl(
   return nullptr;
 }
 
-bool LoopNest::computeInline(BufPtr b) {
+bool LoopNest::computeInline(const BufPtr& b) {
   // Inlining may not always be successful. Since all mutations now happen
   // in-place, an unsuccessful inlining transformation might leave the IR
   // in an invalid state. To get around this problem, we clone the root stmt,
@@ -943,7 +932,7 @@ bool LoopNest::computeInline(BufPtr b) {
   return true;
 }
 
-bool LoopNest::computeInline(StmtPtr s) {
+bool LoopNest::computeInline(const StmtPtr& s) {
   auto s_store = to<Store>(s);
   if (s_store == nullptr) {
     // Could not find buffer producer to inline
@@ -982,7 +971,7 @@ void LoopNest::inlineIntermediateBufs(bool allow_duplicated_work) {
       if (stores.size() == 1) {
         if (auto store = to<Store>(stores[0].s)) {
           auto input_as_load = to<Load>(store->value());
-          if (input_as_load && input_bufs.count(input_as_load->buf())) {
+          if (input_as_load && input_bufs.contains(input_as_load->buf())) {
             bufs_to_inline.insert(buf);
             continue;
           }
@@ -997,7 +986,7 @@ void LoopNest::inlineIntermediateBufs(bool allow_duplicated_work) {
         }
       }
 
-      // all bufs will have at least one store (if they have > 1 they cant be
+      // all bufs will have at least one store (if they have > 1 they can't be
       // inlined anyway)
       size_t reads = uses.size() - 1;
       // if only one read, we can inline it without duplicating work
@@ -1020,14 +1009,14 @@ void LoopNest::inlineIntermediateBufs(bool allow_duplicated_work) {
 class LoadOrStoreUseFinder : public IRVisitor {
  public:
   std::unordered_map<BufPtr, std::vector<BufLoadOrStoreUse>> findUses(
-      StmtPtr s) {
+      const StmtPtr& s) {
     uses_.clear();
     s->accept(this);
     return uses_;
   }
 
  private:
-  void visit(StorePtr v) override {
+  void visit(const StorePtr& v) override {
     if (stores_[v->buf()].insert(last_stmt_).second) {
       uses_[v->buf()].push_back({(StmtPtr)v, true});
     }
@@ -1035,7 +1024,7 @@ class LoadOrStoreUseFinder : public IRVisitor {
     IRVisitor::visit(v);
   }
 
-  void visit(ExternalCallPtr v) override {
+  void visit(const ExternalCallPtr& v) override {
     if (stores_[v->buf()].insert(last_stmt_).second) {
       uses_[v->buf()].push_back({(StmtPtr)v, true});
     }
@@ -1050,7 +1039,7 @@ class LoadOrStoreUseFinder : public IRVisitor {
     IRVisitor::visit(v);
   }
 
-  void visit(ExternalCallWithAllocPtr v) override {
+  void visit(const ExternalCallWithAllocPtr& v) override {
     for (const auto& out_buf : v->buf_out_args()) {
       if (stores_[out_buf].insert(last_stmt_).second) {
         uses_[out_buf].push_back({(StmtPtr)v, true});
@@ -1067,7 +1056,7 @@ class LoadOrStoreUseFinder : public IRVisitor {
     IRVisitor::visit(v);
   }
 
-  void visit(LoadPtr v) override {
+  void visit(const LoadPtr& v) override {
     if (loads_[v->buf()].insert(last_stmt_).second) {
       uses_[v->buf()].push_back({last_stmt_, false});
     }
@@ -1083,7 +1072,7 @@ class LoadOrStoreUseFinder : public IRVisitor {
 };
 
 std::unordered_map<BufPtr, std::vector<BufLoadOrStoreUse>> findLoadOrStoreUses(
-    StmtPtr s) {
+    const StmtPtr& s) {
   LoadOrStoreUseFinder uf;
   return uf.findUses(s);
 }
@@ -1091,26 +1080,26 @@ std::unordered_map<BufPtr, std::vector<BufLoadOrStoreUse>> findLoadOrStoreUses(
 class ContainedStmtsFinder : public IRVisitor {
  public:
   // Simply list all Stores and Block that are children of the given stmt
-  const std::unordered_set<StmtPtr>& findContainedStmts(StmtPtr s) {
+  const std::unordered_set<StmtPtr>& findContainedStmts(const StmtPtr& s) {
     contained_.clear();
     s->accept(this);
     return contained_;
   }
 
  private:
-  void visit(StorePtr v) override {
+  void visit(const StorePtr& v) override {
     contained_.insert((StmtPtr)v);
     IRVisitor::visit(v);
   }
-  void visit(ExternalCallPtr v) override {
+  void visit(const ExternalCallPtr& v) override {
     contained_.insert((StmtPtr)v);
     IRVisitor::visit(v);
   }
-  void visit(ExternalCallWithAllocPtr v) override {
+  void visit(const ExternalCallWithAllocPtr& v) override {
     contained_.insert((StmtPtr)v);
     IRVisitor::visit(v);
   }
-  void visit(BlockPtr v) override {
+  void visit(const BlockPtr& v) override {
     contained_.insert((StmtPtr)v);
     IRVisitor::visit(v);
   }
@@ -1123,11 +1112,11 @@ class StmtDeleter : public IRMutator {
   StmtDeleter(const std::unordered_set<StmtPtr>& targets) : targets_(targets) {}
 
  private:
-  StmtPtr mutate(BlockPtr v) override {
+  StmtPtr mutate(const BlockPtr& v) override {
     std::vector<StmtPtr> stmts;
 
     for (const auto& s : v->stmts()) {
-      if (targets_.count(s) == 0) {
+      if (!targets_.contains(s)) {
         StmtPtr ns = s->accept_mutator(this);
         if (ns) {
           stmts.push_back(Stmt::clone(ns));
@@ -1191,7 +1180,7 @@ class IfThenElseReplacer : public IRCloner {
   IfThenElseReplacer(IfThenElsePtr to_replace, ExprPtr new_expr)
       : to_replace_(std::move(to_replace)), new_expr_(std::move(new_expr)) {}
 
-  ExprPtr mutate(IfThenElsePtr i) override {
+  ExprPtr mutate(const IfThenElsePtr& i) override {
     if (i == to_replace_) {
       return new_expr_;
     }
@@ -1212,7 +1201,7 @@ class IfThenElseReplacer : public IRCloner {
 //   * sets `compared_value` to `expr`, and
 //   * returns true.
 bool isConditionOptimizable(
-    ExprPtr condition,
+    const ExprPtr& condition,
     VarPtr* cond_var,
     ExprPtr* compared_value) {
   auto cs = to<CompareSelect>(condition);
@@ -1245,12 +1234,11 @@ bool isConditionOptimizable(
 //   * sub_exprs to the list of sub-expressions that are the result of this
 //     if-then-else expression.
 bool isConditionalFromCat(
-    IfThenElsePtr ite,
+    const IfThenElsePtr& ite,
     VarPtr* cond_var,
     std::vector<ExprPtr>* comp_values,
     std::vector<ExprPtr>* sub_exprs) {
   VarPtr var = nullptr;
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   ExprPtr comp_value;
   if (isConditionOptimizable(ite->condition(), &var, &comp_value)) {
     if (*cond_var == nullptr) {
@@ -1345,7 +1333,7 @@ bool LoopNest::optimizeConditionals() {
       // refers to a loop that is not normalized.
       continue;
     }
-    if (split_fors.count(for_to_split)) {
+    if (split_fors.contains(for_to_split)) {
       // This loop has already been split while optimizing conditionals
       // earlier.
       //
@@ -1406,7 +1394,7 @@ void LoopNest::vectorizeInnerLoops() {
       blocks.pop_back();
 
       for (const StmtPtr& s : *b) {
-        if (ForPtr f = to<For>(s)) {
+        if (const ForPtr& f = to<For>(s)) {
           worklist.push_back(f);
         } else if (BlockPtr b2 = to<Block>(s)) {
           blocks.push_back(b2);
@@ -1424,7 +1412,7 @@ void LoopNest::vectorizeInnerLoops() {
     bool containsSubLoops = false;
     if (BlockPtr body = to<Block>(f->body())) {
       for (const StmtPtr& s2 : *body) {
-        if (ForPtr f2 = to<For>(s2)) {
+        if (const ForPtr& f2 = to<For>(s2)) {
           containsSubLoops = true;
           worklist.push_back(f2);
         }
@@ -1438,9 +1426,7 @@ void LoopNest::vectorizeInnerLoops() {
 
   // vectorize inner loops.
   for (const ForPtr& loop : innerLoops) {
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     ForPtr split1;
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     ForPtr tail1;
 
     static const int kBodyVectorWidth = 8;
@@ -1448,9 +1434,7 @@ void LoopNest::vectorizeInnerLoops() {
     vectorize(split1);
 
     if (tail1) {
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
       ForPtr split2;
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
       ForPtr tail2;
       static const int kTailVectorWidth = 4;
       splitWithTail(tail1, kTailVectorWidth, &split2, &tail2);
@@ -1459,7 +1443,11 @@ void LoopNest::vectorizeInnerLoops() {
   }
 }
 
-void LoopNest::sliceHead(ForPtr f, int factor, ForPtr* head, ForPtr* tail) {
+void LoopNest::sliceHead(
+    const ForPtr& f,
+    int factor,
+    ForPtr* head,
+    ForPtr* tail) {
   if (intValue(f->start()) && intValue(f->stop())) {
     auto start_val = *intValue(f->start());
     auto stop_val = *intValue(f->stop());
@@ -1471,14 +1459,10 @@ void LoopNest::sliceHead(ForPtr f, int factor, ForPtr* head, ForPtr* tail) {
     }
   }
 
-  if (!f) {
-    throw malformed_input("sliceHead attempted on null loop");
-  }
+  TORCH_CHECK(f, "MALFORMED INPUT: sliceHead attempted on null loop");
 
   BlockPtr p = to<Block>(f->get_parent());
-  if (!p) {
-    throw malformed_input("sliceHead attempted on loop with no parent");
-  }
+  TORCH_CHECK(p, "MALFORMED INPUT: sliceHead attempted on loop with no parent");
 
   ExprPtr head_end = alloc<Min>(
       alloc<Add>(f->start(), immLike(f->stop(), factor)), f->stop(), true);
@@ -1493,13 +1477,16 @@ void LoopNest::sliceHead(ForPtr f, int factor, ForPtr* head, ForPtr* tail) {
     LoopNest::normalize(*tail);
   }
 }
-void LoopNest::sliceHead(ForPtr f, int factor) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+void LoopNest::sliceHead(const ForPtr& f, int factor) {
   ForPtr head, tail;
   sliceHead(f, factor, &head, &tail);
 }
 
-void LoopNest::sliceTail(ForPtr f, int factor, ForPtr* head, ForPtr* tail) {
+void LoopNest::sliceTail(
+    const ForPtr& f,
+    int factor,
+    ForPtr* head,
+    ForPtr* tail) {
   if (intValue(f->start()) && intValue(f->stop())) {
     auto start_val = *intValue(f->start());
     auto stop_val = *intValue(f->stop());
@@ -1511,14 +1498,10 @@ void LoopNest::sliceTail(ForPtr f, int factor, ForPtr* head, ForPtr* tail) {
     }
   }
 
-  if (!f) {
-    throw malformed_input("sliceTail attempted on null loop");
-  }
+  TORCH_CHECK(f, "MALFORMED INPUT: sliceTail attempted on null loop");
 
   BlockPtr p = to<Block>(f->get_parent());
-  if (!p) {
-    throw malformed_input("sliceTail attempted on loop with no parent");
-  }
+  TORCH_CHECK(p, "MALFORMED INPUT: sliceTail attempted on loop with no parent");
 
   ExprPtr tail_start = alloc<Max>(
       f->start(), alloc<Sub>(f->stop(), immLike(f->stop(), factor)), true);
@@ -1533,31 +1516,26 @@ void LoopNest::sliceTail(ForPtr f, int factor, ForPtr* head, ForPtr* tail) {
     LoopNest::normalize(*head);
   }
 }
-void LoopNest::sliceTail(ForPtr f, int factor) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+void LoopNest::sliceTail(const ForPtr& f, int factor) {
   ForPtr head, tail;
   sliceTail(f, factor, &head, &tail);
 }
 
-void LoopNest::splitWithTail(ForPtr f, int factor) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+void LoopNest::splitWithTail(const ForPtr& f, int factor) {
   ForPtr inner, tail;
   splitWithTail(f, factor, &inner, &tail);
 }
 
 void LoopNest::splitWithTail(
-    ForPtr f,
+    const ForPtr& f,
     int factor,
     ForPtr* inner,
     ForPtr* tail) {
-  if (!f) {
-    throw malformed_input("splitWithTail attempted on null loop");
-  }
+  TORCH_CHECK(f, "MALFORMED INPUT: splitWithTail attempted on null loop");
 
   BlockPtr p = to<Block>(f->get_parent());
-  if (!p) {
-    throw malformed_input("splitWithTail attempted on loop with no parent");
-  }
+  TORCH_CHECK(
+      p, "MALFORMED INPUT: splitWithTail attempted on loop with no parent");
 
   // Normalize the loop to simplify start and stop bound computation
   normalize(f);
@@ -1615,13 +1593,12 @@ void LoopNest::splitWithTail(
   f->set_body(*inner);
 }
 
-void LoopNest::splitWithMask(ForPtr f, int factor) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+void LoopNest::splitWithMask(const ForPtr& f, int factor) {
   ForPtr inner;
   splitWithMask(f, factor, &inner);
 }
 
-void LoopNest::splitWithMask(ForPtr f, int factor, ForPtr* inner) {
+void LoopNest::splitWithMask(const ForPtr& f, int factor, ForPtr* inner) {
   BlockPtr p = to<Block>(f->get_parent());
   if (!p) {
     std::cerr << "Parent is not a Block!\n";
@@ -1662,9 +1639,7 @@ void LoopNest::splitWithMask(ForPtr f, int factor, ForPtr* inner) {
   // are only materializing predicates at the last, lowering, step.
   if (tail_is_needed) {
     auto start = intValue(f->start());
-    if (!start || *start != 0) {
-      throw unimplemented_lowering();
-    }
+    TORCH_CHECK(start && *start == 0, "UNIMPLEMENTED LOWERING");
 
     ExprPtr predicate =
         CompareSelect::make(ExprHandle(f->var()), ExprHandle(f->stop()), kLT)
@@ -1683,21 +1658,22 @@ void LoopNest::splitWithMask(ForPtr f, int factor, ForPtr* inner) {
 }
 
 std::vector<ForPtr> LoopNest::distributeLoop(
-    ForPtr loop,
+    const ForPtr& loop,
     const std::unordered_set<StmtPtr>& pivots) {
   TORCH_INTERNAL_ASSERT(
       loop,
       buildErrorMessage(
           "Expected non-null loop in distributeLoop in the fuser."));
   auto root = loop->get_parent();
-  if (root == nullptr) {
-    throw malformed_input("Loop without parent: ", loop);
-  }
+  TORCH_CHECK(
+      root != nullptr,
+      "MALFORMED INPUT: Loop without parent:  - ",
+      std::to_string(loop));
   auto root_block = to<Block>(root);
-  if (root_block == nullptr) {
-    throw malformed_input(
-        "Loop's parent must be a Block, instead found ", root);
-  }
+  TORCH_CHECK(
+      root_block != nullptr,
+      "MALFORMED INPUT: Loop's parent must be a Block, instead found  - ",
+      std::to_string(root));
 
   // Extract bodies for all the loops after distribution.
   std::vector<BlockPtr> new_loop_bodies;
@@ -1706,7 +1682,7 @@ std::vector<ForPtr> LoopNest::distributeLoop(
     auto s = loop->body()->front();
     loop->body()->remove_stmt(s);
     new_loop_body->append_stmt(s);
-    if (pivots.count(s)) {
+    if (pivots.contains(s)) {
       new_loop_bodies.push_back(new_loop_body);
       new_loop_body = alloc<Block>(std::vector<StmtPtr>({}));
     }
@@ -1730,13 +1706,13 @@ std::vector<ForPtr> LoopNest::distributeLoop(
   return new_loops;
 }
 
-std::vector<ForPtr> LoopNest::distributeLoop(ForPtr loop) {
+std::vector<ForPtr> LoopNest::distributeLoop(const ForPtr& loop) {
   std::unordered_set<StmtPtr> stmtsInBlock(
       loop->body()->begin(), loop->body()->end());
   return distributeLoop(loop, stmtsInBlock);
 }
 
-std::vector<ForPtr> LoopNest::distributeLoopAndParents(ForPtr loop) {
+std::vector<ForPtr> LoopNest::distributeLoopAndParents(const ForPtr& loop) {
   auto parentLoop = getParentLoop(loop);
   auto result = distributeLoop(loop);
   if (parentLoop) {
@@ -1745,14 +1721,14 @@ std::vector<ForPtr> LoopNest::distributeLoopAndParents(ForPtr loop) {
   return result;
 }
 
-std::vector<ForPtr> LoopNest::distributeLoopOverInnerLoops(ForPtr loop) {
+std::vector<ForPtr> LoopNest::distributeLoopOverInnerLoops(const ForPtr& loop) {
   auto loops = NodeFinder<For>::find(loop);
   std::unordered_set<StmtPtr> loopsSet(loops.begin(), loops.end());
   return distributeLoop(loop, loopsSet);
 }
 
 std::vector<ForPtr> LoopNest::distributeLoopAndParentsOverInnerLoops(
-    ForPtr loop) {
+    const ForPtr& loop) {
   auto parentLoop = getParentLoop(loop);
   auto result = distributeLoopOverInnerLoops(loop);
   if (parentLoop) {
@@ -1761,16 +1737,16 @@ std::vector<ForPtr> LoopNest::distributeLoopAndParentsOverInnerLoops(
   return result;
 }
 
-static bool areEqual(ExprPtr expr1, ExprPtr expr2) {
+static bool areEqual(const ExprPtr& expr1, const ExprPtr& expr2) {
   auto diff = IRSimplifier::simplify(alloc<Sub>(expr1, expr2));
   return diff->isConstant() && (immediateAs<int>(diff) == 0);
-};
+}
 
 static bool doesExprContainAnyVar(
-    ExprPtr expr,
+    const ExprPtr& expr,
     const std::unordered_set<VarPtr>& vars) {
   for (const auto& v : VarFinder::find(expr)) {
-    if (vars.count(v)) {
+    if (vars.contains(v)) {
       return true;
     }
   }
@@ -1800,7 +1776,7 @@ static bool areIndicesLoopIndependent(
   return true;
 }
 
-bool LoopNest::hasLoopCarriedDependence(ForPtr loop) {
+bool LoopNest::hasLoopCarriedDependence(const ForPtr& loop) {
   analysis::MemDependencyChecker analyzer;
   loop->accept(&analyzer);
 
@@ -1996,7 +1972,6 @@ bool LoopNest::fuseLoops(const std::vector<ForPtr>& loops, ForPtr* fused) {
     loops_copy.push_back(to<For>(l_copy));
     parent->append_stmt(l_copy);
   }
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   ForPtr fused_copy;
   bool ret = unsafeFuseLoops(loops_copy, &fused_copy);
   if (!ret || hasLoopCarriedDependence(fused_copy)) {
@@ -2031,16 +2006,14 @@ ForPtr LoopNest::findOuterFor(ForPtr a, ForPtr b) {
   return nullptr;
 }
 
-void LoopNest::reorderAxis(ForPtr a, ForPtr b) {
+void LoopNest::reorderAxis(const ForPtr& a, const ForPtr& b) {
   if (a == b) {
     // nothing to do.
     return;
   }
   // find inner and outer.
   ForPtr outer = findOuterFor(a, b);
-  if (outer == nullptr) {
-    throw std::runtime_error("Reordered a loop not in LoopNest");
-  }
+  TORCH_CHECK(outer != nullptr, "Reordered a loop not in LoopNest");
 
   ForPtr inner = a == outer ? b : a;
   std::deque<ForPtr> internal_axes;
@@ -2048,11 +2021,10 @@ void LoopNest::reorderAxis(ForPtr a, ForPtr b) {
   // Find relevant axes, store reversed.
   StmtPtr s = inner;
   while (s != outer) {
-    if (ForPtr f = to<For>(s)) {
+    if (const ForPtr& f = to<For>(s)) {
       internal_axes.push_back(f);
     }
 
-    // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
     s = s->get_parent();
   }
 
@@ -2174,26 +2146,26 @@ static bool isValidPermutation(std::vector<size_t> permutation) {
 std::vector<ForPtr> LoopNest::reorder(
     const std::vector<ForPtr>& loops,
     const std::vector<size_t>& permutation) {
-  if (loops.size() != permutation.size()) {
-    throw malformed_input("invalid permutation size");
-  }
+  TORCH_CHECK(
+      loops.size() == permutation.size(),
+      "MALFORMED INPUT: invalid permutation size");
   if (isTrivialPermutation(permutation)) {
     return loops;
   }
-  if (!isValidPermutation(permutation)) {
-    throw malformed_input("invalid permutation for reorder");
-  }
+  TORCH_CHECK(
+      isValidPermutation(permutation),
+      "MALFORMED INPUT: invalid permutation for reorder");
   if (loops.size() < 2) {
     return loops;
   }
-  if (!areLoopsPerfectlyNested(loops)) {
-    throw malformed_input("reorder is only allowed on perfectly nested loops");
-  }
+  TORCH_CHECK(
+      areLoopsPerfectlyNested(loops),
+      "MALFORMED INPUT: reorder is only allowed on perfectly nested loops");
 
   auto parent = to<Block>(loops.front()->get_parent());
-  if (parent == nullptr) {
-    throw malformed_input("parent of the loops must be a Block");
-  }
+  TORCH_CHECK(
+      parent != nullptr,
+      "MALFORMED INPUT: parent of the loops must be a Block");
 
   // Reorder the loops according to the permutation.
   std::vector<ForPtr> result(loops.size());
@@ -2230,13 +2202,11 @@ ForPtr LoopNest::getLoopAt(ForPtr root, const std::vector<int>& indices) const {
   if (indices.empty()) {
     return root;
   }
-  if (root == nullptr) {
-    throw malformed_input("root loop is null");
-  }
+  TORCH_CHECK(root != nullptr, "MALFORMED INPUT: root loop is null");
 
-  ForPtr curr = root;
+  ForPtr curr = std::move(root);
   for (auto i : indices) {
-    if (i < 0 || curr->body()->nstmts() <= i) {
+    if (i < 0 || curr->body()->nstmts() <= static_cast<size_t>(i)) {
       return nullptr;
     }
     std::list<StmtPtr>::iterator stmtp = curr->body()->begin();
@@ -2250,20 +2220,22 @@ ForPtr LoopNest::getLoopAt(ForPtr root, const std::vector<int>& indices) const {
   return curr;
 }
 
-ForPtr LoopNest::tile(ForPtr x, ForPtr y, int x_factor, int y_factor) {
+ForPtr LoopNest::tile(
+    const ForPtr& x,
+    const ForPtr& y,
+    int x_factor,
+    int y_factor) {
   auto parent = to<Block>(x->get_parent());
-  if (parent == nullptr) {
-    throw malformed_input("parent of the loops must be a Block");
-  }
-  if (!areLoopsPerfectlyNested({x, y})) {
-    throw malformed_input("two loops must be perfectly nested");
-  }
+  TORCH_CHECK(
+      parent != nullptr,
+      "MALFORMED INPUT: parent of the loops must be a Block");
+  TORCH_CHECK(
+      areLoopsPerfectlyNested({x, y}),
+      "MALFORMED INPUT: two loops must be perfectly nested");
 
   // Split x, y axes by x_factor and y_factor
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   ForPtr yi, ytail;
   splitWithTail(y, y_factor, &yi, &ytail);
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   ForPtr xi, xtail;
   splitWithTail(x, x_factor, &xi, &xtail);
 
@@ -2301,22 +2273,17 @@ bool LoopNest::areLoopsPerfectlyNested(const std::vector<ForPtr>& loops) {
   return true;
 }
 
-void LoopNest::fullUnroll(ForPtr f, StmtPtr* unrolled) {
+void LoopNest::fullUnroll(const ForPtr& f, StmtPtr* unrolled) {
   BlockPtr p = to<Block>(f->get_parent());
-  if (!f) {
-    throw malformed_input("unroll attempted on null loop");
-  } else if (!p) {
-    throw malformed_input("unroll attempted on loop with no parent");
-  }
+  TORCH_CHECK(f, "MALFORMED INPUT: unroll attempted on null loop");
+  TORCH_CHECK(p, "MALFORMED INPUT: unroll attempted on loop with no parent");
 
   auto start_expr = IRSimplifier::simplify(f->start());
   auto stop_expr = IRSimplifier::simplify(f->stop());
-  if (!start_expr->isConstant()) {
-    throw std::runtime_error("Can't unroll due to non-constant loop start!");
-  }
-  if (!stop_expr->isConstant()) {
-    throw std::runtime_error("Can't unroll due to non-constant loop stop!");
-  }
+  TORCH_CHECK(
+      start_expr->isConstant(), "Can't unroll due to non-constant loop start!");
+  TORCH_CHECK(
+      stop_expr->isConstant(), "Can't unroll due to non-constant loop stop!");
 
   std::vector<StmtPtr> unrolled_stmts;
   int start_val = immediateAs<int>(start_expr);
@@ -2333,39 +2300,34 @@ void LoopNest::fullUnroll(ForPtr f, StmtPtr* unrolled) {
   p->replace_stmt(f, *unrolled);
 }
 
-void LoopNest::fullUnroll(ForPtr f) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+void LoopNest::fullUnroll(const ForPtr& f) {
   StmtPtr unrolled;
   fullUnroll(f, &unrolled);
 }
 
-void LoopNest::unroll(ForPtr f, int factor, ForPtr* tail) {
+void LoopNest::unroll(const ForPtr& f, int factor, ForPtr* tail) {
   if (factor < 2) {
     return;
   }
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   ForPtr inner;
   splitWithTail(f, factor, &inner, tail);
   fullUnroll(inner);
 }
 
-void LoopNest::unroll(ForPtr f, int factor) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+void LoopNest::unroll(const ForPtr& f, int factor) {
   ForPtr tail;
   unroll(f, factor, &tail);
 }
 
-bool LoopNest::isNormalized(ForPtr f) {
+bool LoopNest::isNormalized(const ForPtr& f) {
   if (f->start()->isConstant()) {
     return immediateAs<int>(f->start()) == 0;
   }
   return false;
 }
 
-bool LoopNest::normalize(ForPtr f) {
-  if (!f) {
-    throw malformed_input("normalize attempted on null loop");
-  }
+bool LoopNest::normalize(const ForPtr& f) {
+  TORCH_CHECK(f, "MALFORMED INPUT: normalize attempted on null loop");
 
   if (isNormalized(f)) {
     // No need to normalize anymore here.
@@ -2383,7 +2345,9 @@ bool LoopNest::normalize(ForPtr f) {
 
 // This function expects that there are 'num' loops perfectly nested within
 // and including 'f'.
-std::vector<ForPtr> LoopNest::getLoopStmtsInLoopNest(ForPtr f, size_t num) {
+std::vector<ForPtr> LoopNest::getLoopStmtsInLoopNest(
+    const ForPtr& f,
+    size_t num) {
   std::vector<ForPtr> loops(num);
   ForPtr curr_for = f;
   loops[0] = curr_for;
@@ -2401,13 +2365,11 @@ std::vector<ForPtr> LoopNest::getLoopStmtsInLoopNest(ForPtr f, size_t num) {
 }
 
 bool LoopNest::flatten(const std::vector<ForPtr>& loops, ForPtr* flattened) {
-  if (loops.empty()) {
-    throw malformed_input("flatten attempted on empty set of loops");
-  }
+  TORCH_CHECK(
+      !loops.empty(),
+      "MALFORMED INPUT: flatten attempted on empty set of loops");
   BlockPtr p = to<Block>(loops[0]->get_parent());
-  if (!p) {
-    throw malformed_input("flatten attempted on loops with no parent");
-  }
+  TORCH_CHECK(p, "MALFORMED INPUT: flatten attempted on loops with no parent");
 
   if (loops.size() == 1) {
     // This loop nest is already flattened.
@@ -2431,7 +2393,6 @@ bool LoopNest::flatten(const std::vector<ForPtr>& loops, ForPtr* flattened) {
   // loop is normalized, the given pointers to inner loops point to old code.
   // For the same reason, we can't store the normalized inner loops until after
   // the outer-most loop is normalized.
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   for (size_t i = 0; i < loops.size(); ++i) {
     size_t idx = loops.size() - i - 1;
     LoopNest::normalize(loops[idx]);
@@ -2439,7 +2400,6 @@ bool LoopNest::flatten(const std::vector<ForPtr>& loops, ForPtr* flattened) {
 
   // 'normalized' points to the outer-most loop in the normalized loopnest.
   // Collect all the normalized loops.
-  // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
   auto normalized_loops = getLoopStmtsInLoopNest(loops.front(), loops.size());
 
   auto flat_var = alloc<Var>(
@@ -2467,12 +2427,11 @@ bool LoopNest::flatten(const std::vector<ForPtr>& loops, ForPtr* flattened) {
 }
 
 bool LoopNest::flatten(const std::vector<ForPtr>& loops) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   ForPtr flattened;
   return flatten(loops, &flattened);
 }
 
-void LoopNest::compressBuffer(BufPtr buf, StmtPtr stmt) {
+void LoopNest::compressBuffer(const BufPtr& buf, const StmtPtr& stmt) {
   // Loop iterations in NNC IR do not follow sequential semantics by default.
   // In other words, the iterations of the loops could be executed in any
   // random order without affecting correctness. This constraint in turn
@@ -2536,7 +2495,7 @@ void LoopNest::compressBuffer(BufPtr buf, StmtPtr stmt) {
     for (size_t i = 0; i < indices.size(); ++i) {
       auto index_vars = NodeFinder<Var>::find(indices[i]);
       for (const auto& iv : index_vars) {
-        if (loop_vars.count(iv) == 0) {
+        if (!loop_vars.contains(iv)) {
           // A variable in this index is not in loop_vars.
           // This implies that this dimension cannot be optimized away.
           dims[i] = false;
@@ -2598,18 +2557,18 @@ void LoopNest::compressBuffer(BufPtr buf, StmtPtr stmt) {
   }
 }
 
-void LoopNest::compressAllBuffers(StmtPtr stmt) {
+void LoopNest::compressAllBuffers(const StmtPtr& stmt) {
   for (const auto& buf : BufFinder::find(stmt)) {
     compressBuffer(buf, stmt);
   }
 }
 
-std::vector<ForPtr> LoopNest::getLoopStmtsFor(Tensor t) const {
+std::vector<ForPtr> LoopNest::getLoopStmtsFor(const Tensor& t) const {
   StmtPtr cur_stmt = getLoopBodyFor(t);
   return getLoopStmtsFor(cur_stmt);
 }
 
-std::vector<ForPtr> LoopNest::getLoopStmtsFor(BufPtr buf) const {
+std::vector<ForPtr> LoopNest::getLoopStmtsFor(const BufPtr& buf) const {
   StmtPtr cur_stmt = getLoopBodyFor(buf);
   return getLoopStmtsFor(cur_stmt);
 }
@@ -2627,19 +2586,19 @@ std::vector<ForPtr> LoopNest::getLoopStmtsFor(StmtPtr s) const {
   return result;
 }
 
-StmtPtr LoopNest::getLoopBodyFor(Tensor t) const {
+StmtPtr LoopNest::getLoopBodyFor(const Tensor& t) const {
   return getLoopBodyFor(t.buf());
 }
 
 StmtPtr LoopNest::getLoopBodyFor(BufPtr buf) const {
-  auto writes = WritesToBuf::find(root_stmt_, buf);
+  auto writes = WritesToBuf::find(root_stmt_, std::move(buf));
 
   // special case for reduction Tensors, ignore the initializer if it's the only
   // op:
   if (writes.size() == 2) {
     if (StorePtr s = to<Store>(writes.back())) {
       if (ReduceOpPtr r = to<ReduceOp>(s->value())) {
-        return (StmtPtr)s; // NOLINT
+        return (StmtPtr)s;
       }
     }
   }
@@ -2654,10 +2613,10 @@ StmtPtr LoopNest::getLoopBodyFor(BufPtr buf) const {
     res = Block::getSharedParent(res, s);
   }
 
-  return (StmtPtr)res; // NOLINT
+  return (StmtPtr)res;
 }
 
-ForPtr LoopNest::getParentLoop(StmtPtr st) {
+ForPtr LoopNest::getParentLoop(const StmtPtr& st) {
   if (st == nullptr) {
     return nullptr;
   }
@@ -2668,7 +2627,7 @@ ForPtr LoopNest::getParentLoop(StmtPtr st) {
   return getParentLoop(par);
 }
 
-std::vector<ForPtr> LoopNest::getEnclosingLoopNest(StmtPtr st) {
+std::vector<ForPtr> LoopNest::getEnclosingLoopNest(const StmtPtr& st) {
   std::vector<ForPtr> loops;
   auto f = getParentLoop(st);
   while (f) {
@@ -2680,12 +2639,12 @@ std::vector<ForPtr> LoopNest::getEnclosingLoopNest(StmtPtr st) {
 }
 
 std::vector<StmtPtr> LoopNest::getAllWritesToBuf(BufPtr buf) const {
-  return WritesToBuf::find(root_stmt_, buf);
+  return WritesToBuf::find(root_stmt_, std::move(buf));
 }
 
 std::vector<ForPtr> LoopNest::getAllInnermostLoopsWritingToBuf(
     BufPtr buf) const {
-  auto writes = getAllWritesToBuf(buf);
+  auto writes = getAllWritesToBuf(std::move(buf));
   std::vector<ForPtr> innermost_loops;
   innermost_loops.reserve(writes.size());
   for (const auto& w : writes) {
@@ -2696,7 +2655,7 @@ std::vector<ForPtr> LoopNest::getAllInnermostLoopsWritingToBuf(
 
 std::vector<std::vector<ForPtr>> LoopNest::getAllLoopNestsWritingToBuf(
     BufPtr buf) const {
-  auto writes = getAllWritesToBuf(buf);
+  auto writes = getAllWritesToBuf(std::move(buf));
   std::vector<std::vector<ForPtr>> loopnests;
   loopnests.reserve(writes.size());
   for (const auto& w : writes) {
@@ -2710,7 +2669,7 @@ StmtPtr LoopNest::simplify() {
   return root_stmt_;
 }
 
-StmtPtr FlattenIndexes(StmtPtr s) {
+StmtPtr FlattenIndexes(const StmtPtr& s) {
   IndexFlattener idx_flattener;
   return idx_flattener.flatten(s);
 }
@@ -2732,7 +2691,7 @@ class LoopComputeAtRewriter : public IRMutator {
   BufPtr new_buf_;
   std::vector<ExprPtr> offsets_;
 
-  ExprPtr mutate(LoadPtr v) override {
+  ExprPtr mutate(const LoadPtr& v) override {
     if (v->buf() != buf_) {
       return v;
     }
@@ -2745,7 +2704,7 @@ class LoopComputeAtRewriter : public IRMutator {
   }
 };
 
-static StorePtr getStoreStmtOfProducer(StmtPtr s) {
+static StorePtr getStoreStmtOfProducer(const StmtPtr& s) {
   if (StorePtr st = to<Store>(s)) {
     return st;
   }
@@ -2761,7 +2720,7 @@ static StorePtr getStoreStmtOfProducer(StmtPtr s) {
 
 static std::vector<VarPtr> getOuterLoopIndexes(StmtPtr s) {
   std::vector<VarPtr> res;
-  StmtPtr cur = s;
+  StmtPtr cur = std::move(s);
   while (cur) {
     if (auto l = to<For>(cur)) {
       res.push_back(l->var());
@@ -2777,7 +2736,7 @@ class CacheReplacer : public IRMutator {
       : buf_(std::move(buffer)), cache_(std::move(cache)), offsets_(offsets) {}
 
  private:
-  ExprPtr mutate(LoadPtr v) override {
+  ExprPtr mutate(const LoadPtr& v) override {
     BufPtr buf = v->buf();
     if (buf != buf_) {
       return IRMutator::mutate(v);
@@ -2800,7 +2759,7 @@ class CacheReplacer : public IRMutator {
     return v;
   }
 
-  StmtPtr mutate(StorePtr v) override {
+  StmtPtr mutate(const StorePtr& v) override {
     BufPtr buf = v->buf();
     if (buf != buf_) {
       return IRMutator::mutate(v);
@@ -2832,9 +2791,9 @@ class CacheReplacer : public IRMutator {
 };
 
 LoopNest::AccessResult LoopNest::cacheAccesses(
-    BufPtr producer,
+    const BufPtr& producer,
     const std::string& name,
-    StmtPtr consumer) {
+    const StmtPtr& consumer) {
   ReduceOpPtr reduceOp{nullptr};
   auto stores = NodeFinder<Store>::find(consumer);
   for (const auto& store : stores) {
@@ -2843,11 +2802,9 @@ LoopNest::AccessResult LoopNest::cacheAccesses(
         continue;
       }
 
-      if (reduceOp) {
-        throw std::runtime_error(
-            "can only cache accesses used by at most a single reduceOp");
-        return {nullptr, nullptr};
-      }
+      TORCH_CHECK(
+          !reduceOp,
+          "can only cache accesses used by at most a single reduceOp");
 
       reduceOp = ro;
     }
@@ -2856,10 +2813,9 @@ LoopNest::AccessResult LoopNest::cacheAccesses(
   // Check bounds but don't care about AccessKind.
   auto consumer_bounds_info = inferBounds(consumer, false);
   auto bounds_it = consumer_bounds_info.find(producer);
-  if (bounds_it == consumer_bounds_info.end()) {
-    throw std::runtime_error("consumer does not use the Tensor produced");
-    return {nullptr, nullptr};
-  }
+  TORCH_CHECK(
+      bounds_it != consumer_bounds_info.end(),
+      "consumer does not use the Tensor produced");
 
   TORCH_INTERNAL_ASSERT(
       bounds_it->second.size() == 1,
@@ -2920,7 +2876,7 @@ LoopNest::AccessResult LoopNest::cacheAccesses(
       enclosing_vars.insert(enclosing_for_stmt->var());
     }
     for (const auto& reduce_arg : reduce_args) {
-      if (enclosing_vars.find(reduce_arg) == enclosing_vars.end()) {
+      if (!enclosing_vars.contains(reduce_arg)) {
         on_reduce_axis = true;
       }
     }
@@ -2989,7 +2945,8 @@ LoopNest::AccessResult LoopNest::cacheAccesses(
     StmtPtr tmp_store = alloc<Store>(
         producer, tmp_params, alloc<Load>(tmp_buf, new_loop_vars_expr));
 
-    for (int64_t i = new_loop_vars.size() - 1; i >= 0; --i) {
+    for (int64_t i = static_cast<int64_t>(new_loop_vars.size()) - 1; i >= 0;
+         --i) {
       tmp_store = alloc<For>(
           new_loop_vars[i], immLike(tmp_dims[i], 0), tmp_dims[i], tmp_store);
     }
@@ -3029,7 +2986,7 @@ LoopNest::AccessResult LoopNest::cacheAccesses(
  * redundant computations: we're calling `sin` twice as much as in the first
  * version.
  *
- * Ultimately, we nede to choose at what point we prefer to compute values of
+ * Ultimately, we need to choose at what point we prefer to compute values of
  * A[i,j] - we can do it in the very beginning for the entire buffer A (the
  * first option) or compute it on the fly when we compute B (the second option).
  * There are also options in between those two: we can compute a part of B which
@@ -3112,7 +3069,7 @@ LoopNest::AccessResult LoopNest::cacheAccesses(
  *   `temp` instead of `producer`. The indices in the corresponding accesses
  *   also need to be offset.
  */
-void LoopNest::computeAt(StmtPtr s, ForPtr f) {
+void LoopNest::computeAt(const StmtPtr& s, const ForPtr& f) {
   StorePtr st = getStoreStmtOfProducer(s);
   if (!st) {
     return;
@@ -3140,7 +3097,7 @@ void LoopNest::computeAt(StmtPtr s, ForPtr f) {
   for (const auto i : c10::irange(dims.size())) {
     // TODO: Use name-hint of the producer indices instead of 'idx'
     temp_indices[i] =
-        alloc<Var>(std::string("idx") + c10::to_string(i), dims[i]->dtype());
+        alloc<Var>(std::string("idx") + std::to_string(i), dims[i]->dtype());
   }
 
   // Prepare substitute rules for constructing the temp statement from the prod
@@ -3214,7 +3171,7 @@ class RfactorStoreRewriter : public IRMutator {
     new_indices_.push_back(reduction_var_);
   }
 
-  ExprPtr mutate(LoadPtr v) override {
+  ExprPtr mutate(const LoadPtr& v) override {
     if (v->buf() != old_buf_) {
       return IRMutator::mutate(v);
     }
@@ -3238,7 +3195,7 @@ class RfactorStoreRewriter : public IRMutator {
     return alloc<Load>(new_buf_, new_indices_);
   }
 
-  ExprPtr mutate(ReduceOpPtr v) override {
+  ExprPtr mutate(const ReduceOpPtr& v) override {
     ExprPtr body_new = v->body()->accept_mutator(this);
 
     std::vector<VarPtr> new_reduce_args;
@@ -3251,7 +3208,7 @@ class RfactorStoreRewriter : public IRMutator {
     return alloc<ReduceOp>(body_new, new_reduce_args, v->reducer());
   }
 
-  StmtPtr mutate(StorePtr v) override {
+  StmtPtr mutate(const StorePtr& v) override {
     if (v->buf() != old_buf_) {
       return IRMutator::mutate(v);
     }
@@ -3284,14 +3241,14 @@ class RfactorStoreRewriter : public IRMutator {
   std::vector<ExprPtr> new_indices_;
 };
 
-bool LoopNest::rfactor(StmtPtr st, ForPtr target_for) {
+bool LoopNest::rfactor(const StmtPtr& st, const ForPtr& target_for) {
   BufPtr tmp_buf = nullptr;
   return rfactor(st, target_for, &tmp_buf);
 }
 
 bool LoopNest::rfactor(
-    StmtPtr st,
-    ForPtr outer_reduction_for,
+    const StmtPtr& st,
+    const ForPtr& outer_reduction_for,
     BufPtr* rfac_buf_ptr) {
   StorePtr reduction_store = to<Store>(st);
   ReduceOpPtr reduce_op = to<ReduceOp>(reduction_store->value());
@@ -3316,7 +3273,7 @@ bool LoopNest::rfactor(
   // reductions
   StmtPtr cur = outer_reduction_for;
   while (ForPtr cur_for = to<For>(cur)) {
-    if (!reduce_args.count(cur_for->var())) {
+    if (!reduce_args.contains(cur_for->var())) {
       // output axis inside outer_reduction_for are not allowed
       return false;
     }

@@ -2,14 +2,10 @@
 
 #include <torch/csrc/jit/ir/alias_analysis.h>
 #include <torch/csrc/jit/jit_log.h>
-#include <torch/csrc/jit/passes/constant_propagation.h>
-#include <torch/csrc/jit/passes/peephole.h>
-#include <torch/csrc/jit/runtime/graph_executor.h>
 #include <memory>
 #include <unordered_set>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 struct GuardElimination {
   GuardElimination(std::shared_ptr<Graph> graph)
@@ -96,7 +92,7 @@ struct GuardElimination {
     for (auto it = b->nodes().begin(); it != b->nodes().end(); it++) {
       auto n = *it;
       if (n->kind() == prim::Guard) {
-        if (inputs_to_guards.count(n->input())) {
+        if (inputs_to_guards.contains(n->input())) {
           auto prev = inputs_to_guards[n->input()];
           n->output()->replaceAllUsesWith(prev->output());
           GRAPH_UPDATE(
@@ -235,7 +231,7 @@ struct GuardElimination {
            !input->type()->expectRef<TensorType>().isSummarized()) ||
           input->node()->kind() == prim::Constant ||
           (allow_numbers && input->type()->isSubtypeOf(*NumberType::get())) ||
-          except.count(i) != 0) {
+          except.contains(i)) {
         AT_ASSERT(
             input->node()->kind() != prim::Guard ||
             input->type()->expect<TensorType>());
@@ -276,7 +272,7 @@ struct GuardElimination {
   // to compute any properties `isSummarized()` isn't amenable to guard
   // elimination.
   // Categories:
-  // * Functional-like(e.g. add, sub, le) operations with broadcast semenatics
+  // * Functional-like(e.g. add, sub, le) operations with broadcast semantics
   //   Guards can be removed if all inputs are guarded and `isSummarized()`
   //   returns
   //   false or inputs are `prim::Constant`
@@ -463,5 +459,4 @@ void EliminateRedundantGuards(std::shared_ptr<Graph> graph) {
   ge.run();
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

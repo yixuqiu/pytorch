@@ -1,54 +1,79 @@
 #pragma once
 
-#include <ATen/core/Generator.h>
+#include <ATen/core/GeneratorForPrivateuseone.h>
 #include <ATen/detail/AcceleratorHooksInterface.h>
+
 #include <c10/core/Allocator.h>
 #include <c10/core/Device.h>
 #include <c10/core/Storage.h>
 #include <c10/util/Exception.h>
+
+
 namespace at {
 
 struct TORCH_API PrivateUse1HooksInterface : AcceleratorHooksInterface {
-  virtual ~PrivateUse1HooksInterface() override = default;
-  virtual const at::Generator& getDefaultGenerator(
-      c10::DeviceIndex device_index) {
-    TORCH_CHECK_NOT_IMPLEMENTED(
-        false,
-        "You should register `PrivateUse1HooksInterface` for PrivateUse1 before call `getDefaultGenerator`.");
+#define FAIL_PRIVATEUSE1HOOKS_FUNC(func)                        \
+  TORCH_CHECK_NOT_IMPLEMENTED(                                  \
+      false,                                                    \
+      "You should register `PrivateUse1HooksInterface`",        \
+      "by `RegisterPrivateUse1HooksInterface` and implement `", \
+      func,                                                     \
+      "` at the same time for PrivateUse1.");
+
+  ~PrivateUse1HooksInterface() override = default;
+
+  bool isBuilt() const override {
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
   }
 
-  virtual at::Device getDeviceFromPtr(void* data) const {
-    TORCH_CHECK_NOT_IMPLEMENTED(
-        false,
-        "You should register `PrivateUse1HooksInterface` for PrivateUse1 before call `getDeviceFromPtr`.");
+  bool isAvailable() const override {
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
   }
 
-  virtual Allocator* getPinnedMemoryAllocator() const {
-    TORCH_CHECK(
-        false,
-        "You should register `PrivateUse1HooksInterface` for PrivateUse1 before call `getPinnedMemoryAllocator`.");
+  const at::Generator& getDefaultGenerator(
+      c10::DeviceIndex /*device_index*/) const override {
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
   }
 
-  virtual bool hasPrimaryContext(DeviceIndex device_index) const override {
-    TORCH_CHECK_NOT_IMPLEMENTED(
-        false,
-        "You should register `PrivateUse1HooksInterface` for PrivateUse1 before call `hasPrimaryContext`.");
+  Generator getNewGenerator(
+      [[maybe_unused]] DeviceIndex device_index = -1) const override {
+    // TODO(FFFrog): Preserved for BC and will be removed in the future.
+    if (at::GetGeneratorPrivate().has_value())
+      return at::GetGeneratorForPrivateuse1(device_index);
+
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
   }
 
-  virtual void initPrivateUse1() const {}
-  virtual void resizePrivateUse1Bytes(const c10::Storage &storage, size_t newsize) const {
-    TORCH_CHECK_NOT_IMPLEMENTED(
-        false,
-        "You should register `PrivateUse1HooksInterface` for PrivateUse1 before call `resizePrivateUse1Bytes`.");
+  at::Device getDeviceFromPtr(void* /*data*/) const override {
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
   }
+
+  bool isPinnedPtr(const void* /*data*/) const override {
+    return false;
+  }
+
+  Allocator* getPinnedMemoryAllocator() const override {
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
+  }
+
+  bool hasPrimaryContext(DeviceIndex /*device_index*/) const override {
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
+  }
+
+  void init() const override {}
+  virtual void resizePrivateUse1Bytes(
+      const c10::Storage& /*storage*/,
+      size_t /*newsize*/) const {
+    FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
+  }
+
+#undef FAIL_PRIVATEUSE1HOOKS_FUNC
 };
 
 struct TORCH_API PrivateUse1HooksArgs {};
 
 TORCH_API void RegisterPrivateUse1HooksInterface(
     at::PrivateUse1HooksInterface* hook_);
-
-TORCH_API at::PrivateUse1HooksInterface* GetPrivateUse1HooksInterface();
 
 TORCH_API bool isPrivateUse1HooksRegistered();
 

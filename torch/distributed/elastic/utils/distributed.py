@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# mypy: allow-untyped-defs
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -6,19 +7,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import datetime
-import functools
+import os
 import socket
 from contextlib import closing
-from typing import Optional
 
 import torch.distributed as dist
 from torch.distributed.elastic.utils.logging import get_logger
 from torch.distributed.elastic.utils.store import barrier
 
 
+__all__ = ["create_c10d_store", "get_free_port", "get_socket_with_port"]
+
 logger = get_logger(__name__)
 
-_ADDRESS_IN_USE = "Address already in use"
+_ADDRESS_IN_USE = "address already in use"
 _SOCKET_TIMEOUT = "Socket Timeout"
 
 _TCP_STORE_INIT = "_tcp_store/num_members"
@@ -32,8 +34,18 @@ def create_c10d_store(
     timeout: float = (60 * 10),  # 10 min
     wait_for_workers: bool = True,
     retries=3,
-    use_libuv: Optional[bool] = None,
+    use_libuv: bool | None = None,
 ):
+    if use_libuv is not None:
+        logger.warning(
+            "argument use_libuv is deprecated and ignored. Set USE_LIBUV environment "
+            'variable to "0" to disable libuv, or "1" to enable it. If the env var '
+            "is not set, libuv will be used by default."
+        )
+
+    # check os.environ for use_libuv
+    use_libuv = os.environ.get("USE_LIBUV", "1") == "1"  # libuv is the default option
+
     if server_port == -1 and world_size > 1:
         raise ValueError(
             f"server_port must be specified when world_size > 1, got server_port={server_port}, world_size={world_size}"
@@ -56,43 +68,41 @@ def create_c10d_store(
             "  is_server   : %s\n"
             "  timeout(sec): %s\n"
             "  use_libuv   : %s\n",
-            server_addr, port, world_size, is_server, timeout, use_libuv,
+            server_addr,
+            port,
+            world_size,
+            is_server,
+            timeout,
+            use_libuv,
         )
 
         try:
-            store_builder = functools.partial(
-                dist.TCPStore,
+            store = dist.TCPStore(
                 host_name=server_addr,
                 port=port,
                 world_size=world_size,
                 is_master=is_server,
                 timeout=datetime.timedelta(seconds=timeout),
                 wait_for_workers=wait_for_workers,
+                use_libuv=use_libuv,
             )
-            if use_libuv is None:
-                # TCPStore default backend may change, don't specify it unless we explicity told to do so.
-                store = store_builder()
-            else:
-                store = store_builder(use_libuv=use_libuv)
             # skips full rank check when we don't have to wait for all workers
             if wait_for_workers:
                 _check_full_rank(store, world_size, timeout=timeout)
             logger.info("Successfully created c10d store")
             return store
-        except RuntimeError as e:
-            # this is brittle, but the underlying exception type is not properly pybinded
-            # so we parse the error msg for now, interestingly this is how torch itself
-            # detects timeouts and port conflicts in their own unittests
-            # see - caffe2/torch/testing/_internal/common_utils.py
-            # TODO properly map the exceptions in pybind (c10d/init.cpp)
-            if str(e) == _ADDRESS_IN_USE:  # this will only happen on the server
+        except dist.DistNetworkError as e:
+            if _ADDRESS_IN_USE in str(e).lower():  # this will only happen on the server
                 if attempt < retries:
                     logger.warning(
-                        "port: %s already in use, attempt: [%s/%s]", port, attempt, retries
+                        "port: %s already in use, attempt: [%s/%s]",
+                        port,
+                        attempt,
+                        retries,
                     )
                     attempt += 1
                 else:
-                    raise RuntimeError(
+                    raise dist.DistNetworkError(
                         f"on {server_addr}, port: {port} already in use"
                     ) from e
             else:
@@ -112,6 +122,24 @@ def _check_full_rank(store, world_size, timeout):
 
 
 def get_free_port():
+    """
+    Returns a port that is unused on all local addresses.
+
+    This function finds an unused port by binding a socket to the wildcard
+    address and then closing it.
+
+    Returns:
+        int: a port that is unused on all local addresses
+
+    Example:
+        >>> # xdoctest: +SKIP("Nondeterministic")
+        >>> get_free_port()
+        63976
+
+    .. note::
+        The port returned by :func:`get_free_port` is not reserved and may be
+        taken by another process after this function returns.
+    """
     sock = get_socket_with_port()
     with closing(sock):
         return sock.getsockname()[1]
@@ -119,8 +147,8 @@ def get_free_port():
 
 def get_socket_with_port() -> socket.socket:
     """
-    Returns a free port on localhost that is "reserved" by binding a temporary
-    socket on it. Close the socket before passing the port to the entity
+    Returns a free port that is "reserved" by binding a temporary socket to it
+    on the wildcard address. Close the socket before passing the port to the entity
     that requires it. Usage example
 
     ::
@@ -134,15 +162,21 @@ def get_socket_with_port() -> socket.socket:
         func(port)
     """
 
-    addrs = socket.getaddrinfo(
-        host="localhost", port=None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
-    )
-    for addr in addrs:
-        family, type, proto, _, _ = addr
-        s = socket.socket(family, type, proto)
+    # Bind the wildcard address (dual-stack first), like the TCPStore server that
+    # consumes the port. A port that is free on loopback may already be bound on
+    # another interface, e.g. by NCCL/Gloo, and the server's bind would then fail.
+    # Don't listen(): a wildcard listener would accept, and never serve,
+    # connections meant for the server while the port is reserved.
+    for family, host in ((socket.AF_INET6, "::"), (socket.AF_INET, "0.0.0.0")):
         try:
-            s.bind(("localhost", 0))
-            s.listen(0)
+            s = socket.socket(family, socket.SOCK_STREAM)
+        except OSError as e:
+            logger.warning("Socket creation attempt failed.", exc_info=e)
+            continue
+        try:
+            if family == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            s.bind((host, 0))
             return s
         except OSError as e:
             s.close()

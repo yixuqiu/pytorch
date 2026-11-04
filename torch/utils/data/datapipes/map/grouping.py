@@ -1,13 +1,18 @@
+# mypy: allow-untyped-defs
+from collections.abc import Sized
+from typing import TypeVar
+
 from torch.utils.data.datapipes._decorator import functional_datapipe
-from torch.utils.data.datapipes.datapipe import MapDataPipe, DataChunk
-from typing import List, Sized, TypeVar
-
-__all__ = ["BatcherMapDataPipe", ]
-
-T = TypeVar('T')
+from torch.utils.data.datapipes.datapipe import DataChunk, MapDataPipe
 
 
-@functional_datapipe('batch')
+__all__ = ["BatcherMapDataPipe"]
+
+
+_T = TypeVar("_T")
+
+
+@functional_datapipe("batch")
 class BatcherMapDataPipe(MapDataPipe[DataChunk]):
     r"""
     Create mini-batches of data (functional name: ``batch``).
@@ -33,13 +38,15 @@ class BatcherMapDataPipe(MapDataPipe[DataChunk]):
     batch_size: int
     drop_last: bool
 
-    def __init__(self,
-                 datapipe: MapDataPipe[T],
-                 batch_size: int,
-                 drop_last: bool = False,
-                 wrapper_class=DataChunk,
-                 ) -> None:
-        assert batch_size > 0, "Batch size is required to be larger than 0!"
+    def __init__(
+        self,
+        datapipe: MapDataPipe[_T],
+        batch_size: int,
+        drop_last: bool = False,
+        wrapper_class: type[DataChunk] = DataChunk,
+    ) -> None:
+        if batch_size <= 0:
+            raise AssertionError("Batch size is required to be larger than 0!")
         super().__init__()
         self.datapipe = datapipe
         self.batch_size = batch_size
@@ -47,11 +54,10 @@ class BatcherMapDataPipe(MapDataPipe[DataChunk]):
         self.wrapper_class = wrapper_class
 
     def __getitem__(self, index) -> DataChunk:
-        batch: List = []
+        batch: list = []
         indices = range(index * self.batch_size, (index + 1) * self.batch_size)
         try:
-            for i in indices:
-                batch.append(self.datapipe[i])
+            batch.extend(self.datapipe[i] for i in indices)
             return self.wrapper_class(batch)
         except IndexError as e:
             if not self.drop_last and len(batch) > 0:
@@ -60,6 +66,7 @@ class BatcherMapDataPipe(MapDataPipe[DataChunk]):
                 raise IndexError(f"Index {index} is out of bound.") from e
 
     def __len__(self) -> int:
+        # pyrefly: ignore [unsafe-overlap]
         if isinstance(self.datapipe, Sized):
             if self.drop_last:
                 return len(self.datapipe) // self.batch_size

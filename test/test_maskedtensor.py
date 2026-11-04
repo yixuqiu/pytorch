@@ -2,11 +2,12 @@
 
 import torch
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     TestCase,
-    run_tests,
+    instantiate_parametrized_tests,
     make_tensor,
     parametrize,
-    instantiate_parametrized_tests,
+    run_tests,
 )
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
@@ -64,6 +65,17 @@ def _compare_mts(mt1, mt2, rtol=1e-05, atol=1e-08):
     if not _tensors_match(a, b, exact=False, rtol=rtol, atol=atol):
         raise ValueError("The data in MaskedTensor mt1 and MaskedTensor mt2 do not match")
 
+def _compare_forward_backward(data, mask, fn):
+    mt = masked_tensor(data, mask, requires_grad=True)
+    masked_res = fn(mt)
+    masked_res.sum().backward()
+
+    t = data.masked_fill(~mask, float("-inf")).detach().clone().requires_grad_()
+    tensor_res = fn(t)
+    tensor_res.sum().backward()
+
+    _compare_mt_t(masked_res, tensor_res)
+    _compare_mt_t(mt.grad, t.grad, atol=1e-06)
 
 def _create_random_mask(shape, device):
     return make_tensor(shape, device=device, dtype=torch.bool)
@@ -71,11 +83,12 @@ def _create_random_mask(shape, device):
 def _generate_sample_data(
     device="cpu", dtype=torch.float, requires_grad=True, layout=torch.strided
 ):
-    assert layout in {
+    if layout not in {
         torch.strided,
         torch.sparse_coo,
         torch.sparse_csr,
-    }, "Layout must be strided/sparse_coo/sparse_csr"
+    }:
+        raise AssertionError("Layout must be strided/sparse_coo/sparse_csr")
     shapes = [
         [],
         [2],
@@ -103,7 +116,9 @@ def _fix_fn_name(fn_name):
     return fn_name
 
 
-class TestBasics(TestCase):
+class TestBasicsDevice(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def test_invalid_tensor_inputs(self, device):
         data = torch.randn((3, 4), device=device)
         mask = _create_random_mask((3, 4), device=device)
@@ -141,7 +156,7 @@ class TestBasics(TestCase):
         mask = _create_random_mask((3, 4), device=device)
         msg = "It is not recommended to create a MaskedTensor with a tensor that requires_grad."
         with self.assertWarnsRegex(UserWarning, msg):
-            mt = masked_tensor(data, mask)
+            masked_tensor(data, mask)
 
     def test_add(self, device):
         data = torch.arange(5.0, device=device)
@@ -162,15 +177,8 @@ class TestBasics(TestCase):
             ],
             device=device
         )
-        mt = masked_tensor(data, mask, requires_grad=True)
-        masked_res = torch.softmax(mt, -1)
-        masked_res.sum().backward()
-        xinf = data.masked_fill(~mask, float("-inf")).detach().clone().requires_grad_()
-        tensor_res = torch.softmax(xinf, -1)
-        tensor_res.sum().backward()
 
-        _compare_mt_t(masked_res, tensor_res)
-        _compare_mt_t(mt.grad, xinf.grad, atol=1e-06)
+        _compare_forward_backward(data, mask, lambda t: torch.softmax(t, -1))
 
     def test_where(self, device):
         data = torch.tensor([-10.0, -5, 0, 5, 10, 50, 60, 70, 80, 90, 100], device=device)
@@ -190,11 +198,40 @@ class TestBasics(TestCase):
         _compare_mt_t(mx.grad, x.grad)
         _compare_mt_t(my.grad, y.grad)
 
+    def test_unfold(self, device):
+        data = torch.rand(5, 5, device=device)
+        mask = torch.rand(5, 5, device=device) > 0.5
+        _compare_forward_backward(data, mask, lambda t: t.unfold(1, 2, 2))
+
+    def test_nn_unfold(self, device):
+        data = torch.rand(2, 5, 3, 4, device=device)
+        mask = torch.rand(2, 5, 3, 4, device=device) > 0.5
+        _compare_forward_backward(data, mask, lambda t: torch.nn.functional.unfold(t, kernel_size=(2, 3)))
+
+    def test_stack(self, device):
+        masked_tensors = [
+            masked_tensor(
+                torch.rand(2, 5, 3, 4, device=device),
+                torch.rand(2, 5, 3, 4, device=device) > 0.5,
+                requires_grad=True,
+            ) for _ in range(3)
+        ]
+
+        data_tensors = [mt.get_data().detach().clone().requires_grad_() for mt in masked_tensors]
+        masked_res = torch.stack(masked_tensors)
+        tensor_res = torch.stack(data_tensors)
+
+        masked_res.sum().backward()
+        tensor_res.sum().backward()
+        _compare_mt_t(masked_res, tensor_res)
+        for mt, t in zip(masked_tensors, data_tensors):
+            _compare_mt_t(mt.grad, t.grad, atol=1e-06)
+
     def test_to_sparse(self, device):
         for sample in _generate_sample_data(device=device):
             data = sample.input
             mask = sample.kwargs["mask"]
-            mt = masked_tensor(data.clone().detach(), mask, requires_grad=True)
+            mt = masked_tensor(data.detach().clone(), mask, requires_grad=True)
 
             sparse_mt = mt.to_sparse()
             data.to_sparse().to_dense().sum().backward()
@@ -202,6 +239,39 @@ class TestBasics(TestCase):
 
             _compare_mt_t(sparse_mt, data)
             _compare_mt_t(mt.grad, data.grad)
+
+    def test_to_device(self, device):
+        for sample in _generate_sample_data(device=device):
+            data = sample.input
+            mask = sample.kwargs["mask"]
+            mt = masked_tensor(data, mask, requires_grad=True)
+
+            if device == "cpu":
+                new_device = torch.device(
+                    torch.accelerator.current_accelerator().type
+                    if torch.accelerator.is_available()
+                    else "cpu"
+                )
+            else:
+                new_device = torch.device("cpu")
+            mt_device = mt.to(new_device)
+
+            self.assertEqual(mt_device.device.type, new_device.type)
+            self.assertEqual(mt_device.get_mask().device.type, new_device.type)
+            self.assertEqual(mt_device.get_data().device.type, new_device.type)
+
+    def test_to_dtype(self, device):
+        for sample in _generate_sample_data(device=device):
+            data = sample.input
+            mask = sample.kwargs["mask"]
+            mt = masked_tensor(data, mask, requires_grad=True)
+
+            new_dtype = torch.float64 if data.dtype == torch.float32 else torch.float32
+            mt_dtype = mt.to(new_dtype)
+
+            self.assertEqual(mt_dtype.dtype, new_dtype)
+            self.assertEqual(mt_dtype.get_mask().dtype, torch.bool)
+            self.assertEqual(mt_dtype.get_data().dtype, new_dtype)
 
     def test_to_dense(self, device):
         samples = _generate_sample_data(
@@ -359,13 +429,15 @@ class TestBasics(TestCase):
         self.assertEqual(now_contiguous_mt.is_contiguous(), True)
 
 class TestUnary(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def _get_test_data(self, fn_name):
         data = torch.randn(10, 10)
         mask = torch.rand(10, 10) > 0.5
         fn_name = _fix_fn_name(fn_name)
         if fn_name in ["log", "log10", "log1p", "log2", "sqrt"]:
             data = data.mul(0.5).abs()
-        if fn_name in ["rsqrt"]:
+        if fn_name == "rsqrt":
             data = data.abs() + 1  # Void division by zero
         if fn_name in ["acos", "arccos", "asin", "arcsin", "logit"]:
             data = data.abs().mul(0.5).clamp(0, 1)
@@ -373,7 +445,7 @@ class TestUnary(TestCase):
             data = data.mul(0.5).clamp(-1, 1)
         if fn_name in ["acosh", "arccosh"]:
             data = data.abs() + 1
-        if fn_name in ["bitwise_not"]:
+        if fn_name == "bitwise_not":
             data = data.mul(128).to(torch.int8)
         return data, mask
 
@@ -390,7 +462,7 @@ class TestUnary(TestCase):
         mt = masked_tensor(data, mask)
         t_args = [data]
         mt_args = [mt]
-        if fn_name in ["pow"]:
+        if fn_name == "pow":
             t_args += [2.0]
             mt_args += [2.0]
         return t_args, mt_args
@@ -422,6 +494,8 @@ class TestUnary(TestCase):
         _compare_mt_t(mt_result, t_result)
 
 class TestBinary(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def _get_test_data(self, fn_name):
         fn_name = _fix_fn_name(fn_name)
         data0 = torch.randn(10, 10)
@@ -492,14 +566,14 @@ class TestBinary(TestCase):
         mt1 = masked_tensor(data1, mask1)
         try:
             fn(mt0, mt1)
-            raise AssertionError
+            raise AssertionError("expected ValueError")
         except ValueError as e:
-            assert (
-                "Input masks must match. If you need support for this, please open an issue on Github."
-                == str(e)
-            )
+            if str(e) != "Input masks must match. If you need support for this, please open an issue on Github.":
+                raise AssertionError(f"unexpected error message: {e}") from None
 
 class TestReductions(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_max_not_implemented(self):
         d = torch.tensor([[0, 1, 2], [3, 4, 5.0]])
         m = torch.tensor([[True, False, False], [False, True, False]])
@@ -761,6 +835,45 @@ class TestReductions(TestCase):
         with self.assertRaisesRegex(RuntimeError, msg):
             masked_tensor(d, m, requires_grad=True)
 
+    def test_any_true_dtype(self):
+        mt = torch.masked.MaskedTensor(
+            torch.rand(2, 2),
+            torch.rand(2, 2) > 0.5
+        )
+        msg = "expected a boolean tensor"
+        with self.assertRaisesRegex(ValueError, msg):
+            mt._is_any_true()
+
+    def test__is_any_true(self):
+        mt = torch.masked.MaskedTensor(
+            torch.tensor([[True, True, False], [False, False, True]]),
+            torch.tensor([[True, False, False], [False, True, False]]),
+        )
+        _compare_mts(
+            masked_tensor(torch.tensor(True), torch.tensor(True)),
+            mt._is_any_true(),
+        )
+
+    def test__is_any_true_false(self):
+        mt = torch.masked.MaskedTensor(
+            torch.tensor([[True, True, False], [False, False, True]]),
+            torch.tensor([[False, False, False], [False, False, False]]),
+        )
+        _compare_mts(
+            masked_tensor(torch.tensor(False), torch.tensor(True),),
+            mt._is_any_true(),
+        )
+
+    def test_backward(self):
+        # See https://github.com/pytorch/pytorch/issues/128557
+        with torch.autograd.detect_anomaly():
+            mt = torch.masked.MaskedTensor(
+                torch.rand(2, 2),
+                torch.rand(2, 2) > 0.5,
+                requires_grad=True
+            )
+            mt.sum().backward()
+
 
 def is_unary(op):
     return op.name in UNARY_NAMES
@@ -781,7 +894,9 @@ MASKEDTENSOR_FLOAT_TYPES = {
     torch.float64,
 }
 
-class TestOperators(TestCase):
+class TestOperatorsDevice(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def _convert_mt_args(self, args, mask, layout):
         return [
             masked_tensor(
@@ -896,10 +1011,9 @@ class TestOperators(TestCase):
         self._test_reduction_equality(device, dtype, op, layout)
 
 
-only_for = ("cpu", "cuda")
-instantiate_device_type_tests(TestOperators, globals(), only_for=only_for)
+instantiate_device_type_tests(TestOperatorsDevice, globals(), allow_xpu=True)
 
-instantiate_device_type_tests(TestBasics, globals(), only_for=only_for)
+instantiate_device_type_tests(TestBasicsDevice, globals(), allow_xpu=True)
 instantiate_parametrized_tests(TestUnary)
 instantiate_parametrized_tests(TestBinary)
 instantiate_parametrized_tests(TestReductions)

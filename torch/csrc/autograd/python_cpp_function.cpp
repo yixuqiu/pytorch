@@ -8,22 +8,81 @@
 #include <unordered_map>
 
 #include <pybind11/pybind11.h>
-#include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/autograd/python_anomaly_mode.h>
 #include <torch/csrc/autograd/python_function.h>
 #include <torch/csrc/autograd/python_hook.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/utils/pybind.h>
+#include <torch/csrc/utils/pyobject_preservation.h>
 #include <torch/csrc/utils/python_numbers.h>
 #include <torch/csrc/utils/python_strings.h>
 
 using namespace torch::autograd;
+using torch::utils::PyObjectPreservation;
 
-namespace torch {
-namespace autograd {
+namespace torch::autograd {
+
+int traverse_node(
+    c10::intrusive_ptr<Node>& fn_ptr,
+    visitproc visit,
+    void* arg) {
+  if (fn_ptr.use_count() != 1) {
+    return 0;
+  }
+  auto& fn = *fn_ptr;
+  // The fields traversed below are owned by the cpp grad_fn, which we own a
+  // reference to. We should only traverse them however if we are the only
+  // owner of the grad_fn, otherwise we risk prematurely gc'ing the grad_fn.
+  //
+  // See: https://github.com/pytorch/pytorch/issues/102174
+  for (const auto& hook : fn.tensor_pre_hooks()) {
+    if (auto pyhook = dynamic_cast<PyFunctionTensorPreHook*>(hook.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  // NOTE [retains_grad_hook PyObject traversal]
+  // In theory this shouldn't be necessary, because retains_grad_hooks should
+  // not contain any PyFunctionTensorPreHooks. The alternative is to have a
+  // check that actually guarantees this.
+  for (const auto& pair : fn.retains_grad_hooks()) {
+    if (auto pyhook =
+            dynamic_cast<PyFunctionTensorPreHook*>(pair.second.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  for (const auto& hook : fn.pre_hooks()) {
+    if (auto pyhook = dynamic_cast<PyFunctionPreHook*>(hook.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  for (const auto& hook : fn.post_hooks()) {
+    if (auto pyhook = dynamic_cast<PyFunctionPostHook*>(hook.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  return 0;
+}
 
 namespace {
+
+int THPCppFunction_traverse(PyObject* self, visitproc visit, void* arg) {
+  auto* cpp_fn = reinterpret_cast<THPCppFunction*>(self);
+  return traverse_node(cpp_fn->cdata, visit, arg);
+}
+
+void THPCppFunction_dealloc(PyObject* self) {
+  PyObject_GC_UnTrack(self);
+  auto* cpp_fn = reinterpret_cast<THPCppFunction*>(self);
+  if (cpp_fn->cdata) {
+    auto* slot = cpp_fn->cdata->pyobj_slot();
+    if (slot->load_pyobj() == self) {
+      slot->store_pyobj(nullptr);
+    }
+  }
+  cpp_fn->cdata.~intrusive_ptr();
+  Py_TYPE(self)->tp_free(self);
+}
 
 PyObject* THPCppFunction_call(
     PyObject* self,
@@ -45,7 +104,7 @@ PyObject* THPCppFunction_call(
   variable_list vars(num_inputs);
   for (int i = 0; i != num_inputs; ++i) {
     PyObject* arg = PyTuple_GET_ITEM(args, i);
-    if (arg == Py_None) {
+    if (Py_IsNone(arg)) {
       continue;
     }
     if (!THPVariable_Check(arg)) {
@@ -75,63 +134,9 @@ PyObject* THPCppFunction_call(
   return tuple.release();
 }
 
-int THPCppFunction_traverse(PyObject* self, visitproc visit, void* arg) {
-  if ((((THPCppFunction*)self)->cdata).use_count() == 1) {
-    // The fields traversed below are owned by the cpp grad_fn, which we own a
-    // reference to. We should only them traverse however if we are the only
-    // owner of the grad_fn, otherwise we risk prematurely gc'ing the grad_fn.
-    //
-    // See: https://github.com/pytorch/pytorch/issues/102174
-    auto& fn = *((THPCppFunction*)self)->cdata;
-    for (const auto& hook : fn.tensor_pre_hooks()) {
-      if (auto pyhook = dynamic_cast<PyFunctionTensorPreHook*>(hook.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-    // NOTE [retains_grad_hook PyObject traversal]
-    // In theory this shouldn't be necessary, because retains_grad_hooks should
-    // not contain any PyFunctionTensorPreHooks. The alternative is to have a
-    // check that actually guarantees this.
-    for (const auto& pair : fn.retains_grad_hooks()) {
-      if (auto pyhook =
-              dynamic_cast<PyFunctionTensorPreHook*>(pair.second.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-    for (const auto& hook : fn.pre_hooks()) {
-      if (auto pyhook = dynamic_cast<PyFunctionPreHook*>(hook.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-    for (const auto& hook : fn.post_hooks()) {
-      if (auto pyhook = dynamic_cast<PyFunctionPostHook*>(hook.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-  }
-  return 0;
-}
-
-int THPCppFunction_clear(PyObject* self) {
-  auto f = (THPCppFunction*)self;
-  // Remove the weak ref of the c++ object if it exist
-  if (f->cdata) {
-    f->cdata->set_pyobj(nullptr);
-  }
-  f->cdata.reset();
-  return 0;
-}
-
-void THPCppFunction_dealloc(PyObject* self) {
-  PyObject_GC_UnTrack(self);
-  THPCppFunction_clear(self);
-  ((THPCppFunction*)self)->cdata.~shared_ptr();
-  Py_TYPE(self)->tp_free(self);
-}
-
 } // namespace
 
-PyObject* THPCppFunction_next_functions(PyObject* self, void* _unused) {
+PyObject* THPCppFunction_next_functions(PyObject* self, void* /*_unused*/) {
   auto cdata = reinterpret_cast<const THPCppFunction*>(self)->cdata;
   const auto num_next = cdata->num_outputs();
   THPObjectPtr py_functions(PyTuple_New(num_next));
@@ -155,17 +160,16 @@ PyObject* THPCppFunction_next_functions(PyObject* self, void* _unused) {
   return py_functions.release();
 }
 
-PyObject* THPCppFunction_metadata(PyObject* self, void* _unused) {
+PyObject* THPCppFunction_metadata(PyObject* self, void* /*_unused*/) {
   auto* metadata =
       static_cast<PyAnomalyMetadata*>(
           reinterpret_cast<THPCppFunction*>(self)->cdata->metadata())
           ->dict();
 
-  Py_XINCREF(metadata);
-  return metadata;
+  return Py_XNewRef(metadata);
 }
 
-PyObject* THPCppFunction_requires_grad(PyObject* self, void* unused) {
+PyObject* THPCppFunction_requires_grad(PyObject* /*self*/, void* /*unused*/) {
   Py_RETURN_TRUE;
 }
 
@@ -176,9 +180,8 @@ PyObject* THPCppFunction_register_hook_dict(PyObject* self, PyObject* _var) {
   }
   auto var = (THPVariable*)_var;
   auto& fn = *((THPCppFunction*)self)->cdata;
-  std::unique_ptr<FunctionPreHook> hook(new PyFunctionTensorPreHook(
+  fn.add_tensor_pre_hook(std::make_unique<PyFunctionTensorPreHook>(
       var->backward_hooks, THPVariable_Unpack(var).output_nr()));
-  fn.add_tensor_pre_hook(std::move(hook));
   Py_RETURN_NONE;
 }
 
@@ -192,23 +195,44 @@ PyObject* THPCppFunction_register_prehook(PyObject* self, PyObject* hook) {
   return registerFunctionPreHook(fn, hook);
 }
 
-PyObject* THPCppFunction_name(PyObject* self, PyObject* noargs) {
+PyObject* THPCppFunction_name(PyObject* self, PyObject* /*noargs*/) {
   auto& fn = *((THPCppFunction*)self)->cdata;
   return THPUtils_packString(fn.name());
 }
 
-PyObject* THPCppFunction_sequence_nr(PyObject* self, PyObject* noargs) {
+PyObject* THPCppFunction_sequence_nr(PyObject* self, PyObject* /*noargs*/) {
   auto& fn = *((THPCppFunction*)self)->cdata;
   return THPUtils_packUInt64(fn.sequence_nr());
 }
 
-PyObject* THPCppFunction_set_sequence_nr(
+static PyObject* THPCppFunction_set_sequence_nr(
     PyObject* self,
     PyObject* sequence_nr) {
   HANDLE_TH_ERRORS
   auto& fn = *((THPCppFunction*)self)->cdata;
   fn.set_sequence_nr(THPUtils_unpackUInt64(sequence_nr));
   Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THPCppFunction_input_metadata(PyObject* self, void* /*closure*/) {
+  HANDLE_TH_ERRORS;
+  auto& fn = *((THPCppFunction*)self)->cdata;
+  const auto num_inputs =
+      fn.num_inputs(); // Assuming there's a method to get the number of inputs
+  THPObjectPtr list(PyTuple_New(num_inputs));
+  if (!list) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < num_inputs; ++i) {
+    const auto& metadata = fn.input_metadata(i);
+    THPObjectPtr item(py::cast(metadata).release().ptr());
+    if (!item) {
+      return nullptr;
+    }
+    PyTuple_SET_ITEM(list.get(), i, item.release());
+  }
+  return list.release();
   END_HANDLE_TH_ERRORS
 }
 
@@ -227,6 +251,9 @@ PyTypeObject* _initFunctionPyTypeObject(
     const char* name,
     PyGetSetDef* function_properties,
     PyMethodDef* function_methods) {
+  type.ob_base = {
+    PyObject_HEAD_INIT(nullptr)
+      0};
   // NOLINTNEXTLINE(misc-redundant-expression)
   type.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
   type.tp_name = name;
@@ -237,10 +264,8 @@ PyTypeObject* _initFunctionPyTypeObject(
       function_properties ? function_properties : default_properties;
   type.tp_dealloc = THPCppFunction_dealloc;
   type.tp_traverse = THPCppFunction_traverse;
-  type.tp_clear = THPCppFunction_clear;
   if (PyType_Ready(&type) < 0) {
-    auto msg = std::string("Unable to instantiate PyTypeObject for ") + name;
-    throw std::runtime_error(msg);
+    TORCH_CHECK(false, "Unable to instantiate PyTypeObject for ", name);
   }
   return &type;
 }
@@ -251,49 +276,37 @@ static std::unordered_set<PyTypeObject*> cpp_function_types_set;
 struct DefaultFunctionType {
   DefaultFunctionType() : type() {
     _initFunctionPyTypeObject(type, "CppFunction", nullptr, nullptr);
-    Py_INCREF(&type);
   }
 
   PyTypeObject type;
 };
 
-PyObject* functionToPyObject(const std::shared_ptr<Node>& cdata) {
+static PyTypeObject* get_default_type() {
   static DefaultFunctionType default_type;
+  return &(default_type.type);
+}
 
+PyObject* functionToPyObject(const c10::intrusive_ptr<Node>& cdata) {
   if (!cdata) {
     Py_RETURN_NONE;
   }
 
-  if (auto pfw = dynamic_cast<PyNode*>(cdata.get())) {
-    PyObject* obj = pfw->obj;
-    Py_INCREF(obj);
-    return obj;
-  }
-
-  if (cdata->pyobj()) {
-    Py_INCREF(cdata->pyobj());
-  } else {
-    auto& fn = *cdata;
+  return PyObjectPreservation::get_or_init(*cdata, [&]() {
+    Node& fn = *cdata;
     auto it = cpp_function_types_map.find(std::type_index(typeid(fn)));
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    PyTypeObject* type;
+    PyTypeObject* type = nullptr;
     if (it == cpp_function_types_map.end()) {
-      type = &default_type.type;
+      type = get_default_type();
     } else {
       type = (PyTypeObject*)it->second.get();
     }
 
-    THPObjectPtr obj(type->tp_alloc(type, 0));
-    if (!obj)
-      return nullptr;
-    THPCppFunction* f = (THPCppFunction*)obj.get();
-    new (&f->cdata) std::shared_ptr<Node>(cdata);
-
-    // No INCREF here as we only have a weak reference
-    cdata->set_pyobj(obj.release());
-  }
-
-  return cdata->pyobj();
+    THPObjectPtr new_obj(type->tp_alloc(type, 0));
+    TORCH_CHECK(new_obj, "Failed to allocate a ", type->tp_name, " object");
+    THPCppFunction* f = (THPCppFunction*)new_obj.get();
+    new (&f->cdata) c10::intrusive_ptr<Node>(cdata);
+    return new_obj.release();
+  });
 }
 
 void registerCppFunction(const std::type_info& type, PyTypeObject* pytype) {
@@ -304,16 +317,14 @@ void registerCppFunction(const std::type_info& type, PyTypeObject* pytype) {
 }
 
 bool THPCppFunction_Check(PyObject* obj) {
-  THPObjectPtr type = THPObjectPtr(PyObject_Type(obj));
-  if (cpp_function_types_set.find((PyTypeObject*)type.get()) ==
-      cpp_function_types_set.end()) {
-    return false;
-  } else {
+  PyTypeObject* type = Py_TYPE(obj);
+  if (type == get_default_type()) {
     return true;
   }
+  return cpp_function_types_set.contains(type);
 }
 
-PyObject* callRegisterFn(PyObject* dict, PyObject* hook) {
+static PyObject* callRegisterFn(PyObject* dict, PyObject* hook) {
   THPObjectPtr register_fn(
       PyObject_GetAttrString(THPFunctionClass, "_register_hook"));
   if (!register_fn) {
@@ -339,15 +350,13 @@ PyObject* registerFunctionHook(Node& fn, PyObject* hook) {
   if (!res) {
     return nullptr;
   }
-  if (dict == Py_None) {
+  if (Py_IsNone(dict)) {
     dict = PyTuple_GET_ITEM(res.get(), 0);
-    std::unique_ptr<FunctionPostHook> hook(new PyFunctionPostHook(dict));
-    fn.add_post_hook(std::move(hook));
+    fn.add_post_hook(std::make_unique<PyFunctionPostHook>(dict));
   }
 
   PyObject* handle = PyTuple_GET_ITEM(res.get(), 1);
-  Py_INCREF(handle);
-  return handle;
+  return Py_NewRef(handle);
 }
 
 // This is almost a copy of the function above except post -> pre
@@ -363,16 +372,13 @@ PyObject* registerFunctionPreHook(Node& fn, PyObject* hook) {
   if (!res) {
     return nullptr;
   }
-  if (dict == Py_None) {
+  if (Py_IsNone(dict)) {
     dict = PyTuple_GET_ITEM(res.get(), 0);
-    std::unique_ptr<FunctionPreHook> hook(new PyFunctionPreHook(dict));
-    fn.add_pre_hook(std::move(hook));
+    fn.add_pre_hook(std::make_unique<PyFunctionPreHook>(dict));
   }
 
   PyObject* handle = PyTuple_GET_ITEM(res.get(), 1);
-  Py_INCREF(handle);
-  return handle;
+  return Py_NewRef(handle);
 }
 
-} // namespace autograd
-} // namespace torch
+} // namespace torch::autograd

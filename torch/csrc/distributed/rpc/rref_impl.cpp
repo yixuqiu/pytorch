@@ -1,18 +1,18 @@
 #include <torch/csrc/distributed/rpc/rref_impl.h>
 
 #include <ATen/record_function.h>
-#include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <fmt/format.h>
-#include <torch/csrc/distributed/autograd/rpc_messages/rpc_with_autograd.h>
 #include <torch/csrc/distributed/autograd/utils.h>
-#include <torch/csrc/distributed/rpc/profiler/remote_profiler_manager.h>
 #include <torch/csrc/distributed/rpc/rref_context.h>
 #include <torch/csrc/distributed/rpc/rref_proto.h>
 #include <torch/csrc/distributed/rpc/utils.h>
 
+#include <utility>
+
 namespace {
 // If the type is subtype of named type, return its qualifiedname, otherwise
 // return its type str.
+// NOLINTBEGIN(bugprone-unchecked-optional-access)
 std::string getTypeStr(const c10::TypePtr& type) {
   switch (type->kind()) {
     case c10::TypeKind::FunctionType:
@@ -27,12 +27,11 @@ std::string getTypeStr(const c10::TypePtr& type) {
       return type->annotation_str();
   }
 }
+// NOLINTEND(bugprone-unchecked-optional-access)
 
 } // namespace
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 std::atomic<local_id_t> RRefContext::nextLocalId_{0};
 
@@ -53,10 +52,7 @@ RRefForkData::RRefForkData(
 //////////////////////////////  RRef  /////////////////////////////////////
 
 RRef::RRef(worker_id_t ownerId, const RRefId& rrefId, TypePtr type)
-    : RRefInterface(),
-      ownerId_(ownerId),
-      rrefId_(rrefId),
-      type_(std::move(type)) {}
+    : ownerId_(ownerId), rrefId_(rrefId), type_(std::move(type)) {}
 
 RRefForkData RRef::fork() const {
   auto& ctx = RRefContext::getInstance();
@@ -71,18 +67,23 @@ RRefForkData RRef::fork() const {
 void RRef::handleError(RPCErrorType errorType, const JitFuture& jitFuture) {
   static std::unordered_map<
       RPCErrorType,
-      std::function<void(const JitFuture& jitFuture)>,
+      std::function<void(RRef*, const JitFuture&)>,
       std::hash<int>>
       errorHandlers = {
           {RPCErrorType::TIMEOUT,
-           [this](const JitFuture& /* unused */) { setTimedOut(); }},
+           [](RRef* rref, const JitFuture& /* unused */) {
+             rref->setTimedOut();
+           }},
           {RPCErrorType::INTENTIONAL_FAILURE,
-           [this](const JitFuture& /* unused */) { setTimedOut(); }},
-          {RPCErrorType::UNKNOWN_ERROR, [](const JitFuture& jitFuture) {
+           [](RRef* rref, const JitFuture& /* unused */) {
+             rref->setTimedOut();
+           }},
+          {RPCErrorType::UNKNOWN_ERROR,
+           [](RRef* /* unused */, const JitFuture& jitFuture) {
              // Default error handler
              RRefContext::handleException(jitFuture);
            }}};
-  errorHandlers.find(errorType)->second(jitFuture);
+  errorHandlers.find(errorType)->second(this, jitFuture);
 }
 
 //////////////////////////  UserRRef  /////////////////////////////////////
@@ -242,15 +243,20 @@ OwnerRRef::OwnerRRef(
     const RRefId& rrefId,
     TypePtr type,
     std::vector<c10::Device> devices)
-    : OwnerRRef(ownerId, rrefId, type, /* value */ {}, std::move(devices)) {}
+    : OwnerRRef(
+          ownerId,
+          rrefId,
+          std::move(type),
+          /* value */ {},
+          std::move(devices)) {}
 
 OwnerRRef::OwnerRRef(
     worker_id_t ownerId,
     const RRefId& rrefId,
     TypePtr type,
-    c10::optional<IValue> value,
+    std::optional<IValue> value,
     std::vector<c10::Device> devices)
-    : RRef(ownerId, rrefId, type) {
+    : RRef(ownerId, rrefId, std::move(type)) {
   future_ = c10::make_intrusive<JitFuture>(type_, std::move(devices));
 
   if (value.has_value()) {
@@ -276,7 +282,7 @@ c10::intrusive_ptr<JitFuture> OwnerRRef::getFuture() {
 }
 
 void OwnerRRef::setValue(IValue&& value) {
-  future_->markCompleted(value);
+  future_->markCompleted(std::move(value));
 }
 
 void OwnerRRef::setError(std::exception_ptr eptr) {
@@ -286,15 +292,13 @@ void OwnerRRef::setError(std::exception_ptr eptr) {
 std::ostream& operator<<(std::ostream& os, const RRef& rref) {
   if (rref.isOwner()) {
     return os << "OwnerRRef("
-              << "rref_id=" << rref.rrefId() << ")";
+              << "rref_id=" << rref.rrefId() << ')';
   } else {
     return os << "UserRRef("
               << "rref_id=" << rref.rrefId()
               << ", fork_id=" << static_cast<const UserRRef*>(&rref)->forkId()
-              << ")";
+              << ')';
   }
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

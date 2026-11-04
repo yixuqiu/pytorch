@@ -1,8 +1,17 @@
 #include <torch/csrc/jit/runtime/profiling_graph_executor_impl.h>
 
-#include <c10/util/Optional.h>
 #include <torch/csrc/jit/runtime/simple_graph_executor_impl.h>
 #include <mutex>
+#include <optional>
+
+// clang-format off
+C10_DEFINE_bool(
+    torch_jit_release_simple_executor_graph,
+    false,
+    "After SimpleGraphExecutorImpl compiles its execution plan, release the unoptimized graph the plan was built from. "
+    "The plan owns its own copy, so the original is only needed until compilation finishes. Inference-only memory saving; "
+    "any future code path that rebuilds a plan from the original graph will fail.")
+// clang-format on
 
 namespace torch::jit {
 
@@ -11,9 +20,23 @@ SimpleGraphExecutorImpl::SimpleGraphExecutorImpl(
     std::string function_name)
     : GraphExecutorImplBase(graph, std::move(function_name)) {}
 
+const ExecutionPlan& SimpleGraphExecutorImpl::buildPlan() {
+  TORCH_CHECK(
+      graph,
+      "SimpleGraphExecutorImpl: graph was released before a plan was built");
+  auto copy = graph->copy();
+  runNooptPassPipeline(copy);
+  execution_plan_ = ExecutionPlan(copy, function_name_);
+  if (FLAGS_torch_jit_release_simple_executor_graph) {
+    graph.reset();
+  }
+
+  return *execution_plan_;
+}
+
 const ExecutionPlan& SimpleGraphExecutorImpl::getPlanFor(
     Stack& stack,
-    c10::optional<size_t> remaining_bailout_depth) {
+    std::optional<size_t> remaining_bailout_depth) {
   std::lock_guard<std::mutex> lock(compile_mutex);
 
   // IMPORTANT: This is a hot path of calling a torchscript function. Try not to
@@ -21,11 +44,19 @@ const ExecutionPlan& SimpleGraphExecutorImpl::getPlanFor(
   if (execution_plan_) {
     return *execution_plan_;
   }
-  auto copy = graph->copy();
-  runNooptPassPipeline(copy);
-  execution_plan_ = ExecutionPlan(copy, function_name_);
+  return buildPlan();
+}
 
-  return *execution_plan_;
+const ExecutionPlan& SimpleGraphExecutorImpl::getInputIndependentPlan() {
+  std::lock_guard<std::mutex> lock(compile_mutex);
+  return getInputIndependentPlanImpl();
+}
+
+const ExecutionPlan& SimpleGraphExecutorImpl::getInputIndependentPlanImpl() {
+  if (execution_plan_) {
+    return *execution_plan_;
+  }
+  return buildPlan();
 }
 
 GraphExecutorState SimpleGraphExecutorImpl::getDebugState() {

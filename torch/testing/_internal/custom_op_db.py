@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import torch
 import functools
 from torch.testing import make_tensor
@@ -28,7 +29,7 @@ def to_numpy(tensor):
     return tensor.cpu().numpy()
 
 @torch.library.custom_op("_torch_testing::numpy_cube", mutates_args=())
-def numpy_cube(x: Tensor) -> Tuple[Tensor, Tensor]:
+def numpy_cube(x: Tensor) -> tuple[Tensor, Tensor]:
     x_np = to_numpy(x)
     dx = torch.tensor(3 * x_np ** 2, device=x.device)
     return torch.tensor(x_np ** 3, device=x.device), dx
@@ -39,7 +40,7 @@ def _(x):
 
 def numpy_cube_setup_context(ctx, inputs, output):
     x, = inputs
-    cube, dx = output
+    _cube, dx = output
     ctx.save_for_backward(x, dx)
 
 def numpy_cube_backward(ctx, grad_out, grad_dx):
@@ -49,13 +50,20 @@ def numpy_cube_backward(ctx, grad_out, grad_dx):
 
 numpy_cube.register_autograd(numpy_cube_backward, setup_context=numpy_cube_setup_context)
 
+def numpy_cube_vmap(info, in_dims, x):
+    result = numpy_cube(x)
+    return result, (in_dims[0], in_dims[0])
+
+numpy_cube.register_vmap(numpy_cube_vmap)
+
 @torch.library.custom_op("_torch_testing::numpy_mul", mutates_args=())
 def numpy_mul(x: Tensor, y: Tensor) -> Tensor:
     return torch.tensor(to_numpy(x) * to_numpy(y), device=x.device)
 
 @numpy_mul.register_fake
 def _(x, y):
-    assert x.device == y.device
+    if x.device != y.device:
+        raise AssertionError(f"x.device={x.device} != y.device={y.device}")
     return (x * y).contiguous()
 
 def numpy_mul_setup_context(ctx, inputs, output):
@@ -68,6 +76,16 @@ def numpy_mul_backward(ctx, grad_out):
     return grad_x, grad_y
 
 numpy_mul.register_autograd(numpy_mul_backward, setup_context=numpy_mul_setup_context)
+
+def numpy_mul_vmap(info, in_dims, x, y):
+    x_bdim, y_bdim = in_dims
+    x = x.movedim(x_bdim, -1) if x_bdim is not None else x.unsqueeze(-1)
+    y = y.movedim(y_bdim, -1) if y_bdim is not None else y.unsqueeze(-1)
+    result = x * y
+    result = result.movedim(-1, 0)
+    return result, 0
+
+numpy_mul.register_vmap(numpy_mul_vmap)
 
 @torch.library.custom_op("_torch_testing::numpy_mul_scalar", mutates_args=())
 def numpy_mul_scalar(x: Tensor, *, scalar: float) -> Tensor:
@@ -86,8 +104,17 @@ def numpy_mul_scalar_backward(ctx, grad_out):
 
 numpy_mul_scalar.register_autograd(numpy_mul_scalar_backward, setup_context=numpy_mul_scalar_setup_context)
 
+def numpy_mul_scalar_vmap(info, in_dims, x, *, scalar):
+    x_bdim, = in_dims
+    x = x.movedim(x_bdim, -1) if x_bdim is not None else x.unsqueeze(-1)
+    result = x * scalar
+    result = result.movedim(-1, 0)
+    return result, 0
+
+numpy_mul_scalar.register_vmap(numpy_mul_scalar_vmap)
+
 @torch.library.custom_op("_torch_testing::numpy_sort", mutates_args=())
-def numpy_sort(x: Tensor, dim: int) -> Tuple[Tensor, Tensor, Tensor]:
+def numpy_sort(x: Tensor, dim: int) -> tuple[Tensor, Tensor, Tensor]:
     device = x.device
     x = to_numpy(x)
     ind = np.argsort(x, axis=dim)
@@ -104,7 +131,7 @@ def _(x, dim):
     return torch.empty_like(x), torch.empty_like(x, dtype=torch.long), torch.empty_like(x, dtype=torch.long)
 
 def numpy_sort_setup_context(ctx, inputs, output):
-    out, ind, ind_inv = output
+    _out, ind, ind_inv = output
     ctx.dim = inputs[1]
     ctx.save_for_backward(ind, ind_inv)
     ctx.mark_non_differentiable(ind, ind_inv)
@@ -115,6 +142,14 @@ def numpy_sort_backward(ctx, grad_out, grad_ind, grad_ind_inv):
 
 numpy_sort.register_autograd(numpy_sort_backward, setup_context=numpy_sort_setup_context)
 
+def numpy_sort_vmap(info, in_dims, x, dim):
+    x_bdim, _ = in_dims
+    x = x.movedim(x_bdim, 0)
+    dim = dim if dim >= 0 else dim + x.dim() - 1
+    result = numpy_sort(x, dim + 1)
+    return result, (0, 0, 0)
+
+numpy_sort.register_vmap(numpy_sort_vmap)
 
 @torch.library.custom_op("_torch_testing::numpy_take", mutates_args=())
 def numpy_take(x: Tensor, ind: Tensor, ind_inv: Tensor, dim: int) -> Tensor:
@@ -125,14 +160,18 @@ def numpy_take(x: Tensor, ind: Tensor, ind_inv: Tensor, dim: int) -> Tensor:
 
 @numpy_take.register_fake
 def _(x, ind, ind_inv, dim):
-    assert x.device == ind.device
-    assert x.device == ind_inv.device
-    assert ind.dtype == torch.long
-    assert ind_inv.dtype == torch.long
+    if x.device != ind.device:
+        raise AssertionError(f"x.device={x.device} != ind.device={ind.device}")
+    if x.device != ind_inv.device:
+        raise AssertionError(f"x.device={x.device} != ind_inv.device={ind_inv.device}")
+    if ind.dtype != torch.long:
+        raise AssertionError(f"ind.dtype must be torch.long, got {ind.dtype}")
+    if ind_inv.dtype != torch.long:
+        raise AssertionError(f"ind_inv.dtype must be torch.long, got {ind_inv.dtype}")
     return torch.empty_like(x)
 
 def numpy_take_setup_context(ctx, inputs, output):
-    x, ind, ind_inv, dim = inputs
+    _x, ind, ind_inv, dim = inputs
     ctx.dim = dim
     ctx.save_for_backward(ind, ind_inv)
 
@@ -142,6 +181,26 @@ def numpy_take_backward(ctx, grad_out):
     return grad_x, None, None, None
 
 numpy_take.register_autograd(numpy_take_backward, setup_context=numpy_take_setup_context)
+
+def numpy_take_vmap(info, in_dims, x, ind, ind_inv, dim):
+    x_bdim, ind_bdim, ind_inv_bdim, _ = in_dims
+
+    # wrap dim
+    logical_dim = x.dim() if x_bdim is None else x_bdim - 1
+    dim = dim if dim >= 0 else dim + logical_dim
+
+    def expand_bdim(x, x_bdim):
+        if x_bdim is None:
+            return x.expand(info.batch_size, *x.shape)
+        return x.movedim(x_bdim, 0)
+
+    x = expand_bdim(x, x_bdim)
+    ind = expand_bdim(ind, ind_bdim)
+    ind_inv = expand_bdim(ind_inv, ind_inv_bdim)
+
+    return numpy_take(x, ind, ind_inv, dim + 1), 0
+
+numpy_take.register_vmap(numpy_take_vmap)
 
 @torch.library.custom_op("_torch_testing::numpy_nonzero", mutates_args=())
 def numpy_nonzero(x: Tensor) -> Tensor:
@@ -164,10 +223,18 @@ def sample_inputs_numpy_nonzero(opinfo, device, dtype, requires_grad, **kwargs):
     shape = 10
     result = make_arg(shape, low=0.9, high=2)
     mask = make_tensor(shape, low=0, high=2, device=device, dtype=torch.long)
+    # numpy_nonzero rejects inputs with fewer than two nonzero elements, which a
+    # random mask hits for roughly 1% of the seeds.
+    mask[:2] = 1
     with torch.no_grad():
         result *= mask
 
     yield SampleInput(result, args=())
+
+def numpy_nonzero_vmap(info, in_dims, x):
+    raise NotImplementedError("Operator is data-dependent and cannot be vmapped.")
+
+numpy_nonzero.register_vmap(numpy_nonzero_vmap)
 
 @torch.library.custom_op("_torch_testing::numpy_view_copy", mutates_args=())
 def numpy_view_copy(x: Tensor, shape: Sequence[int]) -> Tensor:
@@ -185,6 +252,16 @@ def numpy_view_copy_backward(ctx, grad_out):
 
 numpy_view_copy.register_autograd(numpy_view_copy_backward, setup_context=numpy_view_copy_setup_context)
 
+def numpy_view_copy_vmap(info, in_dims, x, shape):
+    x_bdim, _ = in_dims
+    x = x.movedim(x_bdim, 0)
+    x_shape = x.shape[0]
+    batch_shape = (x_shape, *shape)
+    result = numpy_view_copy(x, batch_shape)
+    return result, 0
+
+numpy_view_copy.register_vmap(numpy_view_copy_vmap)
+
 def sample_inputs_numpy_view_copy(opinfo, device, dtype, requires_grad, **kwargs):
     make_arg = functools.partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     result = make_arg(2, 3, 4, low=0.9, high=2)
@@ -192,18 +269,24 @@ def sample_inputs_numpy_view_copy(opinfo, device, dtype, requires_grad, **kwargs
 
 @torch.library.custom_op('_torch_testing::numpy_cat', mutates_args=())
 def numpy_cat(xs: Sequence[Tensor], dim: int) -> Tensor:
-    assert len(xs) > 0
-    assert all(x.device == xs[0].device for x in xs)
-    assert all(x.dtype == xs[0].dtype for x in xs)
+    if len(xs) == 0:
+        raise AssertionError("xs must not be empty")
+    if not all(x.device == xs[0].device for x in xs):
+        raise AssertionError("All tensors must be on the same device")
+    if not all(x.dtype == xs[0].dtype for x in xs):
+        raise AssertionError("All tensors must have the same dtype")
     np_xs = [to_numpy(x) for x in xs]
     np_out = np.concatenate(np_xs, axis=dim)
     return torch.tensor(np_out, device=xs[0].device)
 
 @numpy_cat.register_fake
 def _(xs, dim):
-    assert len(xs) > 0
-    assert all(x.device == xs[0].device for x in xs)
-    assert all(x.dtype == xs[0].dtype for x in xs)
+    if len(xs) == 0:
+        raise AssertionError("xs must not be empty")
+    if not all(x.device == xs[0].device for x in xs):
+        raise AssertionError("All tensors must be on the same device")
+    if not all(x.dtype == xs[0].dtype for x in xs):
+        raise AssertionError("All tensors must have the same dtype")
     return torch.cat(xs, dim=dim)
 
 def numpy_cat_setup_context(ctx, inputs, output):
@@ -220,6 +303,13 @@ def numpy_cat_backward(ctx, grad_out):
     return grad_xs, None
 
 numpy_cat.register_autograd(numpy_cat_backward, setup_context=numpy_cat_setup_context)
+
+def numpy_cat_vmap(info, in_dims, x, dim):
+    x_bdim, = in_dims
+    result = numpy_cat(x, dim)
+    return result, x_bdim
+
+numpy_cat.register_vmap(numpy_cat_vmap)
 
 def sample_inputs_numpy_cat(opinfo, device, dtype, requires_grad, **kwargs):
     make_arg = functools.partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -248,13 +338,21 @@ def numpy_split_copy_backward(ctx, grad_out):
 
 numpy_split_copy.register_autograd(numpy_split_copy_backward, setup_context=numpy_split_copy_setup_context)
 
+def numpy_split_copy_vmap(info, in_dims, x, splits, dim):
+    x_bdim, _ , _ = in_dims
+    x = x.movedim(x_bdim, 0)
+    result = numpy_split_copy(x, splits, dim + 1)
+    return result, 0
+
+numpy_split_copy.register_vmap(numpy_split_copy_vmap)
+
 def sample_inputs_numpy_split_copy(opinfo, device, dtype, requires_grad, **kwargs):
     make_arg = functools.partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     x = make_arg(2, 9, low=0.9, high=2)
     yield SampleInput(x, args=([1, 3, 6], 1))
 
 @torch.library.custom_op('_torch_testing::numpy_split_copy_with_int', mutates_args=())
-def numpy_split_copy_with_int(x: Tensor, splits: Sequence[int], dim: int) -> Tuple[List[Tensor], int]:
+def numpy_split_copy_with_int(x: Tensor, splits: Sequence[int], dim: int) -> tuple[List[Tensor], int]:
     x_np = to_numpy(x)
     arrs = np.split(x_np, splits, axis=dim)
     return [torch.tensor(arr, device=x.device, dtype=x.dtype) for arr in arrs], len(splits)
@@ -274,19 +372,30 @@ numpy_split_copy_with_int.register_autograd(
     numpy_split_copy_with_int_backward,
     setup_context=numpy_split_copy_with_int_setup_context)
 
+def numpy_split_copy_with_int_vmap(info, in_dims, x, splits, dim):
+    x_bdim, _ , _ = in_dims
+    x = x.movedim(x_bdim, 0)
+    result, len_split = numpy_split_copy_with_int(x, splits, dim + 1)
+    return (result, len_split), ([0 for _ in range(len(result))], None)
+
+numpy_split_copy_with_int.register_vmap(numpy_split_copy_with_int_vmap)
+
 @torch.library.custom_op("_torch_testing::numpy_nms", mutates_args=())
 def numpy_nms(boxes: Tensor, scores: Tensor, iou_threshold: Number) -> Tensor:
     # Adapted from Ross Girshick's fast-rcnn implementation at
     # https://github.com/rbgirshick/fast-rcnn/blob/master/lib/utils/nms.py
-    assert boxes.device == scores.device
+    if boxes.device != scores.device:
+        raise AssertionError(f"boxes.device={boxes.device} != scores.device={scores.device}")
     device = boxes.device
 
     boxes = to_numpy(boxes)
     scores = to_numpy(scores)
 
     N = boxes.shape[0]
-    assert boxes.shape == (N, 4)
-    assert scores.shape == (N,)
+    if boxes.shape != (N, 4):
+        raise AssertionError(f"boxes.shape must be (N, 4), got {boxes.shape}")
+    if scores.shape != (N,):
+        raise AssertionError(f"scores.shape must be (N,), got {scores.shape}")
 
     x1 = boxes[:, 0]
     y1 = boxes[:, 1]
@@ -315,20 +424,29 @@ def numpy_nms(boxes: Tensor, scores: Tensor, iou_threshold: Number) -> Tensor:
 
     result = torch.tensor(np.stack(keep), device=device)
     # Needed for data-dependent condition :(
-    assert result.size(0) >= 2
+    if result.size(0) < 2:
+        raise AssertionError(f"result.size(0) must be >= 2, got {result.size(0)}")
     return result
 
 @numpy_nms.register_fake
 def _(boxes, scores, iou_threshold):
-    assert boxes.device == scores.device
+    if boxes.device != scores.device:
+        raise AssertionError(f"boxes.device={boxes.device} != scores.device={scores.device}")
     N = boxes.shape[0]
-    assert boxes.shape == (N, 4)
-    assert scores.shape == (N,)
+    if boxes.shape != (N, 4):
+        raise AssertionError(f"boxes.shape must be (N, 4), got {boxes.shape}")
+    if scores.shape != (N,):
+        raise AssertionError(f"scores.shape must be (N,), got {scores.shape}")
 
     ctx = torch._custom_op.impl.get_ctx()
     i0 = ctx.create_unbacked_symint()
     result = boxes.new_empty([i0], dtype=torch.int64)
     return result
+
+def numpy_nms_vmap(info, in_dims, boxes, scores, iou_threshold):
+    raise NotImplementedError("Operator is data-dependent and cannot be vmapped.")
+
+numpy_nms.register_vmap(numpy_nms_vmap)
 
 def sample_inputs_numpy_nms(opinfo, device, dtype, requires_grad, **kwargs):
     make_arg = functools.partial(make_tensor, device=device, dtype=dtype)
@@ -441,7 +559,7 @@ custom_op_db = [
 # some mechanical test cases
 # ==============================================================
 
-lib = torch.library.Library("_torch_testing", "FRAGMENT")  # noqa: TOR901
+lib = torch.library.Library("_torch_testing", "FRAGMENT")
 
 lib.define("source0(Tensor x) -> Tensor")
 
@@ -458,7 +576,7 @@ torch.library.register_fake("_torch_testing::source1", source1_fake, lib=lib)
 
 lib.define("source2(Tensor x) -> Tensor")
 
-@torch.library.impl_abstract("_torch_testing::source2", lib=lib)
+@torch.library.register_fake("_torch_testing::source2", lib=lib)
 def _(x):
     return x.clone()
 
@@ -467,7 +585,7 @@ lib.define("source3(Tensor x) -> Tensor")
 def source3_fake(x):
     return x.clone()
 
-torch.library.impl_abstract("_torch_testing::source3", source3_fake, lib=lib)
+torch.library.register_fake("_torch_testing::source3", source3_fake, lib=lib)
 
 
 @torch.library.custom_op("_torch_testing::source4", mutates_args=())

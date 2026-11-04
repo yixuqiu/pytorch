@@ -4,6 +4,7 @@
 
 #include <ATen/native/vulkan/api/Adapter.h>
 #include <ATen/native/vulkan/api/Runtime.h>
+#include <c10/util/irange.h>
 
 namespace at {
 namespace native {
@@ -78,6 +79,9 @@ VkInstance create_instance(const RuntimeConfiguration& config) {
 #ifdef VK_EXT_debug_report
         VK_EXT_DEBUG_REPORT_EXTENSION_NAME,
 #endif /* VK_EXT_debug_report */
+#ifdef __APPLE__
+        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
+#endif // __APPLE__
     };
 
     find_requested_layers_and_extensions(
@@ -90,7 +94,11 @@ VkInstance create_instance(const RuntimeConfiguration& config) {
   const VkInstanceCreateInfo instance_create_info{
       VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, // sType
       nullptr, // pNext
+#ifdef __APPLE__
+      VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR, // flags
+#else // __APPLE__
       0u, // flags
+#endif // __APPLE__
       &application_info, // pApplicationInfo
       static_cast<uint32_t>(enabled_layers.size()), // enabledLayerCount
       enabled_layers.data(), // ppEnabledLayerNames
@@ -142,8 +150,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_report_callback_fn(
   (void)flags;
 
   std::stringstream stream;
-  stream << layer_prefix << " " << message_code << " " << message << std::endl;
-  const std::string log = stream.str();
+  stream << layer_prefix << ' ' << message_code << ' ' << message << std::endl;
+  const std::string log = std::move(stream).str();
 
   std::cout << log;
 
@@ -198,7 +206,7 @@ uint32_t select_first(const std::vector<Runtime::DeviceMapping>& devices) {
   }
 
   // Select the first adapter that has compute capability
-  for (size_t i = 0; i < devices.size(); ++i) {
+  for (const auto i : c10::irange(devices.size())) {
     if (devices[i].first.num_compute_queues > 0) {
       return i;
     }

@@ -6,8 +6,7 @@
 
 #include <c10/macros/Macros.h>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 using namespace at::cuda::detail;
 
@@ -45,17 +44,20 @@ __global__ void im2col_kernel(
     int64_t h_in = h_out * stride_height - pad_height;
     int64_t w_in = w_out * stride_width - pad_width;
 
-    dt* col = data_col + (channel_out * height_col + h_out) * width_col + w_out;
-    const dt* im = data_im + (channel_in * height + h_in) * width + w_in;
+    // Index from the base pointers: with padding, the window origin lies
+    // before data_im, and forming such a pointer is undefined behavior.
+    int64_t col_offset = (channel_out * height_col + h_out) * width_col + w_out;
+    int64_t im_offset = (channel_in * height + h_in) * width + w_in;
 
     for (int64_t i = 0; i < kernel_height; ++i) {
       for (int64_t j = 0; j < kernel_width; ++j) {
         int64_t h = h_in + i * dilation_height;
         int64_t w = w_in + j * dilation_width;
-        *col = (h >= 0 && w >= 0 && h < height && w < width)
-            ? im[i * dilation_height * width + j * dilation_width]
+        data_col[col_offset] = (h >= 0 && w >= 0 && h < height && w < width)
+            ? data_im
+                  [im_offset + i * dilation_height * width + j * dilation_width]
             : static_cast<dt>(0);
-        col += height_col * width_col;
+        col_offset += height_col * width_col;
       }
     }
   }
@@ -108,7 +110,6 @@ __forceinline__ __device__ void col2im_device(
     const dt* data_col,
     const int64_t height,
     const int64_t width,
-    const int64_t channels,
     const int64_t kernel_h,
     const int64_t kernel_w,
     const int64_t pad_height,
@@ -163,7 +164,6 @@ __global__ void col2im_kernel(
     const dt* data_col,
     const int64_t height,
     const int64_t width,
-    const int64_t channels,
     const int64_t kernel_h,
     const int64_t kernel_w,
     const int64_t pad_height,
@@ -181,7 +181,6 @@ __global__ void col2im_kernel(
         data_col,
         height,
         width,
-        channels,
         kernel_h,
         kernel_w,
         pad_height,
@@ -224,7 +223,6 @@ void col2im(
           data_col,
           height,
           width,
-          channels,
           patch_height,
           patch_width,
           pad_height,
@@ -248,7 +246,6 @@ __global__ void col2im_batched_kernel(
     const int64_t nbatch,
     const int64_t height,
     const int64_t width,
-    const int64_t channels,
     const int64_t kernel_h,
     const int64_t kernel_w,
     const int64_t pad_height,
@@ -273,7 +270,6 @@ __global__ void col2im_batched_kernel(
         data_col + ibatch * col_batch_stride,
         height,
         width,
-        channels,
         kernel_h,
         kernel_w,
         pad_height,
@@ -325,7 +321,6 @@ void col2im_batched(
           nbatch,
           height,
           width,
-          channels,
           patch_height,
           patch_width,
           pad_height,
@@ -341,5 +336,4 @@ void col2im_batched(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

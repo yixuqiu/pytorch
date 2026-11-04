@@ -2,7 +2,6 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/native/AdaptivePooling.h>
 #include <ATen/native/xnnpack/Engine.h>
-#include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -26,20 +25,8 @@ namespace {
     at::Tensor const& input,
     IntArrayRef output_size)
   {
-    TORCH_CHECK(output_size.size() == 2, "adaptive_avg_pool2d: output_size must be 2");
+    adaptive_avg_pool_check(input, output, output_size, /*pooling_dims=*/2, "adaptive_avg_pool2d()");
     int64_t ndim = input.dim();
-    TORCH_CHECK((ndim == 3 || ndim == 4),
-      "adaptive_avg_pool2d(): Expected 3D or 4D tensor, but got ", input.sizes());
-    for (const auto i : {-2, -1}) {
-      TORCH_CHECK(input.size(i) > 0,
-        "adaptive_avg_pool2d(): Expected input to have non-zero size for non-batch dimensions, "
-        "but input has sizes ", input.sizes(), " with dimension ", i + ndim, " being "
-        "empty");
-    }
-
-    TORCH_CHECK(input.dtype() == output.dtype(),
-      "expected dtype ", input.dtype(), " for `output` but got dtype ", output.dtype());
-
     int64_t channels  = input.size(-3);
     int64_t output_height = output_size[0];
     int64_t output_width = output_size[1];
@@ -63,20 +50,8 @@ namespace {
     const Tensor& grad_output,
     const Tensor& input)
   {
-    int64_t ndim = grad_output.ndimension();
-    for (const auto i : c10::irange(1, ndim)) {
-      TORCH_CHECK(grad_output.size(i) > 0,
-        "adaptive_avg_pool2d_backward(): Expected grad_output to have non-zero size for non-batch dimensions, "
-        "but grad_output has sizes ", grad_output.sizes(), " with dimension ", i, " being "
-        "empty");
-    }
-
-    TORCH_CHECK((ndim == 3 || ndim == 4),
-      "adaptive_avg_pool2d_backward(): Expected 3D or 4D tensor, but got ", input.sizes());
-    TORCH_CHECK(input.dtype() == grad_output.dtype(),
-      "expected dtype ", input.dtype(), " for `grad_output` but got dtype ", grad_output.dtype());
-    TORCH_CHECK(input.dtype() == grad_input.dtype(),
-      "expected dtype ", input.dtype(), " for `grad_input` but got dtype ", grad_input.dtype());
+    adaptive_avg_pool_backward_check(
+      grad_input, grad_output, input, /*pooling_dims=*/2, "adaptive_avg_pool2d_backward()");
 
     grad_input.resize_(input.sizes(), input.suggest_memory_format());
     grad_input.zero_();
@@ -117,7 +92,7 @@ namespace {
       return at::mkldnn_adaptive_avg_pool2d(input, C10_AS_INTARRAYREF_SLOW(output_size));
     }
 
-    if (!input.is_quantized() && output_size[0] == 1 && output_size[1] == 1 && !input.is_xpu()) {
+    if (!input.is_quantized() && output_size[0] == 1 && output_size[1] == 1) {
       // in this case, adaptive pooling is just computing mean over hw
       // dimensions, which can be done more efficiently
       #if defined(C10_MOBILE) && defined(USE_XNNPACK)

@@ -6,7 +6,6 @@
 #include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/constant_pooling.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/freeze_module.h>
 #include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/passes/tensorexpr_fuser.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
@@ -19,7 +18,7 @@
 
 namespace torch::jit {
 
-void createFusionGroups(Block* block, AliasDb* aliasDb, size_t min_size);
+static void createFusionGroups(Block* block, AliasDb* aliasDb, size_t min_size);
 
 void fuseStaticSubgraphs(std::shared_ptr<Graph> graph, size_t min_size) {
   Inline(*graph);
@@ -44,10 +43,7 @@ static Operation createStaticSubgraphRuntime(const Node* node) {
   auto num_inputs = module->num_inputs();
   return [module, num_inputs](Stack& stack) {
     RECORD_FUNCTION("Static Runtime", std::vector<c10::IValue>());
-    auto inps = torch::jit::last(stack, num_inputs);
-    // TODO maybe avoid call to vec
-    auto outputs = (*module)(inps.vec(), {});
-    torch::jit::drop(stack, num_inputs);
+    auto outputs = (*module)(torch::jit::pop(stack, num_inputs), {});
 
     if (module->num_outputs() > 1) {
       for (auto& o : outputs.toTupleRef().elements()) {
@@ -60,7 +56,7 @@ static Operation createStaticSubgraphRuntime(const Node* node) {
   };
 }
 
-RegisterOperators StaticSubgraphOps({torch::jit::Operator(
+static RegisterOperators StaticSubgraphOps({torch::jit::Operator(
     prim::StaticSubgraph,
     createStaticSubgraphRuntime,
     AliasAnalysisKind::INTERNAL_SPECIAL_CASE)});
@@ -160,20 +156,18 @@ static value_list sortReverseTopological(ArrayRef<Value*> inputs, Block* b) {
 }
 
 static void debugDumpFusionGroup(const std::string& msg, Node* n) {
-  // NOLINTNEXTLINE(clang-analyzer-core.NonNullParamChecker)
   GRAPH_DEBUG(msg, *n);
-  // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
   if (n->kind() == prim::StaticSubgraph) {
     GRAPH_DEBUG(*n->g(attr::Subgraph));
   }
 }
 
-static c10::optional<Node*> tryMerge(
+static std::optional<Node*> tryMerge(
     Node* fusion_group,
     Node* to_merge,
     AliasDb* aliasDb) {
   if (!canMerge(fusion_group, to_merge, aliasDb)) {
-    return c10::nullopt;
+    return std::nullopt;
   }
 
   std::vector<Node*> nodes_to_merge = {to_merge};
@@ -190,7 +184,7 @@ static c10::optional<Node*> tryMerge(
     GRAPH_UPDATE("Trying to move node next to fusion group: ", getHeader(n));
     if (!aliasDb->moveBeforeTopologicallyValid(n, move_point)) {
       GRAPH_UPDATE("Failed to move because of AliasDb checks!");
-      return c10::nullopt;
+      return std::nullopt;
     }
     move_point = n;
   }
@@ -273,8 +267,7 @@ void createFusionGroups(Block* block, AliasDb* aliasDb, size_t min_size) {
   while (any_changed) {
     any_changed = false;
     for (auto it = block->nodes().rbegin(); it != block->nodes().rend();) {
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-      bool changed;
+      bool changed = false;
       std::tie(it, changed) = scanNode(*it, aliasDb);
       any_changed |= changed;
     }

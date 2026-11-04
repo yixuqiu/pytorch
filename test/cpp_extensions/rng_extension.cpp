@@ -19,29 +19,29 @@ struct TestCPUGenerator : public c10::GeneratorImpl {
   }
   uint32_t random() { return static_cast<uint32_t>(value_); }
   uint64_t random64() { return value_; }
-  void set_current_seed(uint64_t seed) override { throw std::runtime_error("not implemented"); }
-  void set_offset(uint64_t offset) override { throw std::runtime_error("not implemented"); }
-  uint64_t get_offset() const override { throw std::runtime_error("not implemented"); }
-  uint64_t current_seed() const override { throw std::runtime_error("not implemented"); }
-  uint64_t seed() override { throw std::runtime_error("not implemented"); }
-  void set_state(const c10::TensorImpl& new_state) override { throw std::runtime_error("not implemented"); }
-  c10::intrusive_ptr<c10::TensorImpl> get_state() const override { throw std::runtime_error("not implemented"); }
-  TestCPUGenerator* clone_impl() const override { throw std::runtime_error("not implemented"); }
+  void set_current_seed(uint64_t seed) override { TORCH_CHECK(false, "not implemented"); }
+  void set_offset(uint64_t offset) override { TORCH_CHECK(false, "not implemented"); }
+  uint64_t get_offset() const override { TORCH_CHECK(false, "not implemented"); }
+  uint64_t current_seed() const override { TORCH_CHECK(false, "not implemented"); }
+  uint64_t seed() override { TORCH_CHECK(false, "not implemented"); }
+  void set_state(const c10::TensorImpl& new_state) override { TORCH_CHECK(false, "not implemented"); }
+  c10::intrusive_ptr<c10::TensorImpl> get_state() const override { TORCH_CHECK(false, "not implemented"); }
+  TestCPUGenerator* clone_impl() const override { TORCH_CHECK(false, "not implemented"); }
 
   static DeviceType device_type() { return DeviceType::CPU; }
 
   uint64_t value_;
 };
 
-Tensor& random_(Tensor& self, c10::optional<Generator> generator) {
+Tensor& random_(Tensor& self, std::optional<Generator> generator) {
   return at::native::templates::random_impl<native::templates::cpu::RandomKernel, TestCPUGenerator>(self, generator);
 }
 
-Tensor& random_from_to(Tensor& self, int64_t from, optional<int64_t> to, c10::optional<Generator> generator) {
+Tensor& random_from_to(Tensor& self, int64_t from, optional<int64_t> to, std::optional<Generator> generator) {
   return at::native::templates::random_from_to_impl<native::templates::cpu::RandomFromToKernel, TestCPUGenerator>(self, from, to, generator);
 }
 
-Tensor& random_to(Tensor& self, int64_t to, c10::optional<Generator> generator) {
+Tensor& random_to(Tensor& self, int64_t to, std::optional<Generator> generator) {
   return random_from_to(self, 0, to, generator);
 }
 

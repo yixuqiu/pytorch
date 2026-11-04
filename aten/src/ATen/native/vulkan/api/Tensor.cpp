@@ -65,10 +65,8 @@ std::vector<int64_t> calc_strides(
       switch (memory_layout) {
         case api::GPUMemoryLayout::TENSOR_WIDTH_PACKED:
           return calc_contiguous_strides(sizes);
-          break;
         case api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED:
           return calc_channels_last_strides(sizes);
-          break;
         default:
           VK_THROW("Invalid memory format used to create vTensor!");
       }
@@ -460,7 +458,7 @@ void vTensor::virtual_resize(const std::vector<int64_t>& new_sizes) {
 // vTensorStorage
 //
 
-api::VulkanImage allocate_image(
+static api::VulkanImage allocate_image(
     api::Context* const context_ptr,
     api::utils::uvec3& extents,
     const api::StorageType storage_type,
@@ -505,7 +503,7 @@ api::VulkanImage allocate_image(
       /*allocate_memory = */ allocate_memory);
 }
 
-api::VulkanBuffer allocate_buffer(
+static api::VulkanBuffer allocate_buffer(
     api::Context* const context_ptr,
     const int64_t numel,
     const api::StorageType storage_type,

@@ -12,11 +12,6 @@ namespace torch {
 namespace lazy {
 namespace {
 
-bool IsLtcTensor(const at::Tensor& tensor) {
-  return dynamic_cast<torch::lazy::LTCTensorImpl*>(
-      tensor.unsafeGetTensorImpl());
-}
-
 std::unordered_set<std::string>* CreateIgnoredCounters() {
   std::unordered_set<std::string>* icounters =
       new std::unordered_set<std::string>();
@@ -56,8 +51,8 @@ bool EqualValues(at::Tensor tensor1, at::Tensor tensor2) {
   if (tensor1.sizes() != tensor2.sizes() ||
       tensor1.dtype() != tensor2.dtype()) {
     std::cerr << "Different shape:\n"
-              << tensor1.dtype() << " " << tensor1.sizes() << "\n-vs-\n"
-              << tensor2.dtype() << " " << tensor2.sizes() << "\n";
+              << tensor1.dtype() << ' ' << tensor1.sizes() << "\n-vs-\n"
+              << tensor2.dtype() << ' ' << tensor2.sizes() << '\n';
     return false;
   }
   at::ScalarType type1 = tensor1.scalar_type();
@@ -74,8 +69,8 @@ bool EqualValuesNoElementTypeCheck(at::Tensor tensor1, at::Tensor tensor2) {
   tensor2 = ToCpuTensor(tensor2);
   if (tensor1.sizes() != tensor2.sizes()) {
     std::cerr << "Different shape:\n"
-              << tensor1.dtype() << " " << tensor1.sizes() << "\n-vs-\n"
-              << tensor2.dtype() << " " << tensor2.sizes() << "\n";
+              << tensor1.dtype() << ' ' << tensor1.sizes() << "\n-vs-\n"
+              << tensor2.dtype() << ' ' << tensor2.sizes() << '\n';
     return false;
   }
   at::ScalarType type1 = tensor1.scalar_type();
@@ -111,8 +106,8 @@ bool CloseValues(
   if (tensor1.sizes() != tensor2.sizes() ||
       tensor1.dtype() != tensor2.dtype()) {
     std::cerr << "Different shape:\n"
-              << tensor1.dtype() << " " << tensor1.sizes() << "\n-vs-\n"
-              << tensor2.dtype() << " " << tensor2.sizes() << "\n";
+              << tensor1.dtype() << ' ' << tensor1.sizes() << "\n-vs-\n"
+              << tensor2.dtype() << ' ' << tensor2.sizes() << '\n';
     return false;
   }
   bool equal = tensor1.allclose(tensor2, rtol, atol);
@@ -145,7 +140,7 @@ void TestBackward(
     const torch::Tensor& input = inputs[i];
     if (input.defined()) {
       torch::Tensor oinput =
-          input.clone().detach().set_requires_grad(input.requires_grad());
+          input.detach().clone().set_requires_grad(input.requires_grad());
       input_vars.push_back(oinput);
 
       torch::Tensor xinput = CopyToDevice(input, device)
@@ -184,14 +179,14 @@ void TestBackward(
         {sum},
         inputs_w_grad,
         /*grad_outputs=*/{},
-        /*retain_graph=*/c10::nullopt,
+        /*retain_graph=*/std::nullopt,
         /*create_graph=*/create_graph,
         /*allow_unused=*/true);
     xouts = torch::autograd::grad(
         {xsum},
         xinputs_w_grad,
         /*grad_outputs=*/{},
-        /*retain_graph=*/c10::nullopt,
+        /*retain_graph=*/std::nullopt,
         /*create_graph=*/create_graph,
         /*allow_unused=*/true);
     for (size_t i = 0; i < outs.size(); ++i) {

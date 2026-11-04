@@ -1,13 +1,14 @@
 def get_blas_gomp_arch_deps():
-    return [
-        ("x86_64", [
-            "third-party//IntelComposerXE:{}".format(native.read_config("fbcode", "mkl_lp64", "mkl_lp64_omp")),
-        ]),
-        ("aarch64", [
-            "third-party//OpenBLAS:OpenBLAS",
+    return select({
+        "ovr_config//cpu:x86_64": [
+            "fbsource//third-party/mkl:{}".format(native.read_config("fbcode", "mkl_lp64", "mkl_lp64_omp")),
+        ],
+        "ovr_config//cpu:arm64": [
+            "third-party//Arm-Performance-Libraries:armpl_lp64_mp",
             "third-party//openmp:omp",
-        ]),
-    ]
+        ],
+        "DEFAULT": [],
+    })
 
 default_compiler_flags = [
     "-Wall",
@@ -15,6 +16,9 @@ default_compiler_flags = [
     "-Wno-unused-function",
     "-Wno-unused-parameter",
     "-Wno-error=strict-aliasing",
+    # Deprecated APIs (e.g. c10::checked_convert) must warn, not break the build,
+    # so they can be retired while external/BC callers migrate.
+    "-Wno-error=deprecated-declarations",
     "-Wno-shadow-compatible-local",
     "-Wno-maybe-uninitialized",  # aten is built with gcc as part of HHVM
     "-Wno-unknown-pragmas",
@@ -34,7 +38,6 @@ default_compiler_flags = [
     "-DMAGMA_V2",
     "-DNO_CUDNN_DESTROY_HANDLE",
     "-DUSE_FBGEMM",
-    "-DUSE_QNNPACK",
     "-DUSE_PYTORCH_QNNPACK",
     # The dynamically loaded NVRTC trick doesn't work in fbcode,
     # and it's not necessary anyway, because we have a stub
@@ -46,7 +49,7 @@ default_compiler_flags = [
     # includes <pthread.h> - a header not available on Windows.
     "DEFAULT": ["-DUSE_XNNPACK"],
     "ovr_config//os:windows": [],
-}) + (["-O1"] if native.read_config("fbcode", "build_mode_test_label", "") == "dev-nosan" else [])
+})
 
 compiler_specific_flags = {
     "clang": [
@@ -64,8 +67,6 @@ def get_cpu_parallel_backend_flags():
     defs = []
     if parallel_backend == "openmp":
         defs.append("-DAT_PARALLEL_OPENMP_FBCODE=1")
-    elif parallel_backend == "tbb":
-        defs.append("-DAT_PARALLEL_NATIVE_TBB_FBCODE=1")
     elif parallel_backend == "native":
         defs.append("-DAT_PARALLEL_NATIVE_FBCODE=1")
     else:

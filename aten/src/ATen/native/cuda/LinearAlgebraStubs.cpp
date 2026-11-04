@@ -8,15 +8,11 @@
 #include <ATen/NativeFunctions.h>
 #include <ATen/Dispatch.h>
 #include <ATen/DynamicLibrary.h>
-#include <ATen/NativeFunctions.h>
-#include <ATen/native/cuda/MiscUtils.h>
-#include <ATen/native/Resize.h>
-#include <ATen/native/LinearAlgebra.h>
 #include <ATen/native/BatchLinearAlgebra.h>
 #include <ATen/native/TransposeType.h>
+#include <c10/macros/Export.h>
 #if defined(BUILD_LAZY_CUDA_LINALG)
 #include <ATen/native/cuda/linalg/BatchLinearAlgebraLib.h>
-
 #if AT_MAGMA_ENABLED()
 #include <ATen/cuda/detail/CUDAHooks.h>
 
@@ -98,7 +94,7 @@ void lazy_linalg_eig_kernel(Tensor& eigenvalues, Tensor& eigenvectors, Tensor& i
 void lazy_svd_kernel(const Tensor& A,
                      const bool full_matrices,
                      const bool compute_uv,
-                     const c10::optional<c10::string_view>& driver,
+                     const std::optional<std::string_view>& driver,
                      const Tensor& U,
                      const Tensor& S,
                      const Tensor& Vh,
@@ -138,34 +134,34 @@ void lazy_ldl_solve(
 }
 
 REGISTER_CUDA_DISPATCH(cholesky_stub, &lazy_cholesky_kernel)
-REGISTER_CUDA_DISPATCH(cholesky_inverse_stub, &lazy_cholesky_inverse_kernel);
-REGISTER_CUDA_DISPATCH(lu_factor_stub, &lazy_lu_factor);
-REGISTER_CUDA_DISPATCH(ldl_factor_stub, &lazy_ldl_factor);
-REGISTER_CUDA_DISPATCH(ldl_solve_stub, &lazy_ldl_solve);
-REGISTER_CUDA_DISPATCH(triangular_solve_stub, &lazy_triangular_solve_kernel);
-REGISTER_CUDA_DISPATCH(orgqr_stub, &lazy_orgqr_kernel);
-REGISTER_CUDA_DISPATCH(ormqr_stub, &lazy_ormqr_kernel);
-REGISTER_CUDA_DISPATCH(geqrf_stub, &lazy_geqrf_kernel);
-REGISTER_CUDA_DISPATCH(linalg_eigh_stub, &lazy_linalg_eigh_kernel);
-REGISTER_CUDA_DISPATCH(linalg_eig_stub, &lazy_linalg_eig_kernel);
+REGISTER_CUDA_DISPATCH(cholesky_inverse_stub, &lazy_cholesky_inverse_kernel)
+REGISTER_CUDA_DISPATCH(lu_factor_stub, &lazy_lu_factor)
+REGISTER_CUDA_DISPATCH(ldl_factor_stub, &lazy_ldl_factor)
+REGISTER_CUDA_DISPATCH(ldl_solve_stub, &lazy_ldl_solve)
+REGISTER_CUDA_DISPATCH(triangular_solve_stub, &lazy_triangular_solve_kernel)
+REGISTER_CUDA_DISPATCH(orgqr_stub, &lazy_orgqr_kernel)
+REGISTER_CUDA_DISPATCH(ormqr_stub, &lazy_ormqr_kernel)
+REGISTER_CUDA_DISPATCH(geqrf_stub, &lazy_geqrf_kernel)
+REGISTER_CUDA_DISPATCH(linalg_eigh_stub, &lazy_linalg_eigh_kernel)
+REGISTER_CUDA_DISPATCH(linalg_eig_stub, &lazy_linalg_eig_kernel)
 REGISTER_CUDA_DISPATCH(svd_stub, &lazy_svd_kernel)
-REGISTER_CUDA_DISPATCH(lu_solve_stub, &lazy_lu_solve);
-REGISTER_CUDA_DISPATCH(lstsq_stub, &lazy_lstsq_kernel);
+REGISTER_CUDA_DISPATCH(lu_solve_stub, &lazy_lu_solve)
+REGISTER_CUDA_DISPATCH(lstsq_stub, &lazy_lstsq_kernel)
 } // anonymous namespace
 
 // Old style dispatches
 // torch_cuda_linalg dynamic library should have a global constructor
-// that calls regiserLinaglDispatch so in order ot lazy bind
+// that calls registerLinalgDispatch so in order ot lazy bind
 // old style dispatch all one have to do is to load library and call disp.func_name
 // Protect from infinite recursion by initializing dispatch to self and checking
 // that values are different after linalg library were loaded
 
-namespace cuda {
-namespace detail {
+
+namespace cuda::detail {
 void registerLinalgDispatch(const LinalgDispatch& disp_) {
   disp = disp_;
 }
-}} //namespace cuda::detail
+} //namespace cuda::detail
 
 Tensor _cholesky_solve_helper_cuda(const Tensor& self, const Tensor& A, bool upper) {
     getTorchLinalgLibrary();
@@ -173,6 +169,24 @@ Tensor _cholesky_solve_helper_cuda(const Tensor& self, const Tensor& A, bool upp
     return disp.cholesky_solve_helper(self, A, upper);
 }
 
+C10_EXPORT void* getCurrentCUDASolverDnHandleLazy() {
+  using GetCurrentCUDASolverDnHandleFn = void* (*)();
+  static auto* fn = reinterpret_cast<GetCurrentCUDASolverDnHandleFn>(
+      getTorchLinalgLibrary().sym("at_cuda_getCurrentCUDASolverDnHandle"));
+  TORCH_CHECK(
+      fn != nullptr,
+      "Failed to resolve at_cuda_getCurrentCUDASolverDnHandle from "
+      "libtorch_cuda_linalg.so. This usually indicates a version mismatch "
+      "or a build missing torch_cuda_linalg.");
+  return fn();
+}
+
 #endif /*defined(BUILD_LAZY_CUDA_LINALG)*/
+
+#if !defined(BUILD_LAZY_CUDA_LINALG)
+C10_EXPORT void* getCurrentCUDASolverDnHandleLazy() {
+  return reinterpret_cast<void*>(at::cuda::getCurrentCUDASolverDnHandle());
+}
+#endif
 
 } // namespace at::native

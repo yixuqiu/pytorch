@@ -6,7 +6,7 @@
 #include <c10/util/TypeList.h>
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/order_preserving_flat_hash_map.h>
-#include <c10/util/Optional.h>
+#include <optional>
 #include <ATen/core/TensorBody.h>
 #include <ATen/core/jit_type_base.h>
 
@@ -80,11 +80,14 @@ public:
 
   template<class Value_>
   void setValue(Value_&& value) const {
-    static_assert(std::is_constructible<Value, Value_>::value, "Wrong type for the value argument of setValue()");
+    static_assert(std::is_constructible_v<Value, Value_>, "Wrong type for the value argument of setValue()");
     iterator_->second = Value(std::forward<Value_>(value));
   }
+  ~DictEntryRef() = default;
 
 private:
+  DictEntryRef() = default;
+
   // allow copying and moving, but only our friends (i.e. the Dict class) can do
   // it. Copying/moving this reference wrapper would be too ambiguous to allow it
   // in the public API.
@@ -103,7 +106,7 @@ private:
 template<class Key, class Value, class Iterator>
 class DictIterator final {
 public:
-   // C++17 friendly std::iterator implementation
+  using iterator_concept = std::forward_iterator_tag;
   using iterator_category = std::forward_iterator_tag;
   using value_type = DictEntryRef<Key, Value, Iterator>;
   using difference_type = std::ptrdiff_t;
@@ -115,10 +118,7 @@ public:
 
   DictIterator(const DictIterator& rhs): entryRef_(rhs.entryRef_) {}
   DictIterator(DictIterator&& rhs) noexcept: entryRef_(std::move(rhs.entryRef_)) {}
-  DictIterator& operator=(const DictIterator& rhs) {
-    entryRef_ = rhs.entryRef_;
-    return *this;
-  }
+  DictIterator& operator=(const DictIterator& rhs) = default;
   DictIterator& operator=(DictIterator&& rhs) noexcept {
     entryRef_ = std::move(rhs.entryRef_);
     return *this;
@@ -158,24 +158,8 @@ private:
     return lhs.get_iterator_() == rhs.get_iterator_();
   }
 
-  friend bool operator!=(const DictIterator& lhs, const DictIterator& rhs) {
-    return lhs.get_iterator_() != rhs.get_iterator_();
-  }
-
-  friend bool operator<(const DictIterator& lhs, const DictIterator& rhs) {
-    return lhs.get_iterator_() < rhs.get_iterator_();
-  }
-
-  friend bool operator<=(const DictIterator& lhs, const DictIterator& rhs) {
-    return lhs.get_iterator_() <= rhs.get_iterator_();
-  }
-
-  friend bool operator>(const DictIterator& lhs, const DictIterator& rhs) {
-    return lhs.get_iterator_() > rhs.get_iterator_();
-  }
-
-  friend bool operator>=(const DictIterator& lhs, const DictIterator& rhs) {
-    return lhs.get_iterator_() >= rhs.get_iterator_();
+  friend auto operator<=>(const DictIterator& lhs, const DictIterator& rhs) {
+    return lhs.get_iterator_() <=> rhs.get_iterator_();
   }
 
   DictEntryRef<Key, Value, Iterator> entryRef_;
@@ -205,6 +189,7 @@ template<class Key, class Value> Dict<IValue, IValue> toGenericDict(Dict<Key, Va
  * for the kernel API.
  */
 template<class Key, class Value>
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 class Dict final {
 private:
   static_assert((std::is_same_v<IValue, Key> && std::is_same_v<IValue, Value>) || guts::typelist::contains<impl::valid_dict_key_types, Key>::value, "Invalid Key type for Dict. We only support int64_t, double, bool, and string.");
@@ -314,7 +299,7 @@ public:
    *
    * @return The number of elements removed. This is either '1' if an element with the key existed, or '0' if it didn't.
    */
-  C10_NODISCARD size_t erase(const Key& key) const;
+  [[nodiscard]] size_t erase(const Key& key) const;
 
   /**
    * Returns the mapped value of the element with key equivalent to key.
@@ -364,7 +349,7 @@ public:
   bool is(const Dict& rhs) const;
 
   // private API for now because the return type will change to TypePtr
-  // instead of optional<TypePtr> once types are mandatory.
+  // instead of std::optional<TypePtr> once types are mandatory.
   TypePtr keyType() const;
   TypePtr valueType() const;
 
@@ -374,7 +359,7 @@ public:
   // of the new types, nor is there a check that other IValues which
   // hold references to this dictionary have the right static type.
   // This functionality is used only in the unpickler, where at
-  // creation type the real type of the dictionary is unknown, but
+  // creation time the real type of the dictionary is unknown, but
   // then later recovered from the static type information of the
   // unpickled object.
   void unsafeSetKeyType(TypePtr t);

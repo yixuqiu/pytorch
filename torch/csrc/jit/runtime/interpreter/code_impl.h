@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <c10/util/irange.h>
@@ -14,13 +15,10 @@
 #include <torch/csrc/jit/runtime/instruction.h>
 #include <torch/csrc/jit/runtime/interpreter/preprocess_graph.h>
 
-C10_DECLARE_bool(torch_jit_enable_expanded_stacks);
+TORCH_DECLARE_bool(torch_jit_enable_expanded_stacks);
+TORCH_DECLARE_bool(torch_jit_expanded_stacks_mangled);
 
-namespace torch::jit {
-
-std::ostream& operator<<(std::ostream& out, Instruction inst);
-
-namespace interpreter {
+namespace torch::jit::interpreter {
 
 template <class Ttarget, class Tsource>
 Ttarget safe_narrow_cast(Tsource v) {
@@ -61,10 +59,10 @@ struct WithCurrentNode {
 };
 
 struct NodeSourceInfo {
-  const char* func_name_;
-  const char* file_name_;
-  size_t line_;
-  NodeSourceInfo() : func_name_(nullptr), file_name_(nullptr), line_(0) {}
+  const char* func_name_{nullptr};
+  const char* file_name_{nullptr};
+  size_t line_{0};
+  NodeSourceInfo() = default;
 };
 
 struct CodeImpl {
@@ -111,8 +109,8 @@ struct CodeImpl {
   // It is also very useful for debugging interpreter problems to
   // keep this around.
   std::shared_ptr<Graph> graph_;
-  c10::optional<std::vector<GraphExecutor*>> grad_executors_;
-  c10::optional<std::vector<GraphExecutor*>> forward_executors_;
+  std::optional<std::vector<GraphExecutor*>> grad_executors_;
+  std::optional<std::vector<GraphExecutor*>> forward_executors_;
   PreprocessGraph preprocess_;
 
   // map from unique of nodes to register in register table
@@ -228,7 +226,7 @@ struct CodeImpl {
   NodeSourceInfo getSourceInfoFromSourceRange(const SourceRange& range) {
     NodeSourceInfo nodeSource;
     SourceRange r = range;
-    if (range.source()) {
+    if (!FLAGS_torch_jit_expanded_stacks_mangled && range.source()) {
       if (auto orig = range.source()->findSourceRangeThatGenerated(r)) {
         r = *orig;
       }
@@ -277,7 +275,7 @@ struct CodeImpl {
       std::vector<NodeSourceInfo> expandedStack;
       getNodeStack(current_node_, &expandedStack);
       auto insertIdx = expanded_node_stacks_.size();
-      expanded_node_stacks_.emplace_back(expandedStack);
+      expanded_node_stacks_.emplace_back(std::move(expandedStack));
       current_node_->i_(attr::node_stack_idx, insertIdx);
     }
 
@@ -340,8 +338,7 @@ struct CodeImpl {
       int reg = registerFor(input);
       bool moved = input->uses().size() == ++use_count_[input];
 
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-      OpCode op;
+      OpCode op{};
       if (input->node()->kind() == prim::Constant) {
         op = LOADC;
       } else if (moved) {
@@ -449,7 +446,7 @@ struct CodeImpl {
     // check if the node should be emitted as instruction or operator
     const Operator& op = node->getOperator();
     std::string unique_op_name = c10::toString(op.schema().operator_name());
-    if (unique_op_name.find("aten::__getitem__.Dict") == 0) {
+    if (unique_op_name.starts_with("aten::__getitem__.Dict")) {
       // __get_item__ overloaded operator for Dict
       // needs to be emitted an instruction
       emitOperatorOrInstruction(node, DICT_INDEX);
@@ -549,7 +546,7 @@ struct CodeImpl {
   void emitBailOut(Node* node) {
     auto jf_index = emitGuard(node);
     auto unoptimized_graph = node->inputs().at(0)->node()->g(attr::Subgraph);
-    // note, guaded input is already loaded onto the stack
+    // note, guarded input is already loaded onto the stack
     // for GUARD instruction
     emitLoadInputs(node->inputs().slice(2));
     insertInstruction(TAIL_CALL, function_table_.size());
@@ -666,8 +663,8 @@ struct CodeImpl {
 
   void emitFork(Node* node) {
     emitLoadInputs(node->inputs());
-    std::unique_ptr<GraphFunction> forked_fn(new GraphFunction(
-        "<forked function>", node->g(attr::Subgraph), nullptr));
+    auto forked_fn = std::make_unique<GraphFunction>(
+        "<forked function>", node->g(attr::Subgraph), nullptr);
     forked_functions_.emplace_back(std::move(forked_fn));
     function_table_.emplace_back(forked_functions_.back().get());
     insertInstruction(FORK, function_table_.size() - 1, node->inputs().size());
@@ -675,8 +672,8 @@ struct CodeImpl {
 
   void emitAwaitable(Node* node) {
     emitLoadInputs(node->inputs());
-    std::unique_ptr<GraphFunction> await_fn(new GraphFunction(
-        "<awaitable function>", node->g(attr::Subgraph), nullptr));
+    auto await_fn = std::make_unique<GraphFunction>(
+        "<awaitable function>", node->g(attr::Subgraph), nullptr);
     awaited_functions_.emplace_back(std::move(await_fn));
     function_table_.emplace_back(awaited_functions_.back().get());
     insertInstruction(
@@ -869,17 +866,17 @@ struct CodeImpl {
   }
 
   void dump(std::ostream& out, size_t i) const {
-    out << i << " " << instructions_[i];
+    out << i << ' ' << instructions_[i];
     if (instructions_[i].op == OP || instructions_[i].op == CALL ||
         instructions_[i].op == OPN) {
       out << " # " << *instructions_source_[i];
     } else {
-      out << "\n";
+      out << '\n';
     }
   }
 
   void dump(std::ostream& out) const {
-    out << *graph_ << "\n";
+    out << *graph_ << '\n';
     for (const auto i : c10::irange(instructions_.size())) {
       dump(out, i);
     }
@@ -946,7 +943,11 @@ struct MobileCodeImpl : CodeImpl {
       bool support_default_args_before_out,
       bool emit_promoted_ops,
       size_t remaining_bailout_depth)
-      : CodeImpl(graph, function_name, remaining_bailout_depth, false),
+      : CodeImpl(
+            graph,
+            std::move(function_name),
+            remaining_bailout_depth,
+            false),
         emit_default_input_instructions_(emit_default_input_instructions),
         support_default_args_before_out_(support_default_args_before_out),
         emit_promoted_ops_(emit_promoted_ops) {
@@ -1057,5 +1058,4 @@ struct MobileCodeImpl : CodeImpl {
   bool emit_promoted_ops_;
 };
 
-} // namespace interpreter
-} // namespace torch::jit
+} // namespace torch::jit::interpreter

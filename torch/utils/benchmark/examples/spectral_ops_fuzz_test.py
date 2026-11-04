@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 """Microbenchmarks for the torch.fft module"""
 from argparse import ArgumentParser
 from collections import namedtuple
@@ -62,7 +63,7 @@ BENCHMARK_MAP = {b.name: b for b in BENCHMARKS}
 BENCHMARK_NAMES = [b.name for b in BENCHMARKS]
 DEVICE_NAMES = ['cpu', 'cuda']
 
-def _output_csv(file, results):
+def _output_csv(file, results) -> None:
     file.write('benchmark,device,num_threads,numel,shape,contiguous,dim,mean (us),median (us),iqr (us)\n')
     for measurement in results:
         metadata = measurement.metadata

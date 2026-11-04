@@ -5,8 +5,6 @@
 class ParseError(Exception):
     """Whenever the simple parser is unable to parse the report, this exception will be raised"""
 
-    pass
-
 
 class Report:
     """A report is a container of errors, and a summary on how many errors are found"""
@@ -49,7 +47,7 @@ class Error:
 def parse(message):
     """A simple parser that parses the report of cuda-memcheck. This parser is meant to be simple
     and it only split the report into separate errors and a summary. Where each error is further
-    splitted into error message and backtrace. No further details are parsed.
+    split into error message and backtrace. No further details are parsed.
 
     A report contains multiple errors and a summary on how many errors are detected. It looks like:
 

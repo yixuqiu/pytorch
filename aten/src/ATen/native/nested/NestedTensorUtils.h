@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/Dispatch.h>
+#include <ATen/Dispatch_v2.h>
 #include <ATen/NestedTensorImpl.h>
 #include <ATen/Parallel.h>
 #include <ATen/core/Tensor.h>
@@ -22,17 +23,19 @@
 #include <ATen/ops/tensor.h>
 #endif
 
+#include <cmath>
+#include <limits>
+#include <tuple>
 #include <utility>
 #include <vector>
 
-namespace at {
-namespace native {
+namespace at::native {
 struct NestedTensorImpl;
 
 // The following functions are used to construct nested tensors from buffers and
 // metadata.
 
-inline at::Tensor wrap_buffer(at::Tensor buffer, at::Tensor nested_sizes) {
+inline at::Tensor wrap_buffer(const at::Tensor& buffer, const at::Tensor& nested_sizes) {
   TORCH_CHECK(
       buffer.dim() == 1,
       "Expected given buffer to be 1dim, but got ",
@@ -41,19 +44,19 @@ inline at::Tensor wrap_buffer(at::Tensor buffer, at::Tensor nested_sizes) {
   TORCH_CHECK(
       buffer.is_contiguous(), "Expected given buffer to be contiguous.");
   return at::detail::make_tensor<NestedTensorImpl>(
-      std::move(buffer), std::move(nested_sizes));
+      buffer, nested_sizes);
 }
 
 // TODO: Figure out if we need a non-moving wrap_buffer()
 inline at::Tensor wrap_buffer(
-    at::Tensor buffer,
+    const at::Tensor& buffer,
     at::Tensor nested_sizes,
     at::Tensor nested_strides,
     at::Tensor storage_offsets) {
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
       buffer.is_contiguous(), "Given buffer must be contiguous.");
   return at::detail::make_tensor<NestedTensorImpl>(
-      std::move(buffer),
+      buffer,
       std::move(nested_sizes),
       std::move(nested_strides),
       std::move(storage_offsets));
@@ -63,11 +66,22 @@ inline at::Tensor get_buffer(const at::Tensor& tensor) {
   return get_nested_tensor_impl(tensor)->get_buffer();
 }
 
+// Helper to clamp infinite padding sentinels to dtype min/max for integral types
+template <typename scalar_t>
+inline scalar_t _get_padding_value(double padding_value, bool is_floating_point) {
+  if (std::isinf(padding_value) && !is_floating_point) {
+    return padding_value > 0
+      ? std::numeric_limits<scalar_t>::max()
+      : std::numeric_limits<scalar_t>::lowest();
+  }
+  return static_cast<scalar_t>(padding_value);
+}
+
 /**
  * Create a new nested tensor that is a view of a base nested tensor
  *
- * create_view_tensor calls a specialized constructor that copys the
- * the keys from base onto the new view tensor being created.
+ * create_view_tensor calls a specialized constructor that copies the
+ * keys from base onto the new view tensor being created.
  * The storage is shared between the base and the returned view tensor
  *
  * All callers of this helper must:
@@ -95,9 +109,9 @@ inline at::Tensor create_nested_view_tensor(
   return at::detail::make_tensor<NestedTensorImpl>(
       c10::TensorImpl::VIEW,
       base,
-      nested_sizes,
-      nested_strides,
-      storage_offsets);
+      std::move(nested_sizes),
+      std::move(nested_strides),
+      std::move(storage_offsets));
 }
 //  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -180,7 +194,7 @@ inline void check_numel_equals_buffer_size(const NestedTensorImpl* self_ptr) {
 }
 
 // Helper function to get size / stride / offset for a nested/normal tensor.
-inline IntArrayRef get_size_for_index(const Tensor& tensor, int i) {
+inline IntArrayRef get_size_for_index(const Tensor& tensor, int64_t i) {
   if (tensor.is_nested()) {
     std::vector<IntArrayRef> tensor_sizes =
         NestedTensor_get_sizes(get_nested_tensor_impl(tensor));
@@ -190,7 +204,7 @@ inline IntArrayRef get_size_for_index(const Tensor& tensor, int i) {
   }
 }
 
-inline IntArrayRef get_stride_for_index(const Tensor& tensor, int i) {
+inline IntArrayRef get_stride_for_index(const Tensor& tensor, int64_t i) {
   if (tensor.is_nested()) {
     std::vector<IntArrayRef> tensor_strides =
         NestedTensor_get_strides(get_nested_tensor_impl(tensor));
@@ -200,17 +214,13 @@ inline IntArrayRef get_stride_for_index(const Tensor& tensor, int i) {
   }
 }
 
-inline int64_t get_offset_for_index(const Tensor& tensor, int i) {
+inline int64_t get_offset_for_index(const Tensor& tensor, int64_t i) {
   if (tensor.is_nested()) {
-    int64_t* offsets_ptr = get_nested_tensor_impl(tensor)
-                               ->get_storage_offsets()
-                               .data_ptr<int64_t>();
-    return offsets_ptr[i];
-
-  } else {
-    int64_t offset = tensor.storage_offset();
-    return offset + tensor.strides()[0] * i;
+    return get_nested_tensor_impl(tensor)
+        ->get_storage_offsets()
+        .const_data_ptr<int64_t>()[i];
   }
+  return tensor.storage_offset() + tensor.strides()[0] * i;
 }
 //  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // Data structures and functions for generically applying a function on a nested
@@ -220,15 +230,17 @@ namespace impl {
 template <typename T>
 struct NestedNode {
   NestedNode() = delete;
-  explicit NestedNode(std::vector<T>&& children)
-      : _is_leaf(false), _children(children) {}
+  explicit NestedNode(std::vector<T> children)
+      : _is_leaf(false), _children(std::move(children)) {}
   explicit NestedNode(TensorList children)
       : _is_leaf(false), _children(children.vec()) {}
-  // NestedNode(NestedNode&) = delete;
-  // NestedNode(const NestedNode&) = delete;
-  // NestedNode& operator=(NestedNode) = delete;
   explicit NestedNode(T payload)
       : _is_leaf(true), _payload(std::move(payload)) {}
+  NestedNode(const NestedNode&) = delete;
+  NestedNode& operator=(const NestedNode&) = delete;
+  NestedNode(NestedNode&&) noexcept = default;
+  NestedNode& operator=(NestedNode&&) noexcept = default;
+  ~NestedNode() = default;
   inline bool is_leaf() const {
     return _is_leaf;
   }
@@ -251,7 +263,7 @@ struct NestedNode {
  private:
   bool _is_leaf;
   std::vector<T> _children;
-  T _payload;
+  T _payload{};
 };
 
 using TensorNode = NestedNode<at::Tensor>;
@@ -262,13 +274,11 @@ class _map;
 template <class F, class A, class... Args>
 class _map<F, A, c10::guts::typelist::typelist<Args...>> {
  public:
-  static A function_one(F&& fn, const Args&... nested_node) {
-    return std::forward<F>(fn)(nested_node...);
+  static A function_one(const F& fn, const Args&... nested_node) {
+    return fn(nested_node...);
   }
-  // NOTE: We must move F to avoid copying objects if it is a lambda with
-  // captures.
   static NestedNode<A> function(
-      F&& fn,
+      const F& fn,
       const NestedNode<Args>&... nested_node) {
     size_t degree = 0;
     bool all_leaf = true;
@@ -292,7 +302,7 @@ class _map<F, A, c10::guts::typelist::typelist<Args...>> {
     // types.
     std::vector<A> result;
     for (size_t i = 0; i < degree; i++) {
-      std::tuple<Args...> children = c10::guts::tuple_map(
+      auto children = c10::guts::tuple_map(
           std::forward_as_tuple(nested_node...), [&i](auto a) {
             static_assert(
                 c10::guts::is_instantiation_of<NestedNode, decltype(a)>::value,
@@ -309,9 +319,9 @@ class _map<F, A, c10::guts::typelist::typelist<Args...>> {
             TORCH_CHECK(a.degree() > 0, "Internal assert.");
             return a.children(i);
           });
-      c10::guts::apply(
+      std::apply(
           [&result, &fn](Args... filtered) {
-            result.emplace_back(function_one(std::forward<F>(fn), filtered...));
+            result.emplace_back(function_one(fn, filtered...));
           },
           std::move(children));
     }
@@ -340,10 +350,10 @@ inline TensorNode get_nested_tensor_structure(at::Tensor tensor) {
 
 inline Tensor wrap_tensor_node(
     TensorNode tensor_node,
-    c10::optional<ScalarType> dtype,
-    c10::optional<Layout> layout,
-    c10::optional<Device> device,
-    c10::optional<bool> pin_memory) {
+    std::optional<ScalarType> dtype,
+    std::optional<Layout> layout,
+    std::optional<Device> device,
+    std::optional<bool> pin_memory) {
   TORCH_CHECK(
       !tensor_node.is_leaf(), "Expected TensorNode to wrap a list of Tensors.");
   TensorOptions options_ =
@@ -419,6 +429,8 @@ inline Tensor wrap_tensor_node(
   } else { // Slow path
     std::vector<Tensor> flat_tensors;
     std::vector<Tensor> sizes;
+    flat_tensors.reserve(tensor_node.degree());
+    sizes.reserve(tensor_node.degree());
     for (const auto i : c10::irange(tensor_node.degree())) {
       flat_tensors.push_back(tensor_node.children(i).reshape(-1).contiguous());
       sizes.push_back(
@@ -440,11 +452,10 @@ template <class F, class... A>
 inline at::Tensor map_nested_tensor(F&& fn, A... a) {
   return wrap_tensor_node(
       impl::map(std::forward<F>(fn), impl::get_nested_tensor_structure(a)...),
-      c10::nullopt,
-      c10::nullopt,
-      c10::nullopt,
-      c10::nullopt);
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt);
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

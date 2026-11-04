@@ -116,9 +116,9 @@ inline TensorQuantizationParams ChooseQuantizationParams(
 
   if (force_scale_power_of_two) {
     if (scale < 1) {
-      scale = 1.0 / (1 << static_cast<int>(floor(log(1.0 / scale) / log(2))));
+      scale = 1.0 / (1 << static_cast<int>(floor(log2(1.0 / scale))));
     } else {
-      scale = 1 << static_cast<int>(ceil(log(scale) / log(2)));
+      scale = 1 << static_cast<int>(ceil(log2(scale)));
     }
   }
 
@@ -146,12 +146,12 @@ inline TensorQuantizationParams ChooseQuantizationParams(
   // The arithmetic error on the zero point computed from either pair
   // will be roughly machine_epsilon * (sum of absolute values of terms)
   // so we want to use the variant that adds the smaller terms.
-  double zero_point_from_min = qmin - min / static_cast<double>(scale);
-  double zero_point_from_max = qmax - max / static_cast<double>(scale);
+  double zero_point_from_min = qmin - min / scale;
+  double zero_point_from_max = qmax - max / scale;
   double zero_point_from_min_error =
-      std::abs(qmin) - std::abs(min / static_cast<double>(scale));
+      std::abs(qmin) - std::abs(min / scale);
   double zero_point_from_max_error =
-      std::abs(qmax) - std::abs(max / static_cast<double>(scale));
+      std::abs(qmax) - std::abs(max / scale);
   double initial_zero_point =
       zero_point_from_min_error < zero_point_from_max_error
       ? zero_point_from_min
@@ -186,8 +186,9 @@ inline TensorQuantizationParams ChooseQuantizationParams(
 
 // This function helps to convert the Conv1D dimensions usable by the Conv2d op.
 constexpr int64_t kConv1dSqueezeDim = 0;
-static C10_UNUSED torch::List<int64_t> MakeArgForConv1d(const torch::List<int64_t>& arg,
-                                             int64_t base_value) {
+[[maybe_unused]] static torch::List<int64_t> MakeArgForConv1d(
+    const torch::List<int64_t>& arg,
+    int64_t base_value) {
   TORCH_CHECK(!arg.empty(), "Argument must have elements.");
   torch::List<int64_t> result({arg.get(0), base_value});
   if (arg.size() == 1) {

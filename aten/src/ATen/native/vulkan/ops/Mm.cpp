@@ -149,7 +149,7 @@ vTensor pack_weights(const Tensor& weight_arg, const bool use_batch = false) {
 
 vTensor pack_biases(
     const Tensor& weight_arg,
-    const c10::optional<Tensor>& bias_arg,
+    const std::optional<Tensor>& bias_arg,
     const bool use_batch = false) {
   if (bias_arg) {
     Tensor bias = *bias_arg;
@@ -166,7 +166,7 @@ vTensor pack_biases(
 // removed in the future.
 vTensor pack_biases_quantized_weights(
     const Tensor& weight_arg,
-    const c10::optional<Tensor>& bias_arg,
+    const std::optional<Tensor>& bias_arg,
     const bool use_batch = false) {
   TORCH_CHECK(
       weight_arg.is_quantized(),
@@ -193,12 +193,12 @@ vTensor pack_biases_quantized_weights(
         src_kw_sz = b_sizes[Layout::BatchMatrices::width];
         src_kh_sz = b_sizes[Layout::BatchMatrices::height];
       } else if (bias.sizes().size() == 2) {
-        // skip batch dim for boardcasting; index -1
+        // skip batch dim for broadcasting; index -1
         src_kb_sz = 1;
         src_kw_sz = b_sizes[Layout::BatchMatrices::height];
         src_kh_sz = b_sizes[Layout::BatchMatrices::batch];
       } else {
-        // skip batch & height dim for boardcasting; index -2
+        // skip batch & height dim for broadcasting; index -2
         src_kb_sz = 1;
         src_kw_sz = b_sizes[Layout::BatchMatrices::batch];
         src_kh_sz = 1;
@@ -291,7 +291,7 @@ vTensor pack_biases_quantized_weights(
 
 bool available_check_with_batch(
     const Tensor& weight,
-    const c10::optional<Tensor>& bias) {
+    const std::optional<Tensor>& bias) {
   const bool weight_available = (3 == weight.ndimension()) &&
       (weight.size(Layout::BatchMatrices::batch) > 0) &&
       (weight.size(Layout::BatchMatrices::height) > 0) &&
@@ -327,13 +327,13 @@ bool available_check_with_batch(
              weight.size(Layout::BatchMatrices::batch) ||
          bias->size(Layout::BatchMatrices::batch) == 1);
   } else if (bias->ndimension() == 2) {
-    // skip batch dim for boardcasting; index -1
+    // skip batch dim for broadcasting; index -1
     bias_available &=
         (bias->size(Layout::BatchMatrices::height) ==
              weight.size(Layout::BatchMatrices::width) ||
          bias->size(Layout::BatchMatrices::height) == 1);
   } else {
-    // skip batch & height dim for boardcasting; index -2
+    // skip batch & height dim for broadcasting; index -2
     bias_available &=
         (bias->size(Layout::BatchMatrices::batch) ==
              weight.size(Layout::BatchMatrices::width) ||
@@ -345,7 +345,7 @@ bool available_check_with_batch(
 
 bool available(
     const Tensor& weight,
-    const c10::optional<Tensor>& bias,
+    const std::optional<Tensor>& bias,
     const bool use_batch = false) {
   if (!api::available()) {
     return false;
@@ -631,6 +631,7 @@ Tensor run_quantized_addmm_context(
     return output;
   } else {
     std::vector<int64_t> shape;
+    shape.reserve(static_cast<size_t>(std::max<int64_t>(0, input_arg.dim())));
     for (const auto i : c10::irange(input_arg.dim() - 1)) {
       shape.emplace_back(input_arg.size(i));
     }
@@ -751,6 +752,7 @@ Tensor run_addmm_context(
     return output;
   } else {
     std::vector<int64_t> shape;
+    shape.reserve(static_cast<size_t>(std::max<int64_t>(0, input_arg.dim())));
     for (const auto i : c10::irange(input_arg.dim() - 1)) {
       shape.emplace_back(input_arg.size(i));
     }
@@ -897,7 +899,7 @@ Tensor mm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
       1.0f,
       1.0f,
       c10::make_intrusive<LinearPackedContext>(
-          LinearPackedContext(mat2_arg, c10::optional<Tensor>())),
+          LinearPackedContext(mat2_arg, std::optional<Tensor>())),
       false,
       0,
       0);
@@ -909,7 +911,7 @@ Tensor bmm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
       1.0f,
       1.0f,
       c10::make_intrusive<LinearPackedContext>(LinearPackedContext(
-          mat2_arg, c10::optional<Tensor>(), true /*use batch*/)));
+          mat2_arg, std::optional<Tensor>(), true /*use batch*/)));
 }
 
 Tensor baddbmm(
@@ -941,7 +943,7 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
 
 LinearPackedContext::LinearPackedContext(
     const Tensor& weight,
-    const c10::optional<Tensor>& bias,
+    const std::optional<Tensor>& bias,
     const bool use_batch)
     : unpacked_{c10::AnyType::get()} {
   TORCH_CHECK(
@@ -974,7 +976,7 @@ LinearPackedContext LinearPackedContext::pack(c10::impl::GenericList unpacked) {
 
 c10::intrusive_ptr<LinearPackedContext> create_linear_context(
     Tensor&& weight,
-    c10::optional<Tensor>&& bias) {
+    std::optional<Tensor>&& bias) {
   return c10::make_intrusive<LinearPackedContext>(
       LinearPackedContext(weight, bias));
 }

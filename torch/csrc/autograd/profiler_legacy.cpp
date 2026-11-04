@@ -122,11 +122,11 @@ using torch::profiler::impl::ProfilerStateBase;
 struct ProfilerLegacyThreadLocalState : public ProfilerStateBase {
   explicit ProfilerLegacyThreadLocalState(
       const torch::profiler::impl::ProfilerConfig& config)
-      : ProfilerStateBase(config), remoteProfiledEvents_{c10::nullopt} {}
+      : ProfilerStateBase(config), remoteProfiledEvents_{std::nullopt} {}
   ~ProfilerLegacyThreadLocalState() override = default;
 
   static ProfilerLegacyThreadLocalState* getTLS() {
-    auto tls = ProfilerStateBase::get(/*global=*/false);
+    ProfilerStateBase* tls = ProfilerStateBase::getTLS();
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
         tls == nullptr || tls->profilerType() == ActiveProfilerType::LEGACY);
     return static_cast<ProfilerLegacyThreadLocalState*>(tls);
@@ -169,7 +169,7 @@ struct ProfilerLegacyThreadLocalState : public ProfilerStateBase {
   std::unordered_map<uint64_t, std::shared_ptr<RangeEventList>>
       event_lists_map_;
 
-  c10::optional<std::vector<std::vector<LegacyEvent>>> remoteProfiledEvents_;
+  std::optional<std::vector<std::vector<LegacyEvent>>> remoteProfiledEvents_;
 };
 
 thread_event_lists ProfilerLegacyThreadLocalState::consolidate() {
@@ -373,9 +373,7 @@ void pushProfilingCallbacksLegacy() {
             }
             bool record_cuda = state_ptr->config().state ==
                 torch::profiler::impl::ProfilerState::CUDA;
-            if (record_cuda &&
-                disable_cuda_profiling.find(fn.name()) !=
-                    disable_cuda_profiling.end()) {
+            if (record_cuda && disable_cuda_profiling.contains(fn.name())) {
               record_cuda = false;
             }
 
@@ -395,9 +393,7 @@ void pushProfilingCallbacksLegacy() {
             }
             bool record_cuda = state_ptr->config().state ==
                 torch::profiler::impl::ProfilerState::CUDA;
-            if (record_cuda &&
-                disable_cuda_profiling.find(fn.name()) !=
-                    disable_cuda_profiling.end()) {
+            if (record_cuda && disable_cuda_profiling.contains(fn.name())) {
               record_cuda = false;
             }
             state_ptr->popRange(fn, record_cuda);
@@ -429,7 +425,7 @@ void enableProfilerLegacy(
 }
 
 thread_event_lists disableProfilerLegacy(
-    c10::optional<ProfilerDisableOptions> profilerDisableOptions) {
+    std::optional<ProfilerDisableOptions> profilerDisableOptions) {
   auto cleanupTLSState =
       profilerDisableOptions ? profilerDisableOptions->cleanupTLSState : true;
   auto consolidate =
@@ -506,7 +502,7 @@ void LegacyEvent::record(bool record_cuda) {
     for (const auto j : c10::irange(curShapesList.size())) {
       s.emplace_back(curShapesList.get(j).toInt());
     }
-    shapes.emplace_back(s);
+    shapes.emplace_back(std::move(s));
   }
 
   LegacyEvent evt(
@@ -557,10 +553,10 @@ at::IValue LegacyEvent::toIValue() const {
     for (const auto& k : shape) {
       s.emplace_back(k);
     }
-    shapesList.emplace_back(s);
+    shapesList.emplace_back(std::move(s));
   }
-  eventIValueList.emplace_back(shapesList);
-  return at::IValue(eventIValueList);
+  eventIValueList.emplace_back(std::move(shapesList));
+  return at::IValue(std::move(eventIValueList));
 }
 
 double LegacyEvent::cudaElapsedUs(const LegacyEvent& e) const {
@@ -645,7 +641,7 @@ RecordProfile::RecordProfile(std::ostream& out) : out_(out) {
 }
 
 RecordProfile::RecordProfile(const std::string& filename)
-    : file_(new std::ofstream(filename)), out_(*file_) {
+    : file_(std::make_unique<std::ofstream>(filename)), out_(*file_) {
   init();
 }
 

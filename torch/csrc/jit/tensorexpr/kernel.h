@@ -9,9 +9,7 @@
 #include <torch/csrc/jit/tensorexpr/lowerings.h>
 #include <torch/csrc/jit/tensorexpr/tensor.h>
 
-namespace torch {
-namespace jit {
-namespace tensorexpr {
+namespace torch::jit::tensorexpr {
 
 struct SmallSizeTPairHash {
  public:
@@ -49,7 +47,7 @@ ExprHandle tensorOrConstant(
 
 int64_t normalizeAndCheckIndex(int64_t idx, int64_t list_size);
 
-ExprHandle broadcast(BufHandle b, const std::vector<ExprHandle>& axes);
+ExprHandle broadcast(const BufHandle& b, const std::vector<ExprHandle>& axes);
 
 ExprHandle constant(const ArgValue& v);
 
@@ -77,7 +75,7 @@ inline std::string getArgValueName(const ArgValue& a) {
   } else if (std::holds_alternative<ArgNone>(a)) {
     return "None";
   } else {
-    throw std::runtime_error("ArgValue type not handled in string conversion");
+    TORCH_CHECK(false, "ArgValue type not handled in string conversion");
   }
 }
 
@@ -89,9 +87,10 @@ std::vector<T> convertVecArgValue(const std::vector<ArgValue>& v) {
     if (val) {
       res.push_back(*val);
     } else {
-      throw std::runtime_error(
+      TORCH_CHECK(
+          false,
           "vector type not homogeneous - found " + getArgValueName(x) +
-          ", expected " + getArgValueName(v[0]));
+              ", expected " + getArgValueName(v[0]));
     }
   }
   return res;
@@ -122,7 +121,7 @@ class TORCH_API TensorExprKernel {
   //      - a flag to control pre-allocation of buffers.
   explicit TensorExprKernel(
       const std::shared_ptr<Graph>& subgraph,
-      const std::string& kernel_func_name,
+      std::string kernel_func_name,
       std::unordered_map<c10::Symbol, NNCLoweringFunction> custom_lowerings =
           {},
       std::vector<int64_t> symbolic_shape_inputs = {},
@@ -143,10 +142,10 @@ class TORCH_API TensorExprKernel {
       : TensorExprKernel(
             subgraph,
             SubgraphUtils::generateNameForGraph(subgraph),
-            custom_lowerings,
-            symbolic_shape_inputs,
+            std::move(custom_lowerings),
+            std::move(symbolic_shape_inputs),
             pre_alloc,
-            symbolic_strides) {}
+            std::move(symbolic_strides)) {}
 
   void run(Stack& stack) const;
   void runFast(
@@ -181,7 +180,7 @@ class TORCH_API TensorExprKernel {
   }
 
   const std::string& getKernelName() const {
-    return codegen_->kernel_func_name();
+    return (codegen_ ? codegen_->kernel_func_name() : kernel_func_name_);
   }
 
   const std::vector<int64_t>& getSymbolicShapeInputs() const {
@@ -274,10 +273,10 @@ class TORCH_API TensorExprKernel {
       const std::vector<BufPtr>& interm_bufs);
 
   struct UnpackedTensorOptions {
-    c10::optional<c10::ScalarType> dtype;
-    c10::optional<c10::Layout> layout;
-    c10::optional<c10::Device> device;
-    c10::optional<bool> pinned_memory;
+    std::optional<c10::ScalarType> dtype;
+    std::optional<c10::Layout> layout;
+    std::optional<c10::Device> device;
+    std::optional<bool> pinned_memory;
 
     UnpackedTensorOptions(const c10::TensorOptions& opts)
         : dtype(c10::optTypeMetaToScalarType(opts.dtype_opt())),
@@ -370,13 +369,11 @@ TORCH_API bool setFallbackAllowed(bool value);
 TORCH_API bool& getCatWoConditionals();
 TORCH_API bool& getOptConditionals();
 
-TORCH_API c10::optional<at::Device> pickDeviceType(
+TORCH_API std::optional<at::Device> pickDeviceType(
     const at::ArrayRef<torch::jit::Value*>& inputs);
 
 bool isContiguous(
     const torch::jit::Value* v,
     at::MemoryFormat memory_format = at::MemoryFormat::Contiguous);
 
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr

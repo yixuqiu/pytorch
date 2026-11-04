@@ -6,10 +6,16 @@ import torch
 import torch.fx
 from torch.fx.experimental import const_fold
 from torch.fx.passes.shape_prop import _extract_tensor_metadata, ShapeProp
-from torch.testing._internal.common_utils import TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    raise_on_run_directly,
+    TestCase,
+)
 
 
 class TestConstFold(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def _get_attr(self, node):
         mod = node.graph.owning_module
         target = str(node.target)
@@ -61,7 +67,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr_1 = torch.nn.Parameter(torch.tensor([[-0.9]]))
                 self.attr_2 = torch.nn.Parameter(torch.tensor([[17.1]]))
@@ -106,7 +112,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 # Note: Named as such to result in name collision.
                 self.add_1__CF = torch.nn.Parameter(torch.tensor([[1.0]]))
@@ -168,7 +174,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr1 = torch.nn.Parameter(torch.tensor([[-0.9]]))
 
@@ -211,7 +217,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr1 = torch.nn.Parameter(torch.tensor([[-0.9]]))
                 self.attr1 = torch.nn.Parameter(torch.tensor([[1.32]]))
@@ -254,7 +260,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr1 = torch.nn.Parameter(torch.randn(2, 3))
                 self.attr2 = torch.nn.Parameter(torch.randn(2, 3))
@@ -301,7 +307,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr1 = torch.nn.Parameter(torch.randn(4, 4))
                 self.attr2 = torch.nn.Parameter(torch.randn(4, 4))
@@ -332,7 +338,7 @@ class TestConstFold(TestCase):
         """
 
         class TracedThroughModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.internal_attr = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -340,7 +346,7 @@ class TestConstFold(TestCase):
                 return self.internal_attr
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.my_mod = TracedThroughModule()
                 self.attr = torch.nn.Parameter(torch.randn(2, 3))
@@ -364,7 +370,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -413,7 +419,7 @@ class TestConstFold(TestCase):
 
     def test_const_fold_has_inlined_call_module_node(self):
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr = torch.nn.Parameter(torch.randn(2, 3))
                 self.mod = torch.nn.Identity()
@@ -434,7 +440,7 @@ class TestConstFold(TestCase):
 
     def test_const_fold_module_attr(self):
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.const = torch.nn.Parameter(torch.randn(2, 3))
                 self.mod = torch.nn.Identity()
@@ -456,7 +462,7 @@ class TestConstFold(TestCase):
 
     def test_const_fold_unused_placeholder(self):
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.const = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -475,7 +481,7 @@ class TestConstFold(TestCase):
 
     def test_dict_output(self):
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.const = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -494,7 +500,7 @@ class TestConstFold(TestCase):
 
     def test_two_outputs(self):
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.const = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -514,7 +520,7 @@ class TestConstFold(TestCase):
 
     def test_three_outputs(self):
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.const = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -540,7 +546,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -572,7 +578,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr = torch.nn.Parameter(torch.randn(2, 3))
 
@@ -605,7 +611,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.randn(4, 4))
                 self.bias = torch.nn.Parameter(torch.randn(4))
@@ -650,7 +656,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.lin_input = torch.nn.Parameter(torch.randn(4, 4))
                 self.lin = torch.nn.Linear(4, 4)
@@ -676,7 +682,7 @@ class TestConstFold(TestCase):
         """
 
         class ConstFoldTestModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.attr_1 = torch.nn.Parameter(torch.tensor([[-0.9]]), requires_grad)
                 self.attr_2 = torch.nn.Parameter(torch.tensor([[17.1]]), requires_grad)
@@ -706,3 +712,220 @@ class TestConstFold(TestCase):
         base_result = mod(in_x, in_y)
         fold_result = mod_folded(in_x, in_y)
         self.assertTrue(torch.equal(fold_result, base_result))
+
+    def test_fold_pure_subgraph(self):
+        class SubModule(torch.nn.Module):
+            def forward(self):
+                return torch.full((5, 10), 2.0) + 1
+
+        # Create a parent graph with this module as a subgraph and output
+        ep = torch.export.export(SubModule(), ())
+        parent_graph = torch.fx.Graph()
+        call_mod = parent_graph.call_module("sub", args=())
+        get_item = parent_graph.call_function(
+            operator.getitem, args=(call_mod, slice(None))
+        )
+        parent_graph.output((get_item,))
+        parent = torch.fx.GraphModule({"sub": ep.module()}, parent_graph)
+
+        mod_folded: const_fold.FoldedGraphModule = const_fold.split_const_subgraphs(
+            parent, device_for_folded_attrs="cpu"
+        )
+        self._verify_const_fold_mod(mod_folded)
+
+    def test_do_not_fold_impure_subgraph(self):
+        """
+        Skip folding any subgraph containing impure ops.
+        """
+
+        class SubModule(torch.nn.Module):
+            def forward(self):
+                return torch.randn(5, 10) + 1
+
+        # Create a parent graph with this module as a subgraph and output
+        ep = torch.export.export(SubModule(), ())
+        parent_graph = torch.fx.Graph()
+        call_mod = parent_graph.call_module("sub", args=())
+        get_item = parent_graph.call_function(
+            operator.getitem, args=(call_mod, slice(None))
+        )
+        parent_graph.output((get_item,))
+        parent = torch.fx.GraphModule({"sub": ep.module()}, parent_graph)
+
+        mod_folded: const_fold.FoldedGraphModule = const_fold.split_const_subgraphs(
+            parent, device_for_folded_attrs="cpu"
+        )
+        self.assertIsNone(mod_folded.const_subgraph_module)
+
+    def test_skip_folding_node_fn_in_subgraph(self):
+        """
+        A call_module node can only be folded as a whole, so if its subgraph
+        contains a node that skip_folding_node_fn says to skip, the whole
+        call_module node should be skipped.
+        """
+
+        class SubModule(torch.nn.Module):
+            def forward(self):
+                return torch.full((5, 10), 2.0) + 1
+
+        def _make_parent() -> torch.fx.GraphModule:
+            ep = torch.export.export(SubModule(), ())
+            parent_graph = torch.fx.Graph()
+            call_mod = parent_graph.call_module("sub", args=())
+            get_item = parent_graph.call_function(
+                operator.getitem, args=(call_mod, slice(None))
+            )
+            parent_graph.output((get_item,))
+            return torch.fx.GraphModule({"sub": ep.module()}, parent_graph)
+
+        # skip_folding_node_fn matches a node *inside* the submodule, so the
+        # whole call_module node must be skipped and nothing gets folded.
+        def skip_full(node: torch.fx.Node) -> bool:
+            return node.target == torch.ops.aten.full.default
+
+        mod_folded: const_fold.FoldedGraphModule = const_fold.split_const_subgraphs(
+            _make_parent(),
+            skip_folding_node_fn=skip_full,
+            device_for_folded_attrs="cpu",
+        )
+        self.assertIsNone(mod_folded.const_subgraph_module)
+
+        # Control: when skip_folding_node_fn matches nothing in the submodule,
+        # the same pure subgraph is still folded as usual.
+        def skip_nothing(node: torch.fx.Node) -> bool:
+            return False
+
+        mod_folded = const_fold.split_const_subgraphs(
+            _make_parent(),
+            skip_folding_node_fn=skip_nothing,
+            device_for_folded_attrs="cpu",
+        )
+        self._verify_const_fold_mod(mod_folded)
+
+    def test_skip_folding_dynamic_node_in_subgraph(self):
+        """
+        A dynamic (symbolic-shape) node inside a call_module subgraph. A call_module
+        folds atomically, so folding it makes const folding *execute* the subgraph
+        at compile time, which crashes with "NameError: name 's..' is not defined"
+        because the shape symbol is only bound at runtime.
+        """
+        import torch.utils._pytree as pytree
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        def _make_parent() -> torch.fx.GraphModule:
+            # Submodule whose forward materializes a tensor of symbolic size
+            sub_graph = torch.fx.Graph()
+            sym = ShapeEnv().create_unbacked_symint()
+            full = sub_graph.call_function(
+                torch.ops.aten.full.default,
+                args=([sym, 1], 0),
+                kwargs={"dtype": torch.bfloat16},
+            )
+            sub_graph.output((full,))
+            sub = torch.fx.GraphModule(torch.nn.Module(), sub_graph)
+
+            parent_graph = torch.fx.Graph()
+            call_mod = parent_graph.call_module("sub", args=())
+            get_item = parent_graph.call_function(operator.getitem, args=(call_mod, 0))
+            parent_graph.output((get_item,))
+            return torch.fx.GraphModule({"sub": sub}, parent_graph)
+
+        # Skips nodes carrying a symbolic value. they can't be evaluated at
+        # compile time, so folding them would fail.
+        def skip_dynamic(node: torch.fx.Node) -> bool:
+            return any(
+                isinstance(a, torch.SymInt)
+                for a in pytree.tree_leaves((node.args, node.kwargs))
+            )
+
+        # Folding this subgraph without skipping fails, because the symbolic size
+        # is unbound at compile time
+        with self.assertRaises(Exception):
+            unguarded = const_fold.split_const_subgraphs(
+                _make_parent(), device_for_folded_attrs="cpu"
+            )
+            unguarded.run_folding()
+
+        # With skip_dynamic, the dynamic node inside the submodule is skipped, so
+        # the call_module is not folded and running folding is a safe no-op.
+        mod_folded = const_fold.split_const_subgraphs(
+            _make_parent(),
+            skip_folding_node_fn=skip_dynamic,
+            device_for_folded_attrs="cpu",
+        )
+        self.assertIsNone(mod_folded.const_subgraph_module)
+        mod_folded.run_folding()
+
+    def test_const_fold_partial_graph(self):
+        """
+        If a model graph is partially const folded,
+        the non-const subgraph should be inlined back and erased.
+        """
+
+        class TestModule(torch.nn.Module):
+            def __init__(self, p):
+                super().__init__()
+                self.p = p
+
+            def forward(self, x):
+                probs = torch.empty_permuted(x.shape, [0, 1])
+                mask = torch.bernoulli(probs, 1 - self.p)
+                return x * mask / (1 - self.p)
+
+        ep = torch.export.export(TestModule(0.4), (torch.randn(5, 10),))
+
+        mod_folded: const_fold.FoldedGraphModule = const_fold.split_const_subgraphs(
+            ep.module(), device_for_folded_attrs="cpu"
+        )
+        self._verify_const_fold_mod(mod_folded)
+
+    def test_const_fold_is_impure_node_preserves_dead_node(self):
+        r"""
+        Const folding runs dead-code elimination, which by default drops a node
+        with no users when ``Node.is_impure()`` is False. A caller can pass
+        ``is_impure_node`` to preserve such a node -- e.g. a destination-passing
+        op whose only effect is writing a buffer through an ``out=`` kwarg its
+        schema does not declare as mutated, so the default check treats it as
+        pure dead code.
+        """
+
+        class ConstFoldTestModule(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attr1 = torch.nn.Parameter(torch.randn(2, 3))
+                self.attr2 = torch.nn.Parameter(torch.randn(2, 3))
+
+            def forward(self, x):
+                folded = self.attr1 + self.attr2  # const-foldable subgraph
+                _unused = torch.relu(x)  # no users -> dead-code candidate
+                return x + folded
+
+        def _num_userless_relus(gm: torch.fx.GraphModule) -> int:
+            return sum(
+                1
+                for n in gm.graph.nodes
+                if n.op == "call_function"
+                and "relu" in str(n.target)
+                and len(n.users) == 0
+            )
+
+        def _is_userless_relu(n: torch.fx.Node) -> bool:
+            return (
+                n.op == "call_function"
+                and "relu" in str(n.target)
+                and len(n.users) == 0
+            )
+
+        # Default: the user-less relu is dead-code-eliminated.
+        mod_default = const_fold.split_const_subgraphs(ConstFoldTestModule())
+        self.assertEqual(_num_userless_relus(mod_default), 0)
+
+        # With is_impure_node marking the user-less relu impure, it survives.
+        mod_kept = const_fold.split_const_subgraphs(
+            ConstFoldTestModule(), is_impure_node=_is_userless_relu
+        )
+        self.assertEqual(_num_userless_relus(mod_kept), 1)
+
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_fx.py")

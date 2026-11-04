@@ -1,5 +1,3 @@
-# mypy: ignore-errors
-
 from .utils import (
     _gen_alignment_data,
     assert_,
@@ -15,5 +13,6 @@ from .utils import (
     IS_WASM,
     suppress_warnings,
 )
+
 
 # from .testing import assert_allclose    # FIXME

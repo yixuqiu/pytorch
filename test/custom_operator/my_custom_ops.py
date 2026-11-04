@@ -1,10 +1,12 @@
-import torch
 from model import get_custom_op_library_path
+
+import torch
+
 
 torch.ops.load_library(get_custom_op_library_path())
 
 
-@torch.library.impl_abstract("custom::nonzero")
+@torch.library.register_fake("custom::nonzero")
 def nonzero_abstract(x):
     n = x.dim()
     ctx = torch.library.get_ctx()

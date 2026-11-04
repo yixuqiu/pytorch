@@ -11,10 +11,12 @@ from torch.testing._internal.common_quantized import (
     override_quantized_engine,
     qengine_is_qnnpack,
 )
-from torch.testing._internal.common_utils import TestCase
+from torch.testing._internal.common_utils import HardwareClassification, TestCase
 
 
 class TestQlinearPackedParams(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def qlinear_packed_params_test(self, allow_non_zero_zero_points=False):
         # copied from https://pytorch.org/docs/stable/sparse.html#csr-tensor-operations,
         # so row/col block indices match that example, but with blocks and
@@ -30,7 +32,6 @@ class TestQlinearPackedParams(TestCase):
         row_block_size = 1
         col_block_size = 4
         out_features = weight_fp32.shape[0]
-        in_features = weight_fp32.shape[1]
 
         scales = [2.0, 6.0, 12.0]
         zero_points = [
@@ -201,13 +202,10 @@ class TestQlinearPackedParams(TestCase):
         row_block_size = 1
         col_block_size = 4
         out_features = weight_fp32.shape[0]
-        in_features = weight_fp32.shape[1]
 
         scales = [2.0, 3.0, 7.0]
         zero_points = [0 for _ in range(out_features)]
         dtype = torch.qint8
-
-        x = torch.rand(size=(1, weight_fp32.shape[1]))
 
         def make_lin_get_state_weight_bias_and_save():
             weight = torch.quantize_per_tensor(
@@ -230,7 +228,7 @@ class TestQlinearPackedParams(TestCase):
             state = lin._packed_params._packed_params.__getstate__()
             weight_bias = lin._weight_bias()
 
-            file_buff = tempfile.TemporaryFile()
+            file_buff = tempfile.TemporaryFile()  # noqa:SIM115
             torch.save(lin, file_buff)
             file_buff.seek(0)
 

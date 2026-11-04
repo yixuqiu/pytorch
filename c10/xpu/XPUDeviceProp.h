@@ -43,7 +43,7 @@ namespace c10::xpu {
    * on the device. */                                                         \
   _(max_num_sub_groups)                                                        \
                                                                                \
-  /* a std::vector of size_t containing the set of sub-group sizes  supported  \
+  /* a std::vector of size_t containing the set of sub-group sizes supported   \
    * by the device. */                                                         \
   _(sub_group_sizes)                                                           \
                                                                                \
@@ -113,18 +113,56 @@ namespace c10::xpu {
   _(native_vector_width_double)                                                \
   _(native_vector_width_half)
 
-#define AT_FORALL_XPU_EXT_DEVICE_PROPERTIES(_)           \
-  /* the number of EUs associated with the Intel GPU. */ \
-  _(gpu_eu_count, 512)                                   \
-                                                         \
-  /* the number of EUs in a subslice. */                 \
-  _(gpu_eu_count_per_subslice, 8)                        \
-                                                         \
-  /* the simd width of EU of GPU. */                     \
-  _(gpu_eu_simd_width, 8)                                \
-                                                         \
-  /* the number of hardware threads per EU of GPU. */    \
-  _(gpu_hw_threads_per_eu, 8)
+#if SYCL_COMPILER_VERSION >= 20260100
+#define AT_FORALL_XPU_EXT_DEVICE_PROPERTIES_XE(_)                           \
+                                                                            \
+  /* the number of stacks (chiplets/tiles) */                               \
+  _(xe_stack_count, xe_stack_count, 1)                                      \
+                                                                            \
+  /* the number of regions sharing local L2/L3 (XE_CU) per stack */         \
+  _(xe_regions_per_stack, xe_regions_per_stack, 1)                          \
+                                                                            \
+  /* the number of clusters (slices) per region */                          \
+  _(xe_clusters_per_region, xe_clusters_per_region, 1)                      \
+                                                                            \
+  /* the number of XE cores (subslices) per cluster */                      \
+  _(xe_cores_per_cluster, xe_cores_per_cluster, 64)                         \
+                                                                            \
+  /* the number of execution engines (EUs) per XE Core */                   \
+  _(eus_per_xe_core, eus_per_xe_core, 8)                                    \
+                                                                            \
+  /* the maximal number of lanes (virtual SIMD size) per hardware thread */ \
+  _(max_lanes_per_hw_thread, max_lanes_per_hw_thread, 32)
+#else
+#define AT_FORALL_XPU_EXT_DEVICE_PROPERTIES_XE(_)
+#endif
+
+#define AT_FORALL_XPU_EXT_DEVICE_PROPERTIES(_)                                \
+  /* the number of EUs associated with the Intel GPU. */                      \
+  _(gpu_eu_count, gpu_eu_count, 512)                                          \
+                                                                              \
+  /* the number of EUs in a subslice. */                                      \
+  _(gpu_eu_count_per_subslice, gpu_eu_count_per_subslice, 8)                  \
+                                                                              \
+  /* the simd width of EU of GPU. */                                          \
+  _(gpu_eu_simd_width, gpu_eu_simd_width, 8)                                  \
+                                                                              \
+  /* the number of hardware threads per EU of GPU. */                         \
+  _(gpu_hw_threads_per_eu, gpu_hw_threads_per_eu, 8)                          \
+                                                                              \
+  /* the device identifier of the Intel GPU, also known as the product ID. */ \
+  _(device_id, device_id, 0)                                                  \
+                                                                              \
+  /* the device descriptor for device Universal Unique ID, 16 bytes. */       \
+  _(uuid, device_info_uuid, (std::array<unsigned char, 16>{}))                \
+                                                                              \
+  /* the maximum clock rate of device's global memory in MHz. */              \
+  _(memory_clock_rate, memory_clock_rate, 0)                                  \
+                                                                              \
+  /* the maximum bus width between device and memory in bits. */              \
+  _(memory_bus_width, memory_bus_width, 0)                                    \
+                                                                              \
+  AT_FORALL_XPU_EXT_DEVICE_PROPERTIES_XE(_)
 
 #define AT_FORALL_XPU_DEVICE_ASPECT(_)                  \
   /* sycl::half is supported on device. */              \
@@ -135,6 +173,26 @@ namespace c10::xpu {
                                                         \
   /* 64-bit atomic operation is supported on device. */ \
   _(atomic64)
+
+#define AT_FORALL_XPU_EXP_CL_ASPECT(_)                                         \
+  /* conversion between single-precision 32-bit floating-point values and      \
+   * 16-bit bfloat16 values is supported on device. */                         \
+  _(bfloat16_conversions)                                                      \
+                                                                               \
+  /* specialized hardware to compute MMA is supported on device. */            \
+  _(subgroup_matrix_multiply_accumulate)                                       \
+                                                                               \
+  /* specialized hardware to compute MMA for 32-bit floating-point is          \
+   * supported on device. */                                                   \
+  _(subgroup_matrix_multiply_accumulate_tensor_float32)                        \
+                                                                               \
+  /* block read operations for efficient matrix multiplication is supported on \
+   * device. */                                                                \
+  _(subgroup_2d_block_io)
+
+#define AT_FORALL_XPU_EXP_DEVICE_PROPERTIES(_)       \
+  /* the device architecture of this SYCL device. */ \
+  _(architecture)
 
 #define _DEFINE_SYCL_PROP(ns, property, member) \
   ns::property::return_type member;
@@ -148,17 +206,35 @@ namespace c10::xpu {
 #define DEFINE_EXT_DEVICE_PROP(property, ...) \
   _DEFINE_SYCL_PROP(sycl::ext::intel::info::device, property, property)
 
-#define DEFINE_DEVICE_ASPECT(member) bool has_##member;
+#define DEFINE_DEVICE_ASPECT(member) bool member;
 
-struct C10_XPU_API DeviceProp {
-  AT_FORALL_XPU_DEVICE_PROPERTIES(DEFINE_DEVICE_PROP);
+#define DEFINE_DEVICE_HAS_ASPECT(member) bool has_##member;
 
-  // the platform name.
-  DEFINE_PLATFORM_PROP(name, platform_name);
+#define DEFINE_EXP_DEVICE_PROP(property) \
+  _DEFINE_SYCL_PROP(                     \
+      sycl::ext::oneapi::experimental::info::device, property, property)
 
-  AT_FORALL_XPU_EXT_DEVICE_PROPERTIES(DEFINE_EXT_DEVICE_PROP);
+struct C10_XPU_API DeviceProp{
+    AT_FORALL_XPU_DEVICE_PROPERTIES(DEFINE_DEVICE_PROP)
 
-  AT_FORALL_XPU_DEVICE_ASPECT(DEFINE_DEVICE_ASPECT);
+    // the platform name.
+    DEFINE_PLATFORM_PROP(name, platform_name)
+
+    // ext properties.
+    AT_FORALL_XPU_EXT_DEVICE_PROPERTIES(DEFINE_EXT_DEVICE_PROP)
+
+    // device aspects.
+    DEFINE_DEVICE_ASPECT(is_integrated_gpu)
+
+    // device has aspects.
+    AT_FORALL_XPU_DEVICE_ASPECT(DEFINE_DEVICE_HAS_ASPECT)
+
+    // experimental device aspects.
+    AT_FORALL_XPU_EXP_CL_ASPECT(DEFINE_DEVICE_HAS_ASPECT)
+
+    // experimental device properties.
+    AT_FORALL_XPU_EXP_DEVICE_PROPERTIES(DEFINE_EXP_DEVICE_PROP)
+
 };
 
 #undef _DEFINE_SYCL_PROP
@@ -166,5 +242,7 @@ struct C10_XPU_API DeviceProp {
 #undef DEFINE_PLATFORM_PROP
 #undef DEFINE_EXT_DEVICE_PROP
 #undef DEFINE_DEVICE_ASPECT
+#undef DEFINE_DEVICE_HAS_ASPECT
+#undef DEFINE_EXP_DEVICE_PROP
 
 } // namespace c10::xpu

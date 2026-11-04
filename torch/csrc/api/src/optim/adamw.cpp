@@ -1,18 +1,13 @@
 #include <torch/optim/adamw.h>
 
-#include <torch/csrc/autograd/variable.h>
-#include <torch/nn/module.h>
-#include <torch/serialize/archive.h>
 #include <torch/utils.h>
 
-#include <ATen/ATen.h>
 #include <c10/util/irange.h>
 
 #include <cmath>
 #include <functional>
 
-namespace torch {
-namespace optim {
+namespace torch::optim {
 
 AdamWOptions::AdamWOptions(double lr) : lr_(lr) {}
 
@@ -87,7 +82,7 @@ Tensor AdamW::step(LossClosure closure) {
       auto param_state = state_.find(p.unsafeGetTensorImpl());
       auto& options = static_cast<AdamWOptions&>(group.options());
 
-      // Perform stepweight decay
+      // Perform step weight decay
       if (options.weight_decay() != 0) {
         p.mul_(1 - options.lr() * options.weight_decay());
       }
@@ -182,5 +177,4 @@ void AdamW::load(serialize::InputArchive& archive) {
     }
   }
 }
-} // namespace optim
-} // namespace torch
+} // namespace torch::optim

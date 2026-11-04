@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <filesystem>
+
 #include "test/cpp/jit/test_utils.h"
 #include "torch/csrc/jit/runtime/graph_executor.h"
 #include "torch/jit.h"
@@ -26,8 +28,7 @@ TEST(GraphExecutorTest, Basic_CUDA) {
   auto stack = createStack({input, hx, cx, w_ih, w_hh});
   executor.run(stack);
   ASSERT_EQ(stack.size(), 2);
-  at::Tensor r0, r1;
-  std::tie(r0, r1) = lstm(input, hx, cx, w_ih, w_hh);
+  auto [r0, r1] = lstm(input, hx, cx, w_ih, w_hh);
   ASSERT_TRUE(almostEqual(stack[0].toTensor(), r0));
   ASSERT_TRUE(almostEqual(stack[1].toTensor(), r1));
 }
@@ -46,9 +47,8 @@ TEST(GraphExecutorTest, runAsync_executor) {
   demo = DemoModule()
   torch.jit.save(torch.jit.script(demo), 'test_interpreter_async.pt')
   */
-  std::string filePath(__FILE__);
-  auto testModelFile = filePath.substr(0, filePath.find_last_of("/\\") + 1);
-  testModelFile.append("test_interpreter_async.pt");
+  auto testModelFile =
+      resolveTestDataFile(__FILE__, "test_interpreter_async.pt");
   auto module = load(testModelFile);
   auto graph = module.get_method("forward").graph();
   GraphExecutor graphExecutor(graph, "");

@@ -4,27 +4,25 @@
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 #include <torch/csrc/distributed/rpc/tensorpipe_agent.h>
 #include <torch/csrc/distributed/rpc/testing/faulty_tensorpipe_agent.h>
+#include <torch/csrc/distributed/rpc/testing/testing.h>
 #include <torch/csrc/utils/pybind.h>
 
 #include <pybind11/chrono.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
-namespace testing {
+#include <utility>
+
+namespace torch::distributed::rpc::testing {
 
 namespace {
 
 template <typename T>
 using shared_ptr_class_ = py::class_<T, std::shared_ptr<T>>;
 
-PyObject* faulty_agent_init(PyObject* _unused, PyObject* noargs) {
+PyObject* faulty_agent_init(PyObject* /*_unused*/, PyObject* /*noargs*/) {
   // Add the FaultyTensorPipeAgent and its backend options object
   // to the python module torch._C._distributed_rpc_testing
   auto torch_C_module = THPObjectPtr(PyImport_ImportModule("torch._C"));
-  if (!torch_C_module) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(torch_C_module);
 
   auto torch_C_m = py::handle(torch_C_module).cast<py::module>();
   auto m = torch_C_m.def_submodule(
@@ -68,7 +66,7 @@ PyObject* faulty_agent_init(PyObject* _unused, PyObject* noargs) {
       module, "FaultyTensorPipeAgent", rpc_module.attr("TensorPipeAgent"))
       .def(
           py::init(
-              [](const c10::intrusive_ptr<::c10d::Store> store,
+              [](const c10::intrusive_ptr<::c10d::Store>& store,
                  std::string name,
                  worker_id_t rank,
                  int world_size,
@@ -81,9 +79,9 @@ PyObject* faulty_agent_init(PyObject* _unused, PyObject* noargs) {
                         std::move(name),
                         rank,
                         world_size,
-                        opts,
-                        reverse_device_maps,
-                        devices,
+                        std::move(opts),
+                        std::move(reverse_device_maps),
+                        std::move(devices),
                         std::make_unique<RequestCallbackImpl>()),
                     impl::destroy_without_gil<FaultyTensorPipeAgent>);
               }),
@@ -106,23 +104,23 @@ PyObject* faulty_agent_init(PyObject* _unused, PyObject* noargs) {
           py::call_guard<py::gil_scoped_release>())
       .def(
           "get_worker_info",
-          (const WorkerInfo& (TensorPipeAgent::*)(void) const) &
-              RpcAgent::getWorkerInfo,
+          static_cast<const WorkerInfo& (TensorPipeAgent::*)(void) const>(
+              &RpcAgent::getWorkerInfo),
           py::call_guard<py::gil_scoped_release>())
       .def(
           "get_worker_info",
-          (const WorkerInfo& (TensorPipeAgent::*)(const std::string&) const) &
-              TensorPipeAgent::getWorkerInfo,
+          static_cast<const WorkerInfo& (TensorPipeAgent::*)(const std::string&)
+                          const>(&TensorPipeAgent::getWorkerInfo),
           py::call_guard<py::gil_scoped_release>())
       .def(
           "get_worker_info",
-          (const WorkerInfo& (TensorPipeAgent::*)(worker_id_t id) const) &
-              TensorPipeAgent::getWorkerInfo,
+          static_cast<const WorkerInfo& (TensorPipeAgent::*)(worker_id_t id)
+                          const>(&TensorPipeAgent::getWorkerInfo),
           py::call_guard<py::gil_scoped_release>())
       .def(
           "get_worker_infos",
-          (std::vector<WorkerInfo>(TensorPipeAgent::*)() const) &
-              TensorPipeAgent::getWorkerInfos,
+          static_cast<std::vector<WorkerInfo> (TensorPipeAgent::*)() const>(
+              &TensorPipeAgent::getWorkerInfos),
           py::call_guard<py::gil_scoped_release>());
 #endif // USE_TENSORPIPE
 
@@ -139,7 +137,4 @@ PyMethodDef* python_functions() {
   return methods;
 }
 
-} // namespace testing
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc::testing

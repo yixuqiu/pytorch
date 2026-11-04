@@ -1,29 +1,32 @@
+"""
+This file contains the list of tests that are known to fail under Dynamo
+
+We generate xFailIfTorchDynamo* for all tests in `dynamo_expected_failures`
+We generate skipIfTorchDynamo* for all tests in `dynamo_skips`
+We generate runWithoutCompiledAutograd for all tests in `compiled_autograd_skips`
+
+For an easier-than-manual way of generating and updating these lists,
+see scripts/compile_tests/update_failures.py
+
+If you're adding a new test, and it's failing PYTORCH_TEST_WITH_DYNAMO=1,
+either add the appropriate decorators to your test or add skips for them
+via test/dynamo_skips and test/dynamo_expected_failures.
+
+*These are not exactly unittest.expectedFailure and unittest.skip. We'll
+always execute the test and then suppress the signal, if necessary.
+If your tests crashes, or is slow, please use @skipIfTorchDynamo instead.
+
+The expected failure and skip files are located in test/dynamo_skips and
+test/dynamo_expected_failures. They're individual files rather than a list so
+git will merge changes easier.
+"""
+
 import logging
 import os
 import sys
 
-# NOTE: [dynamo_test_failures.py]
-#
-# We generate xFailIfTorchDynamo* for all tests in `dynamo_expected_failures`
-# We generate skipIfTorchDynamo* for all tests in `dynamo_skips`
-#
-# For an easier-than-manual way of generating and updating these lists,
-# see scripts/compile_tests/update_failures.py
-#
-# If you're adding a new test, and it's failing PYTORCH_TEST_WITH_DYNAMO=1,
-# either add the appropriate decorators to your test or add skips for them
-# via test/dynamo_skips and test/dynamo_expected_failures.
-#
-# *These are not exactly unittest.expectedFailure and unittest.skip. We'll
-# always execute the test and then suppress the signal, if necessary.
-# If your tests crashes, or is slow, please use @skipIfTorchDynamo instead.
-#
-# The expected failure and skip files are located in test/dynamo_skips and
-# test/dynamo_expected_failures. They're individual files rather than a list so
-# git will merge changes easier.
 
-
-def find_test_dir():
+def find_test_dir() -> str | None:
     # Find the path to the dynamo expected failure and skip files.
     from os.path import abspath, basename, dirname, exists, join, normpath
 
@@ -77,12 +80,28 @@ FIXME_inductor_non_strict = {
 if test_dir is None:
     dynamo_expected_failures = set()
     dynamo_skips = set()
-else:
-    failures_directory = os.path.join(test_dir, "dynamo_expected_failures")
-    skips_directory = os.path.join(test_dir, "dynamo_skips")
 
-    dynamo_expected_failures = set(os.listdir(failures_directory))
-    dynamo_skips = set(os.listdir(skips_directory))
+    inductor_expected_failures = set()
+    inductor_skips = set()
+
+    compiled_autograd_skips = set()
+else:
+    dynamo_failures_directory = os.path.join(test_dir, "dynamo_expected_failures")
+    dynamo_skips_directory = os.path.join(test_dir, "dynamo_skips")
+
+    dynamo_expected_failures = set(os.listdir(dynamo_failures_directory))
+    dynamo_skips = set(os.listdir(dynamo_skips_directory))
+
+    inductor_failures_directory = os.path.join(test_dir, "inductor_expected_failures")
+    inductor_skips_directory = os.path.join(test_dir, "inductor_skips")
+
+    inductor_expected_failures = set(os.listdir(inductor_failures_directory))
+    inductor_skips = set(os.listdir(inductor_skips_directory))
+
+    compiled_autograd_skips_directory = os.path.join(
+        test_dir, "compiled_autograd_skips"
+    )
+    compiled_autograd_skips = set(os.listdir(compiled_autograd_skips_directory))
 
 # TODO: due to case sensitivity problems, for now list these files by hand
 extra_dynamo_skips = {
@@ -101,13 +120,25 @@ dynamo_skips = dynamo_skips.union(extra_dynamo_skips)
 
 
 # verify some invariants
-for test in dynamo_expected_failures.union(dynamo_skips):
+for test in (
+    dynamo_expected_failures
+    | dynamo_skips
+    | inductor_expected_failures
+    | inductor_skips
+):
     if len(test.split(".")) != 2:
         raise AssertionError(f'Invalid test name: "{test}"')
 
-intersection = dynamo_expected_failures.intersection(dynamo_skips)
-if len(intersection) > 0:
+dynamo_intersection = dynamo_expected_failures.intersection(dynamo_skips)
+if len(dynamo_intersection) > 0:
     raise AssertionError(
         "there should be no overlap between dynamo_expected_failures "
-        "and dynamo_skips, got " + str(intersection)
+        "and dynamo_skips, got " + str(dynamo_intersection)
+    )
+
+inductor_intersection = inductor_expected_failures.intersection(inductor_skips)
+if len(inductor_intersection) > 0:
+    raise AssertionError(
+        "there should be no overlap between inductor_expected_failures "
+        "and inductor_skips, got " + str(inductor_intersection)
     )

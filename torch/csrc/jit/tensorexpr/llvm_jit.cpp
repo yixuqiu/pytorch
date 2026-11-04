@@ -11,6 +11,7 @@ C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wsuggest-override")
 #include <llvm/ExecutionEngine/JITSymbol.h>
 C10_DIAGNOSTIC_POP()
 
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wextra-semi")
 #include <llvm/ExecutionEngine/Orc/CompileUtils.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
@@ -35,6 +36,7 @@ C10_DIAGNOSTIC_POP()
 #endif
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
+C10_DIAGNOSTIC_POP()
 
 #include <torch/csrc/jit/tensorexpr/external_functions_registry.h>
 
@@ -56,8 +58,12 @@ static llvm::JITTargetAddress toAddress(T* Ptr) {
 // Get subtarget features for the host.
 static llvm::SubtargetFeatures getHostSubtargetFeatures() {
   llvm::SubtargetFeatures subtargetFeatures;
+#if LLVM_VERSION_MAJOR >= 19
+  const auto featureMap = llvm::sys::getHostCPUFeatures();
+#else
   llvm::StringMap<bool> featureMap;
   llvm::sys::getHostCPUFeatures(featureMap);
+#endif
   for (auto& feature : featureMap) {
     subtargetFeatures.AddFeature(feature.first(), feature.second);
   }
@@ -67,8 +73,8 @@ static llvm::SubtargetFeatures getHostSubtargetFeatures() {
 // Create a JTMB using the host's triple.  CPU and attrs default to the host
 // unless they are supplied.
 static llvm::orc::JITTargetMachineBuilder makeJTMBFromHost(
-    c10::optional<std::string> cpu,
-    c10::optional<std::string> attrs) {
+    std::optional<std::string> cpu,
+    std::optional<std::string> attrs) {
   llvm::orc::JITTargetMachineBuilder JTMB(
       (llvm::Triple(llvm::sys::getProcessTriple())));
   JTMB.setCPU(cpu.value_or(llvm::sys::getHostCPUName().str()));
@@ -85,8 +91,8 @@ static llvm::orc::JITTargetMachineBuilder makeJTMBFromHost(
 // Create a JTMB using a given triple.  Do not set cpu or attrs if not supplied.
 static llvm::orc::JITTargetMachineBuilder makeJTMBFromTriple(
     const std::string& triple,
-    c10::optional<std::string> cpu,
-    c10::optional<std::string> attrs) {
+    std::optional<std::string> cpu,
+    std::optional<std::string> attrs) {
   llvm::orc::JITTargetMachineBuilder JTMB((llvm::Triple(triple)));
   if (cpu) {
     JTMB.setCPU(*cpu);
@@ -100,9 +106,9 @@ static llvm::orc::JITTargetMachineBuilder makeJTMBFromTriple(
 }
 
 static llvm::orc::JITTargetMachineBuilder makeTargetMachineBuilder(
-    c10::optional<std::string> triple,
-    c10::optional<std::string> cpu,
-    c10::optional<std::string> attrs) {
+    std::optional<std::string> triple,
+    std::optional<std::string> cpu,
+    std::optional<std::string> attrs) {
   auto JTMB = triple ? makeJTMBFromTriple(*triple, cpu, attrs)
                      : makeJTMBFromHost(cpu, attrs);
 #if LLVM_VERSION_MAJOR >= 18
@@ -160,9 +166,9 @@ class TORCH_API PytorchLLVMJITImpl {
 
  public:
   PytorchLLVMJITImpl(
-      c10::optional<std::string> triple,
-      c10::optional<std::string> cpu,
-      c10::optional<std::string> attrs)
+      std::optional<std::string> triple,
+      std::optional<std::string> cpu,
+      std::optional<std::string> attrs)
       : TM(assertSuccess(makeTargetMachineBuilder(triple, cpu, attrs)
                              .createTargetMachine())),
         LLJ(assertSuccess(
@@ -170,11 +176,23 @@ class TORCH_API PytorchLLVMJITImpl {
                 .setJITTargetMachineBuilder(
                     makeTargetMachineBuilder(triple, cpu, attrs))
 #if LLVM_VERSION_MAJOR >= 17
-                .setObjectLinkingLayerCreator([&](ExecutionSession& ES,
-                                                  const Triple& TT) {
+                .setObjectLinkingLayerCreator([&](ExecutionSession& ES
+#if LLVM_VERSION_MAJOR < 21
+                                                  ,
+                                                  const Triple& TT
+#elif LLVM_VERSION_MAJOR >= 23
+                                                  ,
+                                                  jitlink::JITLinkMemoryManager&
+                                                      JLMM
+#endif
+                                              ) {
+#if LLVM_VERSION_MAJOR >= 23
+                  return std::make_unique<ObjectLinkingLayer>(ES, JLMM);
+#else
                   return std::make_unique<ObjectLinkingLayer>(
                       ES,
                       assertSuccess(jitlink::InProcessMemoryManager::Create()));
+#endif
                 })
 #endif
                 .create())) {
@@ -193,6 +211,30 @@ class TORCH_API PytorchLLVMJITImpl {
 
     // Register implementations of intrinsics
     registerIntrinsics(JD, Mangle, intrinsics);
+
+    // Work around UBSAN crashes which reads 8 byte in front of every function.
+    // Placing a dummy variable with 8 bytes first ensures there is readable
+    // memory before code for the first function is emitted. See also:
+    // - https://reviews.llvm.org/D148665
+    // - https://github.com/llvm/llvm-project/issues/65253
+    {
+      std::unique_ptr<llvm::LLVMContext> ctx =
+          std::make_unique<llvm::LLVMContext>();
+      std::unique_ptr<llvm::Module> module_ =
+          std::make_unique<llvm::Module>("__asan_workaround_fill", *ctx);
+      llvm::Type* type = llvm::ArrayType::get(llvm::Type::getInt8Ty(*ctx), 8);
+      module_->getOrInsertGlobal("__asan_workaround_fill", type, [&]() {
+        return new llvm::GlobalVariable(
+            *module_,
+            type,
+            true,
+            llvm::GlobalVariable::InternalLinkage,
+            llvm::Constant::getNullValue(type),
+            "__asan_workaround_fill");
+      });
+      assertSuccess(LLJ->addIRModule(
+          ThreadSafeModule(std::move(module_), std::move(ctx))));
+    }
   }
 
   void addModule(std::unique_ptr<Module> M, std::unique_ptr<LLVMContext> C) {
@@ -204,7 +246,7 @@ class TORCH_API PytorchLLVMJITImpl {
   JITSymbol findSymbol(const std::string Name) {
 #if LLVM_VERSION_MAJOR >= 15
     // Starting with llvm-15, LLJIT::lookup returns an address rather than a
-    // symbol. Even though an address is what we ultimately we want, we also
+    // symbol. Even though an address is what we ultimately want, we also
     // want to avoid churning our internal APIs, so we wrap the returned address
     // in a fake JITSymbol.
     auto result = assertSuccess(LLJ->lookup(Name));
@@ -241,9 +283,9 @@ class TORCH_API PytorchLLVMJITImpl {
 
  public:
   PytorchLLVMJITImpl(
-      c10::optional<std::string> triple,
-      c10::optional<std::string> cpu,
-      c10::optional<std::string> attrs)
+      std::optional<std::string> triple,
+      std::optional<std::string> cpu,
+      std::optional<std::string> attrs)
       : Resolver(createLegacyLookupResolver(
             ES,
             [this](const std::string& Name) -> JITSymbol {
@@ -320,9 +362,9 @@ class TORCH_API PytorchLLVMJITImpl {
 #endif
 
 PytorchLLVMJIT::PytorchLLVMJIT(
-    c10::optional<std::string> triple,
-    c10::optional<std::string> cpu,
-    c10::optional<std::string> attrs)
+    std::optional<std::string> triple,
+    std::optional<std::string> cpu,
+    std::optional<std::string> attrs)
     : impl_(std::make_unique<PytorchLLVMJITImpl>(triple, cpu, attrs)) {}
 
 PytorchLLVMJIT::~PytorchLLVMJIT() = default;

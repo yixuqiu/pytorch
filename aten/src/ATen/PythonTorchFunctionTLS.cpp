@@ -1,5 +1,6 @@
 #include <ATen/PythonTorchFunctionTLS.h>
-#include <c10/core/TensorImpl.h>
+
+#include <utility>
 
 namespace at::impl {
 
@@ -22,7 +23,7 @@ const std::shared_ptr<SafePyObject>& PythonTorchFunctionTLS::get_stack_at(int64_
 }
 
 int64_t PythonTorchFunctionTLS::stack_len() {
-  return pythonTorchFunctionState.stack_.size();
+  return static_cast<int64_t>(pythonTorchFunctionState.stack_.size());
 }
 
 void PythonTorchFunctionTLS::set_disabled_state(TorchFunctionDisabledState disabled_state) {
@@ -31,6 +32,16 @@ void PythonTorchFunctionTLS::set_disabled_state(TorchFunctionDisabledState disab
 
 TorchFunctionDisabledState PythonTorchFunctionTLS::get_disabled_state() {
   return pythonTorchFunctionState.disabled_state_;
+}
+
+bool PythonTorchFunctionTLS::exchange_skip_next(bool new_skip_next) {
+  return std::exchange(
+    pythonTorchFunctionState.skip_next_,
+    new_skip_next);
+}
+
+bool PythonTorchFunctionTLS::peek_skip_next() {
+  return pythonTorchFunctionState.skip_next_;
 }
 
 void PythonTorchFunctionTLS::set_state(const PythonTorchFunctionTLS& state) {
@@ -42,8 +53,19 @@ const PythonTorchFunctionTLS& PythonTorchFunctionTLS::get_state() {
 }
 
 bool torch_function_mode_enabled() {
-  return PythonTorchFunctionTLS::get_disabled_state() != TorchFunctionDisabledState::ALL_DISABLED &&
-         PythonTorchFunctionTLS::stack_len() > 0;
+  // Manually flatten because gcc is refusing to inline here.  Note
+  // that we are still calling __tls_get_addr twice here with GCC,
+  // presumably because of
+  // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=81501 (which says
+  // the fix ships in GCC 16), but forcing inlining still improves
+  // performance.
+  const auto& ptfs = pythonTorchFunctionState;
+  return ptfs.disabled_state_ != TorchFunctionDisabledState::ALL_DISABLED && !ptfs.stack_.empty();
+}
+
+// This is needed to disambiguate the ternary torch function disabled states
+bool torch_function_all_disabled() {
+  return PythonTorchFunctionTLS::get_disabled_state() == TorchFunctionDisabledState::ALL_DISABLED;
 }
 
 } // namespace at::impl

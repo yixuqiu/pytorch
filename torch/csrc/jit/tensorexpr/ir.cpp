@@ -44,7 +44,7 @@ Load::Load(Dtype dtype, BufPtr buf, std::vector<ExprPtr> indices)
   castIndicesToInts(indices_);
 }
 
-Load::Load(BufPtr buf, const std::vector<ExprPtr>& indices)
+Load::Load(const BufPtr& buf, const std::vector<ExprPtr>& indices)
     : Load(ChooseDtype(buf->dtype(), dtypeOfIndices(indices)), buf, indices) {}
 
 ExprHandle Load::make(
@@ -92,12 +92,12 @@ ExprPtr flatten_index(
   }
 
   size_t ndim = dims.size();
-  if (ndim != indices.size()) {
-    throw malformed_input("dimensions mismatch in flatten_index");
-  }
-  if (ndim != strides.size()) {
-    throw malformed_input("strides mismatch in flatten_index");
-  }
+  TORCH_CHECK(
+      ndim == indices.size(),
+      "MALFORMED INPUT: dimensions mismatch in flatten_index");
+  TORCH_CHECK(
+      ndim == strides.size(),
+      "MALFORMED INPUT: strides mismatch in flatten_index");
   if (ndim == 0) {
     return alloc<LongImm>(0);
   }
@@ -125,9 +125,9 @@ Dtype Intrinsics::IntrinsicsDtype(
     IntrinsicsOp op_type,
     const std::vector<ExprPtr>& params) {
   // TODO: check the op_type and make a real decision
-  // Doesnt this fail with kRand?
+  // Doesn't this fail with kRand?
   if (params.empty()) {
-    throw malformed_input("invalid params in Intrinsics");
+    TORCH_CHECK(false, "MALFORMED INPUT: invalid params in Intrinsics");
   } else if (params.size() == 1) {
     return IntrinsicsDtype(op_type, params[0]->dtype());
   } else if (params.size() == 2) {
@@ -136,7 +136,7 @@ Dtype Intrinsics::IntrinsicsDtype(
   return params[0]->dtype();
 }
 
-int Intrinsics::OpArgCount(IntrinsicsOp op_type) {
+size_t Intrinsics::OpArgCount(IntrinsicsOp op_type) {
   switch (op_type) {
     case kSin:
     case kCos:
@@ -175,7 +175,7 @@ int Intrinsics::OpArgCount(IntrinsicsOp op_type) {
     case kRemainder:
       return 2;
     default:
-      throw std::runtime_error("invalid op_type: " + c10::to_string(op_type));
+      TORCH_CHECK(false, "invalid op_type: " + std::to_string(op_type));
   }
 }
 
@@ -276,7 +276,7 @@ bool immediateIsPositive(const ExprPtr& e) {
   if (Name##ImmPtr imm = to<Name##Imm>(e)) { \
     return imm->value() > 0;                 \
   }
-  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE);
+  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE)
 #undef TYPE_CASE
   return false;
 }
@@ -286,7 +286,7 @@ bool immediateIsZero(const ExprPtr& e) {
   if (Name##ImmPtr imm = to<Name##Imm>(e)) { \
     return imm->value() == 0;                \
   }
-  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE);
+  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE)
 #undef TYPE_CASE
   return false;
 }

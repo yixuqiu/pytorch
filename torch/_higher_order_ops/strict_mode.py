@@ -1,14 +1,12 @@
+# mypy: allow-untyped-defs
+
 import torch
 import torch._subclasses.functional_tensor
-
 import torch.utils._pytree as pytree
-
 from torch._C import DispatchKey
 from torch._functorch.utils import exposed_in
-
-from torch._higher_order_ops.utils import _set_compilation_env, autograd_not_implemented
+from torch._higher_order_ops.utils import autograd_not_implemented, register_fake
 from torch._ops import HigherOrderOperator
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import (
     disable_proxy_modes_tracing,
     make_fx,
@@ -23,34 +21,39 @@ def strict_mode(callable, operands):
     if torch.compiler.is_dynamo_compiling():
         return strict_mode_op(callable, operands)
 
-    with _set_compilation_env():
-        with torch._dynamo.utils.disable_cache_limit():
-            return torch.compile(strict_mode_op, backend="eager", fullgraph=True)(
-                callable, operands
-            )
+    from torch._higher_order_ops.utils import _hop_compile_and_call
+
+    return _hop_compile_and_call(strict_mode_op, (callable, operands))
 
 
-strict_mode_op = HigherOrderOperator("strict_mode")
+class StrictMode(HigherOrderOperator):
+    def __init__(self):
+        super().__init__("strict_mode")
+
+    def __call__(self, callable, operands):
+        # pyrefly: ignore [missing-attribute]
+        return super().__call__(callable, operands)
+
+
+strict_mode_op = StrictMode()
 
 
 @strict_mode_op.py_impl(DispatchKey.CompositeExplicitAutograd)
 def strict_mode_op_dense(callable, operands):
     mode = _get_current_dispatch_mode()
-    assert mode is None, "Mode should never be enabled for CPU/CUDA key"
+    if mode is not None:
+        raise AssertionError("Mode should never be enabled for CPU/CUDA key")
     return callable(*operands)
 
 
-strict_mode_op.py_impl(DispatchKey.Autograd)(
+strict_mode_op.py_autograd_impl(
     autograd_not_implemented(strict_mode_op, deferred_error=True)
 )
 
 
 @strict_mode_op.py_impl(ProxyTorchDispatchMode)
 def inner(mode, callable, operands):
-    if mode.enable_tracing:
-        return trace_strict_mode(mode, strict_mode_op, callable, operands)
-    else:
-        return strict_mode_op(callable, operands)
+    return trace_strict_mode(mode, strict_mode_op, callable, operands)
 
 
 def trace_strict_mode(mode, strict_mode_op, callable, operands):
@@ -59,16 +62,7 @@ def trace_strict_mode(mode, strict_mode_op, callable, operands):
     with disable_proxy_modes_tracing():
         graph = make_fx(callable, pre_dispatch=pre_dispatch)(*operands)
 
-    next_name = None
-    i = 0
-    while not next_name:
-        candidate = f"strict_graph_{i}"
-        if hasattr(mode.tracer.root, candidate):
-            i += 1
-        else:
-            next_name = candidate
-
-    graph_name = next_name
+    graph_name = mode.tracer.get_fresh_qualname("strict_graph_")
     mode.tracer.root.register_module(graph_name, graph)
 
     args = (graph, operands)
@@ -83,11 +77,9 @@ def trace_strict_mode(mode, strict_mode_op, callable, operands):
     return track_tensor_tree(out, out_proxy, constant=None, tracer=mode.tracer)
 
 
-@strict_mode_op.py_impl(FakeTensorMode)
-def strict_mode_fake_tensor_mode(mode, callable, operands):
-    with mode:
-        true_outs = callable(*operands)
-    return true_outs
+@register_fake(strict_mode_op, skip_cache=True)
+def strict_mode_fake_tensor_mode(callable, operands):
+    return callable(*operands)
 
 
 @strict_mode_op.py_functionalize_impl

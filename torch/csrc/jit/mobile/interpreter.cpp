@@ -4,7 +4,6 @@
 #include <ATen/core/dynamic_type.h>
 #include <ATen/core/function.h>
 #include <ATen/core/jit_type.h>
-#include <ATen/core/operator_name.h>
 #include <ATen/record_function.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
@@ -12,13 +11,11 @@
 #include <torch/csrc/jit/mobile/function.h>
 #include <torch/csrc/jit/mobile/observer.h>
 #include <torch/csrc/jit/mobile/promoted_prim_ops.h>
-#include <torch/csrc/jit/runtime/jit_exception.h>
+#include <torch/csrc/jit/runtime/instruction.h>
 #include <torch/csrc/jit/runtime/vararg_functions.h>
 
-namespace torch {
-namespace jit {
-char const* toString(OpCode op);
-std::ostream& operator<<(std::ostream& out, Instruction inst);
+namespace torch::jit {
+
 namespace mobile {
 InterpreterState::InterpreterState(const Code& code) {
   enterFrame(code);
@@ -96,11 +93,11 @@ bool InterpreterState::run(Stack& stack) {
         debug_handle = *handle;
       }
 
-      // std::cout << "RUNNING " << pc << " " << code.instructions_[pc];
+      // std::cout << "RUNNING " << pc << ' ' << code.instructions_[pc];
       // if (inst.op == OP) {
       //   std::cout << ", " << code.op_names_[inst.X].name;
       //   if (!code.op_names_[inst.X].overload_name.empty()) {
-      //     std::cout << "." << code.op_names_[inst.X].overload_name;
+      //     std::cout << '.' << code.op_names_[inst.X].overload_name;
       //   }
       // }
       // std::cout << std::endl;
@@ -225,7 +222,8 @@ bool InterpreterState::run(Stack& stack) {
           while (static_cast<int>(userObj->type()->numAttributes()) <= inst.X) {
             std::stringstream ss;
             ss << userObj->type()->numAttributes();
-            userObj->type()->addAttribute(ss.str(), c10::NoneType::get());
+            userObj->type()->addAttribute(
+                std::move(ss).str(), c10::NoneType::get());
           }
           userObj->setSlot(inst.X, std::move(v));
           frame.step();
@@ -358,13 +356,12 @@ bool InterpreterState::run(Stack& stack) {
           // when STRIP_ERROR_MESSAGES is defined (which happens for production
           // mobile builds). This will cause the stack to be in an inconsistent
           // state. It has previously resulted in a SEV (S22350).
-          const auto& sref = stack.back().toStringRef();
-          TORCH_WARN(sref);
+          TORCH_WARN(stack.back().toStringRef());
           stack.pop_back();
           frame.step();
         } break;
         default:
-          AT_ERROR(toString(inst.op), " is invalid.");
+          TORCH_CHECK(false, toString(inst.op), " is invalid.");
       }
 
       if (!prev_value) {
@@ -391,7 +388,6 @@ bool InterpreterState::run(Stack& stack) {
     //    }
     //  }
   }
-  return false;
 }
 
 IValue& InterpreterState::reg(size_t reg) {
@@ -401,5 +397,4 @@ IValue& InterpreterState::reg(size_t reg) {
 }
 
 } // namespace mobile
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

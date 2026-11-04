@@ -21,7 +21,10 @@
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+// Fixes compilation warnings when gcc-11 is used
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wmismatched-new-delete")
 #include <llvm/IR/IRBuilder.h>
+C10_DIAGNOSTIC_POP()
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/PassManager.h>
@@ -74,26 +77,27 @@
 #include <torch/csrc/jit/jit_log.h>
 
 #include <memory>
+#include <numeric>
 
 using namespace torch::jit::tensorexpr;
 
 C10_DEFINE_bool(
     torch_jit_llvm_use_fast_intrinsics,
     false,
-    "Use fast (but slightly less accurate) implementations of tanh and sigmoid");
+    "Use fast (but slightly less accurate) implementations of tanh and sigmoid")
 
 namespace torch::jit::tensorexpr {
 
-c10::optional<std::string>& LLVMTargetTriple() {
-  static c10::optional<std::string> triple = c10::nullopt;
+std::optional<std::string>& LLVMTargetTriple() {
+  static std::optional<std::string> triple = std::nullopt;
   return triple;
 }
-c10::optional<std::string>& LLVMTargetCPU() {
-  static c10::optional<std::string> cpu = c10::nullopt;
+std::optional<std::string>& LLVMTargetCPU() {
+  static std::optional<std::string> cpu = std::nullopt;
   return cpu;
 }
-c10::optional<std::string>& LLVMTargetAttrs() {
-  static c10::optional<std::string> attrs = c10::nullopt;
+std::optional<std::string>& LLVMTargetAttrs() {
+  static std::optional<std::string> attrs = std::nullopt;
   return attrs;
 }
 bool& LLVMAOTWorkflow() {
@@ -111,6 +115,16 @@ struct TypedPointer {
   llvm::Type* type = nullptr;
   llvm::Value* addr = nullptr;
 };
+#endif
+
+#if LLVM_VERSION_MAJOR > 23
+llvm::PointerType* llvm_pointer_to(llvm::Type* ty, unsigned addrspace = 0) {
+  return llvm::PointerType::get(ty->getContext(), addrspace);
+}
+#else
+llvm::PointerType* llvm_pointer_to(llvm::Type* ty, unsigned addrspace = 0) {
+  return ty->getPointerTo(addrspace);
+}
 #endif
 
 llvm::CmpInst::Predicate llvm_comparison_predicate(
@@ -135,7 +149,7 @@ llvm::CmpInst::Predicate llvm_comparison_predicate(
                                      : llvm::ICmpInst::ICMP_ULE;
     default:
       // TODO: change to a proper error report
-      throw std::runtime_error("invalid operator type");
+      TORCH_CHECK(false, "invalid operator type");
   }
 }
 
@@ -156,7 +170,7 @@ llvm::CmpInst::Predicate llvm_fp_comparison_predicate(
       return llvm::FCmpInst::FCMP_OLE;
     default:
       // TODO: change to a proper error report
-      throw std::runtime_error("invalid operator type");
+      TORCH_CHECK(false, "invalid operator type");
   }
 }
 
@@ -183,7 +197,7 @@ using FunctionCallee = llvm::FunctionCallee;
 #elif LLVM_VERSION_MAJOR == 8 && LLVM_VERSION_PATCH == 20181009
 
 struct FunctionCallee {
-  FunctionCallee() {}
+  FunctionCallee() = default;
 
   FunctionCallee(llvm::Constant* fn)
       : v_(fn), ft_(cast<llvm::Function>(v_)->getFunctionType()) {}
@@ -243,7 +257,7 @@ class LLVMCodeGenImpl : public IRVisitor {
   std::string kernel_func_name_;
 
 #define LLVM_TYPE_DECLARE(_1, Name) llvm::Type* Name##Ty_;
-  AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, LLVM_TYPE_DECLARE);
+  AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, LLVM_TYPE_DECLARE)
 #undef LLVM_TYPE_DECLARE
 
 #if LLVM_VERSION_MAJOR >= 15
@@ -276,12 +290,21 @@ class LLVMCodeGenImpl : public IRVisitor {
     Binary,
   };
 
-  using SimdCallee = std::tuple<llvm::FunctionType*, llvm::Value*, bool>;
+  // The callee, plus the number of lanes it consumes per call. A width of 1
+  // means no vector implementation was found and the scalar function has to be
+  // called once per lane.
+  using SimdCallee = std::tuple<llvm::FunctionType*, llvm::Value*, int>;
   SimdCallee getSimdFunction(
       const std::string& name,
       llvm::Type* type,
       Arity arity,
       int lanes);
+  llvm::Value* emitSimdCall(
+      llvm::FunctionType* callTy,
+      llvm::Value* callFn,
+      const std::vector<llvm::Value*>& params,
+      int lanes,
+      int simdLanes);
 
   llvm::Value* varToValue(VarPtr var);
   void replaceVarMapping(
@@ -306,51 +329,51 @@ class LLVMCodeGenImpl : public IRVisitor {
       at::Device device,
       Dtype dtype,
       std::string kernel_func_name,
-      c10::optional<std::string> triple,
-      c10::optional<std::string> cpu,
-      c10::optional<std::string> attrs);
-  ~LLVMCodeGenImpl() = default;
+      std::optional<std::string> triple,
+      std::optional<std::string> cpu,
+      std::optional<std::string> attrs);
+  ~LLVMCodeGenImpl() override = default;
 
   llvm::JITTargetAddress getKernelAddress() const;
   std::unique_ptr<llvm::orc::PytorchLLVMJIT> releaseJIT();
 
-  void visit(AddPtr v) override;
-  void visit(SubPtr v) override;
-  void visit(MulPtr v) override;
-  void visit(DivPtr v) override;
-  void visit(ModPtr v) override;
-  void visit(MaxPtr v) override;
-  void visit(MinPtr v) override;
-  void visit(AndPtr v) override;
-  void visit(OrPtr v) override;
-  void visit(XorPtr v) override;
-  void visit(LshiftPtr v) override;
-  void visit(RshiftPtr v) override;
-  void visit(CompareSelectPtr v) override;
+  void visit(const AddPtr& v) override;
+  void visit(const SubPtr& v) override;
+  void visit(const MulPtr& v) override;
+  void visit(const DivPtr& v) override;
+  void visit(const ModPtr& v) override;
+  void visit(const MaxPtr& v) override;
+  void visit(const MinPtr& v) override;
+  void visit(const AndPtr& v) override;
+  void visit(const OrPtr& v) override;
+  void visit(const XorPtr& v) override;
+  void visit(const LshiftPtr& v) override;
+  void visit(const RshiftPtr& v) override;
+  void visit(const CompareSelectPtr& v) override;
 
-#define IMM_VISIT_DECLARE(_1, Name) void visit(Name##ImmPtr v) override;
-  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, IMM_VISIT_DECLARE);
+#define IMM_VISIT_DECLARE(_1, Name) void visit(const Name##ImmPtr& v) override;
+  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, IMM_VISIT_DECLARE)
 #undef IMM_VISIT_DECLARE
 
-  void visit(CastPtr v) override;
-  void visit(BitCastPtr v) override;
-  void visit(VarPtr v) override;
-  void visit(RampPtr v) override;
-  void visit(LoadPtr v) override;
-  void visit(ForPtr v) override;
-  void visit(BlockPtr v) override;
-  void visit(StorePtr v) override;
-  void visit(BroadcastPtr v) override;
-  void visit(IfThenElsePtr v) override;
-  void visit(IntrinsicsPtr v) override;
-  void visit(AllocatePtr v) override;
-  void visit(FreePtr v) override;
-  void visit(FreeExtPtr v) override;
-  void visit(PlacementAllocatePtr v) override;
-  void visit(LetPtr v) override;
-  void visit(CondPtr v) override;
-  void visit(ExternalCallPtr v) override;
-  void visit(ExternalCallWithAllocPtr v) override;
+  void visit(const CastPtr& v) override;
+  void visit(const BitCastPtr& v) override;
+  void visit(const VarPtr& v) override;
+  void visit(const RampPtr& v) override;
+  void visit(const LoadPtr& v) override;
+  void visit(const ForPtr& v) override;
+  void visit(const BlockPtr& v) override;
+  void visit(const StorePtr& v) override;
+  void visit(const BroadcastPtr& v) override;
+  void visit(const IfThenElsePtr& v) override;
+  void visit(const IntrinsicsPtr& v) override;
+  void visit(const AllocatePtr& v) override;
+  void visit(const FreePtr& v) override;
+  void visit(const FreeExtPtr& v) override;
+  void visit(const PlacementAllocatePtr& v) override;
+  void visit(const LetPtr& v) override;
+  void visit(const CondPtr& v) override;
+  void visit(const ExternalCallPtr& v) override;
+  void visit(const ExternalCallWithAllocPtr& v) override;
 
   void emitIsNan(IntrinsicsPtr v);
 
@@ -397,9 +420,9 @@ LLVMCodeGen::LLVMCodeGen(
     at::Device device,
     const std::string& kernel_func_name,
     Dtype dtype,
-    c10::optional<std::string> triple,
-    c10::optional<std::string> cpu,
-    c10::optional<std::string> attrs)
+    std::optional<std::string> triple,
+    std::optional<std::string> cpu,
+    std::optional<std::string> attrs)
     : CodeGen(stmt, args, device, kernel_func_name) {
   impl_ = std::make_unique<LLVMCodeGenImpl>(
       this->stmt(),
@@ -428,9 +451,9 @@ void LLVMCodeGen::call_with_numel(void** args, int64_t /* numel */) {
 
 void LLVMCodeGen::call(const std::vector<CallArg>& args) {
   auto& buf_args = buffer_args();
-  if (args.size() != buf_args.size()) {
-    throw malformed_input("wrong number of args in call");
-  }
+  TORCH_CHECK(
+      args.size() == buf_args.size(),
+      "MALFORMED INPUT: wrong number of args in call");
 
   constexpr unsigned nargs = 8;
   c10::SmallVector<void*, nargs> argv;
@@ -446,10 +469,10 @@ void LLVMCodeGen::call(const std::vector<CallArg>& args) {
 at::Tensor LLVMCodeGen::empty_strided(
     c10::IntArrayRef size,
     c10::IntArrayRef stride,
-    c10::optional<c10::ScalarType> dtype_opt,
-    c10::optional<c10::Layout> layout_opt,
-    c10::optional<c10::Device> device_opt,
-    c10::optional<bool> pin_memory_opt) {
+    std::optional<c10::ScalarType> dtype_opt,
+    std::optional<c10::Layout> layout_opt,
+    std::optional<c10::Device> device_opt,
+    std::optional<bool> pin_memory_opt) {
   return at::native::empty_strided_cpu(
       size, stride, dtype_opt, layout_opt, device_opt, pin_memory_opt);
 }
@@ -489,9 +512,9 @@ LLVMCodeGenImpl::LLVMCodeGenImpl(
     at::Device device,
     Dtype dtype,
     std::string kernel_func_name,
-    c10::optional<std::string> triple,
-    c10::optional<std::string> cpu,
-    c10::optional<std::string> attrs)
+    std::optional<std::string> triple,
+    std::optional<std::string> cpu,
+    std::optional<std::string> attrs)
     : context_(std::make_unique<llvm::LLVMContext>()),
       irb_(getContext()),
       kernel_func_name_(std::move(kernel_func_name)),
@@ -532,7 +555,13 @@ LLVMCodeGenImpl::LLVMCodeGenImpl(
 
   module_ = std::make_unique<llvm::Module>("pytorch", getContext());
   module_->setDataLayout(jit_->getDataLayout());
-  module_->setTargetTriple(jit_->getTargetMachine().getTargetTriple().str());
+  module_->setTargetTriple(
+#if LLVM_VERSION_MAJOR >= 21
+      llvm::Triple(jit_->getTargetMachine().getTargetTriple())
+#else
+      jit_->getTargetMachine().getTargetTriple().str()
+#endif
+  );
 
   // We support float16 ops by casting expr inputs to float32
   // and then casting the result back to float16
@@ -589,24 +618,21 @@ llvm::Type* LLVMCodeGenImpl::dtypeToLLVM(Dtype dtype) {
 #undef TYPE_CASE
     case ScalarType::QInt8:
       return CharTy_;
-      break;
 
     case ScalarType::QUInt8:
       return ByteTy_;
-      break;
 
     case ScalarType::BFloat16:
       return ShortTy_;
-      break;
 
     default:
-      throw unsupported_dtype();
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE");
   }
   return nullptr;
 }
 
 llvm::Type* LLVMCodeGenImpl::dtypeToLLVMPtr(Dtype dtype) {
-  return dtypeToLLVM(dtype)->getPointerTo();
+  return llvm_pointer_to(dtypeToLLVM(dtype));
 }
 
 void LLVMCodeGenImpl::emitWrapper(const std::vector<llvm::Type*>& params) {
@@ -625,6 +651,20 @@ void LLVMCodeGenImpl::emitWrapper(const std::vector<llvm::Type*>& params) {
       kernel_func_name_,
       module_.get());
 #endif
+
+  {
+    // Work around UBSAN crashes which reads 8 byte in front of every function.
+    // Otherwise, if the function was placed at the beginning of a page, reading
+    // 8B before the page could trigger a wild-addr-read ASAN failure if the
+    // page before this function was not mapped.
+    // - https://reviews.llvm.org/D148665
+    // - https://github.com/llvm/llvm-project/issues/65253
+    // Place the variable just before the function,
+    // the optimizer might otherwise disable this workaround.
+    // https://llvm.org/docs/LangRef.html#prefix-data
+    wrapper->setPrefixData(llvm::Constant::getNullValue(
+        llvm::ArrayType::get(llvm::Type::getInt8Ty(getContext()), 8)));
+  }
 
   auto wrapBB = llvm::BasicBlock::Create(getContext(), "wrapBB", wrapper);
   irb_.SetInsertPoint(wrapBB);
@@ -670,7 +710,7 @@ void LLVMCodeGenImpl::emitWrapper(const std::vector<llvm::Type*>& params) {
 
 class LLVMIntrinsicsExpander : public GenericIntrinsicsExpander {
  private:
-  ExprPtr mutate(IntrinsicsPtr v) override {
+  ExprPtr mutate(const IntrinsicsPtr& v) override {
     if (v->op_type() == kTanh) {
       ScalarType stype = v->dtype().scalar_type();
       if (stype == ScalarType::Float) {
@@ -725,9 +765,9 @@ void LLVMCodeGenImpl::emitKernel(
   GRAPH_DEBUG(
       "\nLLVM module before optimizations\n\n", asmStream.str().str(), "\n");
 
-  if (llvm::verifyFunction(*fn_, &llvm::outs())) {
-    throw std::runtime_error("Function verification failed");
-  }
+  TORCH_CHECK(
+      !llvm::verifyFunction(*fn_, &llvm::outs()),
+      "Function verification failed");
 
   optimize(*module_);
 
@@ -754,12 +794,12 @@ void LLVMCodeGenImpl::emitKernel(
   PM.run(*module_);
   asmCode_ = asmStream.str().str();
 
-  GRAPH_DEBUG("\nLLVM generated assembly code\n\n", asmCode_, "\n");
+  GRAPH_DEBUG("\nLLVM generated assembly code\n\n", asmCode_, '\n');
 }
 
-// TODO: The binary ops are copypasta.
+// TODO: The binary ops are copypaste.
 
-void LLVMCodeGenImpl::visit(AddPtr v) {
+void LLVMCodeGenImpl::visit(const AddPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -773,11 +813,14 @@ void LLVMCodeGenImpl::visit(AddPtr v) {
   } else if (!lfp && !rfp) {
     value_ = irb_.CreateAdd(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in Add", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Add - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(SubPtr v) {
+void LLVMCodeGenImpl::visit(const SubPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -791,11 +834,14 @@ void LLVMCodeGenImpl::visit(SubPtr v) {
   } else if (!lfp && !rfp) {
     value_ = irb_.CreateSub(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in Sub", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Sub - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(MulPtr v) {
+void LLVMCodeGenImpl::visit(const MulPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -809,11 +855,14 @@ void LLVMCodeGenImpl::visit(MulPtr v) {
   } else if (!lfp && !rfp) {
     value_ = irb_.CreateMul(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in Mul", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Mul - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(DivPtr v) {
+void LLVMCodeGenImpl::visit(const DivPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -827,11 +876,14 @@ void LLVMCodeGenImpl::visit(DivPtr v) {
   } else if (!lfp && !rfp) {
     value_ = irb_.CreateSDiv(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in Div", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Div - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(AndPtr v) {
+void LLVMCodeGenImpl::visit(const AndPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -842,11 +894,14 @@ void LLVMCodeGenImpl::visit(AndPtr v) {
   if (!lfp && !rfp) {
     value_ = irb_.CreateAnd(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in And", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in And - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(OrPtr v) {
+void LLVMCodeGenImpl::visit(const OrPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -855,13 +910,16 @@ void LLVMCodeGenImpl::visit(OrPtr v) {
   bool rfp = rhs->getType()->isFPOrFPVectorTy();
 
   if (!lfp && !rfp) {
-    value_ = irb_.CreateOr(lhs, rhs);
+    value_ = irb_.CreateOr(lhs, rhs); // codespell:ignore
   } else {
-    throw malformed_input("llvm_codegen: bad type in Or", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Or - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(XorPtr v) {
+void LLVMCodeGenImpl::visit(const XorPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -872,11 +930,14 @@ void LLVMCodeGenImpl::visit(XorPtr v) {
   if (!lfp && !rfp) {
     value_ = irb_.CreateXor(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in Xor", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Xor - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(LshiftPtr v) {
+void LLVMCodeGenImpl::visit(const LshiftPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -887,11 +948,14 @@ void LLVMCodeGenImpl::visit(LshiftPtr v) {
   if (!lfp && !rfp) {
     value_ = irb_.CreateShl(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in Lshift", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Lshift - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(RshiftPtr v) {
+void LLVMCodeGenImpl::visit(const RshiftPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -906,11 +970,14 @@ void LLVMCodeGenImpl::visit(RshiftPtr v) {
       value_ = irb_.CreateLShr(lhs, rhs);
     }
   } else {
-    throw malformed_input("llvm_codegen: bad type in Rshift", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Rshift - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(ModPtr v) {
+void LLVMCodeGenImpl::visit(const ModPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   bool lfp = lhs->getType()->isFPOrFPVectorTy();
@@ -921,11 +988,14 @@ void LLVMCodeGenImpl::visit(ModPtr v) {
   if (!lfp && !rfp) {
     value_ = irb_.CreateSRem(lhs, rhs);
   } else {
-    throw malformed_input("llvm_codegen: bad type in Mod", v);
+    TORCH_CHECK(
+        false,
+        "MALFORMED INPUT: llvm_codegen: bad type in Mod - ",
+        std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(MaxPtr v) {
+void LLVMCodeGenImpl::visit(const MaxPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   v->rhs()->accept(this);
@@ -948,7 +1018,7 @@ void LLVMCodeGenImpl::visit(MaxPtr v) {
           irb_.CreateFCmp(llvm::FCmpInst::FCMP_OGT, lhs, rhs), lhs, rhs));
 }
 
-void LLVMCodeGenImpl::visit(MinPtr v) {
+void LLVMCodeGenImpl::visit(const MinPtr& v) {
   v->lhs()->accept(this);
   auto lhs = this->value_;
   v->rhs()->accept(this);
@@ -970,7 +1040,7 @@ void LLVMCodeGenImpl::visit(MinPtr v) {
           irb_.CreateFCmp(llvm::FCmpInst::FCMP_OLT, lhs, rhs), lhs, rhs));
 }
 
-void LLVMCodeGenImpl::visit(CompareSelectPtr v) {
+void LLVMCodeGenImpl::visit(const CompareSelectPtr& v) {
   auto genUnbiased = [this, v]() -> llvm::Value* {
     v->lhs()->accept(this);
     auto lhs = this->value_;
@@ -992,7 +1062,7 @@ void LLVMCodeGenImpl::visit(CompareSelectPtr v) {
     } else if (c10::isFloatingType(type_used)) {
       cmp_ = irb_.CreateFCmp(llvm_fp_comparison_predicate(cmp_op_), lhs, rhs);
     } else {
-      throw std::runtime_error("invalid type for CompareSelect");
+      TORCH_CHECK(false, "invalid type for CompareSelect");
     }
 
     return irb_.CreateSelect(cmp_, retval1, retval2);
@@ -1014,7 +1084,7 @@ void LLVMCodeGenImpl::visit(CompareSelectPtr v) {
     } else if (c10::isFloatingType(cmp_type)) {
       cmp = irb_.CreateFCmp(llvm_fp_comparison_predicate(cmp_op), lhs, rhs);
     } else {
-      throw std::runtime_error("invalid type for CompareSelect");
+      TORCH_CHECK(false, "invalid type for CompareSelect");
     }
 
     auto lanes = v->lhs()->dtype().lanes();
@@ -1061,33 +1131,35 @@ void LLVMCodeGenImpl::visit(CompareSelectPtr v) {
 }
 
 template <typename T>
-typename std::enable_if<std::is_integral<T>::value, llvm::Value*>::type
-getFromType(llvm::Type* type, T value) {
-  return llvm::ConstantInt::get(type, value, std::is_signed<T>::value);
+std::enable_if_t<std::is_integral_v<T>, llvm::Value*> getFromType(
+    llvm::Type* type,
+    T value) {
+  return llvm::ConstantInt::get(type, value, std::is_signed_v<T>);
 }
 
 template <typename T>
-typename std::enable_if<std::is_floating_point<T>::value, llvm::Value*>::type
-getFromType(llvm::Type* type, T value) {
+std::enable_if_t<std::is_floating_point_v<T>, llvm::Value*> getFromType(
+    llvm::Type* type,
+    T value) {
   return llvm::ConstantFP::get(type, value);
 }
 
 #define IMM_VISIT_DECLARE(Type, Name)                  \
-  void LLVMCodeGenImpl::visit(Name##ImmPtr v) {        \
+  void LLVMCodeGenImpl::visit(const Name##ImmPtr& v) { \
     value_ = getFromType<Type>(Name##Ty_, v->value()); \
   }
-AT_FORALL_SCALAR_TYPES(IMM_VISIT_DECLARE);
+AT_FORALL_SCALAR_TYPES(IMM_VISIT_DECLARE)
 #undef IMM_VISIT_DECLARE
 
-void LLVMCodeGenImpl::visit(HalfImmPtr v) {
+void LLVMCodeGenImpl::visit(const HalfImmPtr& v) {
   value_ = llvm::ConstantFP::get(HalfTy_, v->value());
 }
 
-void LLVMCodeGenImpl::visit(BFloat16ImmPtr v) {
+void LLVMCodeGenImpl::visit(const BFloat16ImmPtr& v) {
   value_ = llvm::ConstantInt::get(ShortTy_, v->value().x);
 }
 
-void LLVMCodeGenImpl::visit(BoolImmPtr v) {
+void LLVMCodeGenImpl::visit(const BoolImmPtr& v) {
   value_ = llvm::ConstantInt::get(BoolTy_, v->value());
 }
 
@@ -1099,7 +1171,7 @@ static llvm::Type* llvmTypeToVec(llvm::Type* type, int lanes) {
   }
 }
 
-void LLVMCodeGenImpl::visit(CastPtr v) {
+void LLVMCodeGenImpl::visit(const CastPtr& v) {
   v->src_value()->accept(this);
 
   auto dst_type = v->dtype().scalar_type();
@@ -1200,7 +1272,7 @@ void LLVMCodeGenImpl::visit(CastPtr v) {
       }
       value_ = irb_.CreateFPCast(value_, dstType);
     } else if (dstType->isIntOrIntVectorTy()) {
-      // Strictly casting from Float -> i8 doesnt give correct results
+      // Strictly casting from Float -> i8 doesn't give correct results
       // set one bit true if the input float is not 0
       if (v->dtype().scalar_type() == ScalarType::Bool) {
         llvm::Value* zero =
@@ -1218,14 +1290,15 @@ void LLVMCodeGenImpl::visit(CastPtr v) {
         value_ = irb_.CreateFPToSI(value_, dstType);
       }
     } else {
-      throw unimplemented_lowering(v);
+      TORCH_CHECK(false, "UNIMPLEMENTED LOWERING: ", std::to_string(v));
     }
     return;
   }
 
-  if (!srcType->isIntOrIntVectorTy()) {
-    throw unimplemented_lowering(v);
-  }
+  TORCH_CHECK(
+      srcType->isIntOrIntVectorTy(),
+      "UNIMPLEMENTED LOWERING: ",
+      std::to_string(v));
   if (dstType->isFPOrFPVectorTy()) {
     if (srcUnsigned) {
       value_ = irb_.CreateUIToFP(value_, dstType);
@@ -1242,11 +1315,11 @@ void LLVMCodeGenImpl::visit(CastPtr v) {
     }
     value_ = irb_.CreateIntCast(value_, dstType, !destUnsigned);
   } else {
-    throw unimplemented_lowering(v);
+    TORCH_CHECK(false, "UNIMPLEMENTED LOWERING: ", std::to_string(v));
   }
 }
 
-void LLVMCodeGenImpl::visit(BitCastPtr v) {
+void LLVMCodeGenImpl::visit(const BitCastPtr& v) {
   v->src_value()->accept(this);
 
   llvm::Type* dstType = dtypeToLLVM(v->dtype());
@@ -1265,17 +1338,17 @@ void LLVMCodeGenImpl::visit(BitCastPtr v) {
   value_ = irb_.CreateBitOrPointerCast(value_, dstType);
 }
 
-void LLVMCodeGenImpl::visit(VarPtr v) {
+void LLVMCodeGenImpl::visit(const VarPtr& v) {
   value_ = varToValue(v);
 }
 
 llvm::Value* LLVMCodeGenImpl::varToValue(VarPtr v) {
   // It is possible for v to be in both varToVal_ and varToArgs.
   // In that case, varToVal_ takes precedence.
-  if (varToVal_.count(v)) {
-    return varToVal_.at(v);
-  } else if (varToArg_.count(v)) {
-    auto idx = varToArg_.at(v);
+  if (auto it = varToVal_.find(v); it != varToVal_.end()) {
+    return it->second;
+  } else if (auto it = varToArg_.find(v); it != varToArg_.end()) {
+    auto idx = it->second;
     auto arg = fn_->arg_begin() + idx;
     return arg;
   }
@@ -1297,7 +1370,7 @@ void LLVMCodeGenImpl::replaceVarMapping(
   }
 }
 
-void LLVMCodeGenImpl::visit(RampPtr v) {
+void LLVMCodeGenImpl::visit(const RampPtr& v) {
   v->base()->accept(this);
   auto base = this->value_;
   v->stride()->accept(this);
@@ -1337,7 +1410,7 @@ void LLVMCodeGenImpl::visit(RampPtr v) {
       vecType = llvm::VectorType::get(ShortTy_, element_count);
       break;
     default:
-      throw std::runtime_error("invalid dtype in Ramp");
+      TORCH_CHECK(false, "invalid dtype in Ramp");
   }
 
   value_ = llvm::UndefValue::get(vecType);
@@ -1397,7 +1470,7 @@ llvm::Value* LLVMCodeGenImpl::emitMaskedLoad(
   return phi;
 }
 
-void LLVMCodeGenImpl::visit(LoadPtr v) {
+void LLVMCodeGenImpl::visit(const LoadPtr& v) {
   if (v->dtype().lanes() == 1) {
     v->base_handle()->accept(this);
     auto base = this->value_;
@@ -1427,7 +1500,7 @@ void LLVMCodeGenImpl::visit(LoadPtr v) {
       loadType = llvm::VectorType::get(ShortTy_, element_count);
       break;
     default:
-      throw std::runtime_error("invalid dtype in Load");
+      TORCH_CHECK(false, "invalid dtype in Load");
   }
 
   // Handle the case where the load is contiguous and unmasked efficiently
@@ -1449,8 +1522,7 @@ void LLVMCodeGenImpl::visit(LoadPtr v) {
           first_idx);
 #endif
 
-      auto vaddr = irb_.CreateBitOrPointerCast(
-          addr, llvm::PointerType::get(loadType, 0));
+      auto vaddr = irb_.CreateBitOrPointerCast(addr, llvm_pointer_to(loadType));
 #if LLVM_VERSION_MAJOR >= 12
       value_ = irb_.CreateAlignedLoad(loadType, vaddr, llvm::MaybeAlign(4));
 #else
@@ -1510,10 +1582,10 @@ std::vector<llvm::Value*> LLVMCodeGenImpl::unpackFuncArgs(
   std::vector<llvm::Value*> func_args(arg_count);
   llvm::Value* zero = llvm::ConstantInt::get(IntTy_, 0);
   for (const auto i : c10::irange(arg_count)) {
-    llvm::Type* feild_type = packed.type->getStructElementType(i);
-    llvm::Value* feild_addr = irb_.CreateInBoundsGEP(
+    llvm::Type* field_type = packed.type->getStructElementType(i);
+    llvm::Value* field_addr = irb_.CreateInBoundsGEP(
         packed.type, packed.addr, {zero, llvm::ConstantInt::get(IntTy_, i)});
-    func_args[i] = irb_.CreateLoad(feild_type, feild_addr);
+    func_args[i] = irb_.CreateLoad(field_type, field_addr);
   }
   return func_args;
 }
@@ -1673,7 +1745,7 @@ void LLVMCodeGenImpl::processParallelFor(ForPtr v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
 }
 
-void LLVMCodeGenImpl::visit(ForPtr v) {
+void LLVMCodeGenImpl::visit(const ForPtr& v) {
   if (v->is_parallel()) {
     processParallelFor(v);
     return;
@@ -1697,7 +1769,7 @@ void LLVMCodeGenImpl::visit(ForPtr v) {
   if (!varToVal_.count(v->var())) {
     varToVal_.emplace(v->var(), idx);
   } else {
-    throw std::runtime_error("var should not exist before");
+    TORCH_CHECK(false, "var should not exist before");
   }
 
   // Create the body and exit blocks.
@@ -1729,7 +1801,7 @@ void LLVMCodeGenImpl::visit(ForPtr v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
 }
 
-void LLVMCodeGenImpl::visit(BlockPtr v) {
+void LLVMCodeGenImpl::visit(const BlockPtr& v) {
   BlockPtr last = scope_;
   scope_ = v;
 
@@ -1742,9 +1814,7 @@ void LLVMCodeGenImpl::visit(BlockPtr v) {
   auto it = scopeToVar_.find(v);
   if (it != scopeToVar_.end()) {
     for (VarPtr e : it->second) {
-      if (varToVal_.erase(e) != 1) {
-        throw std::runtime_error("erasing var that doesn't exist");
-      }
+      TORCH_CHECK(varToVal_.erase(e) == 1, "erasing var that doesn't exist");
     }
   }
 }
@@ -1795,7 +1865,7 @@ void LLVMCodeGenImpl::emitMaskedStore(
   irb_.SetInsertPoint(tailblock);
 }
 
-void LLVMCodeGenImpl::visit(StorePtr v) {
+void LLVMCodeGenImpl::visit(const StorePtr& v) {
   if (v->value()->dtype().lanes() == 1) {
     v->base_handle()->accept(this);
     auto base = this->value_;
@@ -1832,8 +1902,8 @@ void LLVMCodeGenImpl::visit(StorePtr v) {
           first_idx);
 #endif
 
-      auto vaddr = irb_.CreateBitOrPointerCast(
-          addr, llvm::PointerType::get(val->getType(), 0));
+      auto vaddr =
+          irb_.CreateBitOrPointerCast(addr, llvm_pointer_to(val->getType()));
 
 #if LLVM_VERSION_MAJOR >= 13
       irb_.CreateAlignedStore(val, vaddr, llvm::MaybeAlign(4));
@@ -1858,13 +1928,13 @@ void LLVMCodeGenImpl::visit(StorePtr v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
 }
 
-void LLVMCodeGenImpl::visit(BroadcastPtr v) {
+void LLVMCodeGenImpl::visit(const BroadcastPtr& v) {
   v->value()->accept(this);
   int lanes = v->lanes();
   value_ = irb_.CreateVectorSplat(lanes, value_);
 }
 
-void LLVMCodeGenImpl::visit(IfThenElsePtr v) {
+void LLVMCodeGenImpl::visit(const IfThenElsePtr& v) {
   v->condition()->accept(this);
   llvm::Value* condition = value_;
   llvm::Value* c = irb_.CreateICmpNE(
@@ -1956,24 +2026,37 @@ LLVMCodeGenImpl::SimdCallee LLVMCodeGenImpl::getSimdFunction(
     llvm::Type* basetype,
     Arity arity,
     int lanes) {
-  std::string name;
-  llvm::Type* type;
-  bool useSimd;
+  std::string name = basename;
+  llvm::Type* type = basetype;
+  int simdLanes = 1;
 
-  // Determine whether to use vectorized intrinsic.
+  // Sleef's vector entry points are only callable if the target actually has
+  // the ISA they were built for. Advanced SIMD is mandatory on aarch64, so
+  // there is nothing to test for; on x86 the widest ones need AVX.
+  auto const& targetTriple = jit_->getTargetMachine().getTargetTriple();
   auto const& featureString = jit_->getTargetMachine().getTargetFeatureString();
-  bool hasAVX = featureString.find("+avx") != llvm::StringRef::npos;
-  std::string typeSuffix = basetype == DoubleTy_ ? "d" : "";
-  std::string sleefName =
-      "Sleef_" + basename + typeSuffix + std::to_string(lanes);
-  if (wantSleef(basename) && hasAVX && jit_->hasSymbol(sleefName)) {
-    name = std::move(sleefName);
-    type = llvm::VectorType::get(basetype, ElementCount(lanes));
-    useSimd = true;
-  } else {
-    name = basename;
-    type = basetype;
-    useSimd = false;
+  bool hasSimd = targetTriple.isAArch64() ||
+      featureString.find("+avx") != llvm::StringRef::npos;
+
+  if (wantSleef(basename) && hasSimd) {
+    std::string typeSuffix = basetype == DoubleTy_ ? "d" : "";
+    // Prefer an entry point as wide as the vectorized loop body, but accept a
+    // narrower one and call it repeatedly. Advanced SIMD tops out at 4 floats
+    // or 2 doubles, so without this a body vectorized at 8 lanes would fall
+    // all the way back to one scalar libm call per element.
+    for (int width = lanes; width > 1; width /= 2) {
+      if (lanes % width != 0) {
+        continue;
+      }
+      std::string sleefName =
+          "Sleef_" + basename + typeSuffix + std::to_string(width);
+      if (jit_->hasSymbol(sleefName)) {
+        name = std::move(sleefName);
+        type = llvm::VectorType::get(basetype, ElementCount(width));
+        simdLanes = width;
+        break;
+      }
+    }
   }
 
   // Get function to call from name and type.
@@ -1988,13 +2071,66 @@ LLVMCodeGenImpl::SimdCallee LLVMCodeGenImpl::getSimdFunction(
   }
   FunctionCallee callee = module_->getOrInsertFunction(name, fntype, {});
   applyMathFunctionAttributes(llvm::cast<llvm::Function>(callee.getCallee()));
-  return SimdCallee{callee.getFunctionType(), callee.getCallee(), useSimd};
+  return SimdCallee{callee.getFunctionType(), callee.getCallee(), simdLanes};
 }
 
-void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
+// Applies `callFn`, which consumes `simdLanes` at a time, across a
+// `lanes`-wide vector by slicing the operands and concatenating the results.
+llvm::Value* LLVMCodeGenImpl::emitSimdCall(
+    llvm::FunctionType* callTy,
+    llvm::Value* callFn,
+    const std::vector<llvm::Value*>& params,
+    int lanes,
+    int simdLanes) {
+  auto constantMask = [&](const std::vector<int>& indices) {
+    std::vector<llvm::Constant*> mask;
+    mask.reserve(indices.size());
+    for (int i : indices) {
+      mask.push_back(
+          i < 0 ? llvm::UndefValue::get(IntTy_)
+                : llvm::ConstantInt::get(IntTy_, i));
+    }
+    return llvm::ConstantVector::get(mask);
+  };
+
+  llvm::Value* result = nullptr;
+  int resultLanes = 0;
+  for (int base = 0; base < lanes; base += simdLanes) {
+    std::vector<int> sliceIndices(simdLanes);
+    std::iota(sliceIndices.begin(), sliceIndices.end(), base);
+    std::vector<llvm::Value*> slice;
+    slice.reserve(params.size());
+    for (llvm::Value* p : params) {
+      slice.push_back(irb_.CreateShuffleVector(
+          p, llvm::UndefValue::get(p->getType()), constantMask(sliceIndices)));
+    }
+    llvm::Value* part = irb_.CreateCall(callTy, callFn, slice);
+
+    if (!result) {
+      result = part;
+      resultLanes = simdLanes;
+      continue;
+    }
+    // shufflevector needs both operands to have the same type, so pad this
+    // part out to the accumulated width before appending it.
+    std::vector<int> padIndices(resultLanes, -1);
+    std::iota(padIndices.begin(), padIndices.begin() + simdLanes, 0);
+    llvm::Value* padded = irb_.CreateShuffleVector(
+        part, llvm::UndefValue::get(part->getType()), constantMask(padIndices));
+
+    std::vector<int> concatIndices(resultLanes + simdLanes);
+    std::iota(concatIndices.begin(), concatIndices.end(), 0);
+    result =
+        irb_.CreateShuffleVector(result, padded, constantMask(concatIndices));
+    resultLanes += simdLanes;
+  }
+  return result;
+}
+
+void LLVMCodeGenImpl::visit(const IntrinsicsPtr& v) {
   llvm::FunctionType* call_ty = nullptr;
   llvm::Value* call_fn = nullptr;
-  bool call_simd_sleef = false;
+  int call_simd_lanes = 1;
 
   if (v->op_type() == kIsNan) {
     return emitIsNan(v);
@@ -2009,11 +2145,11 @@ void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
             toVec(llvm::ConstantFP::get(FloatTy_, 1.0), v->dtype().lanes());
         value_ = irb_.CreateFDiv(constant, value_);
         return;
-      } break;
+      }
 
 #define SIMD_UNARY_MATH_CASE(enum, name, type)                  \
   case enum: {                                                  \
-    std::tie(call_ty, call_fn, call_simd_sleef) =               \
+    std::tie(call_ty, call_fn, call_simd_lanes) =               \
         getSimdFunction(name, type, Unary, v->dtype().lanes()); \
   } break;
         SIMD_UNARY_MATH_CASE(kLog10, "log10f", FloatTy_)
@@ -2044,7 +2180,7 @@ void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
 
 #define SIMD_BINARY_MATH_CASE(enum, name, type)                  \
   case enum: {                                                   \
-    std::tie(call_ty, call_fn, call_simd_sleef) =                \
+    std::tie(call_ty, call_fn, call_simd_lanes) =                \
         getSimdFunction(name, type, Binary, v->dtype().lanes()); \
   } break;
         SIMD_BINARY_MATH_CASE(kAtan2, "atan2f", FloatTy_)
@@ -2063,15 +2199,15 @@ void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
       } break;
 
       default: {
-        throw unimplemented_lowering(v);
-      } break;
+        TORCH_CHECK(false, "UNIMPLEMENTED LOWERING: ", std::to_string(v));
+      }
     }
 
   } else if (v->dtype().scalar_type() == ScalarType::Double) {
     switch (v->op_type()) {
 #define SIMD_UNARY_MATH_CASE(enum, name, type)                  \
   case enum: {                                                  \
-    std::tie(call_ty, call_fn, call_simd_sleef) =               \
+    std::tie(call_ty, call_fn, call_simd_lanes) =               \
         getSimdFunction(name, type, Unary, v->dtype().lanes()); \
   } break;
       SIMD_UNARY_MATH_CASE(kLog10, "log10", DoubleTy_)
@@ -2109,11 +2245,11 @@ void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
         }
         value_ = irb_.CreateFDiv(constant, value_);
         return;
-      } break;
+      }
 
 #define SIMD_BINARY_MATH_CASE(enum, name, type)                  \
   case enum: {                                                   \
-    std::tie(call_ty, call_fn, call_simd_sleef) =                \
+    std::tie(call_ty, call_fn, call_simd_lanes) =                \
         getSimdFunction(name, type, Binary, v->dtype().lanes()); \
   } break;
         SIMD_BINARY_MATH_CASE(kAtan2, "atan2", DoubleTy_)
@@ -2132,8 +2268,8 @@ void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
       } break;
 
       default: {
-        throw unimplemented_lowering(v);
-      } break;
+        TORCH_CHECK(false, "UNIMPLEMENTED LOWERING: ", std::to_string(v));
+      }
     }
   } else if (v->dtype().is_integral() && v->op_type() == kAbs) {
     // abs is only intrinsic defined for integer inputs in pytorch eager
@@ -2163,12 +2299,13 @@ void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
     params.push_back(value_);
   }
 
-  if (v->dtype().lanes() == 1 || call_simd_sleef == true) {
+  int lanes = v->dtype().lanes();
+  if (lanes == call_simd_lanes) {
     value_ = irb_.CreateCall(call_ty, call_fn, params);
-  } else {
+  } else if (call_simd_lanes == 1) {
     llvm::Type* vecType = params[0]->getType();
     value_ = llvm::UndefValue::get(vecType);
-    for (int i = 0; i < v->dtype().lanes(); ++i) {
+    for (int i = 0; i < lanes; ++i) {
       std::vector<llvm::Value*> call_operands;
       for (auto p : params) {
         call_operands.push_back(irb_.CreateExtractElement(p, i));
@@ -2177,6 +2314,8 @@ void LLVMCodeGenImpl::visit(IntrinsicsPtr v) {
       llvm::Value* val = irb_.CreateCall(call_ty, call_fn, call_operands);
       value_ = irb_.CreateInsertElement(value_, val, i);
     }
+  } else {
+    value_ = emitSimdCall(call_ty, call_fn, params, lanes, call_simd_lanes);
   }
 }
 
@@ -2188,11 +2327,12 @@ void LLVMCodeGenImpl::handleBufReuse(BufPtr buf, BufPtr buf_to_reuse) {
   varToVal_[buf->base_handle()] = ptr;
 }
 
-void LLVMCodeGenImpl::visit(ExternalCallPtr v) {
+void LLVMCodeGenImpl::visit(const ExternalCallPtr& v) {
   auto& func_registry = getNNCFunctionRegistry();
-  if (!func_registry.count(v->func_name())) {
-    throw unimplemented_lowering(v);
-  }
+  TORCH_CHECK(
+      func_registry.count(v->func_name()),
+      "UNIMPLEMENTED LOWERING: ",
+      std::to_string(v));
 
   // Prepare a vector of bufs that we need to pass to the external function.
   // This vector is the output buf followed by the buf_args.
@@ -2342,11 +2482,12 @@ void LLVMCodeGenImpl::visit(ExternalCallPtr v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
 }
 
-void LLVMCodeGenImpl::visit(ExternalCallWithAllocPtr v) {
+void LLVMCodeGenImpl::visit(const ExternalCallWithAllocPtr& v) {
   auto& func_registry = getNNCFunctionRegistry();
-  if (!func_registry.count(v->func_name())) {
-    throw unimplemented_lowering(v);
-  }
+  TORCH_CHECK(
+      func_registry.count(v->func_name()),
+      "UNIMPLEMENTED LOWERING: ",
+      std::to_string(v));
 
   const auto& bufs_out = v->buf_out_args();
   const auto& bufs_in = v->buf_args();
@@ -2559,7 +2700,7 @@ void LLVMCodeGenImpl::visit(ExternalCallWithAllocPtr v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
 }
 
-void LLVMCodeGenImpl::visit(AllocatePtr v) {
+void LLVMCodeGenImpl::visit(const AllocatePtr& v) {
   llvm::Value* size =
       llvm::ConstantInt::getSigned(LongTy_, v->dtype().byte_size());
   for (ExprPtr e : v->dims()) {
@@ -2578,8 +2719,10 @@ void LLVMCodeGenImpl::visit(AllocatePtr v) {
   }
 
 #if LLVM_VERSION_MAJOR > 17
+  irb_.SetInsertPoint(irb_.GetInsertBlock());
   llvm::Instruction* I = irb_.CreateMalloc(
       LongTy_, dtypeToLLVM(v->dtype()), size, nullptr, nullptr, "");
+  varToVal_[v->buffer_var()] = I;
 #else
   llvm::Instruction* I = llvm::CallInst::CreateMalloc(
       irb_.GetInsertBlock(),
@@ -2588,14 +2731,14 @@ void LLVMCodeGenImpl::visit(AllocatePtr v) {
       size,
       nullptr,
       nullptr);
-#endif
   // Insert the bitcast into the block.
   irb_.SetInsertPoint(irb_.GetInsertBlock());
   llvm::Value* malloc = irb_.Insert(I);
   varToVal_[v->buffer_var()] = malloc;
+#endif
 }
 
-void LLVMCodeGenImpl::visit(PlacementAllocatePtr v) {
+void LLVMCodeGenImpl::visit(const PlacementAllocatePtr& v) {
   auto buf_to_reuse = v->buf_to_reuse();
   auto buf = v->buf();
 
@@ -2607,7 +2750,7 @@ void LLVMCodeGenImpl::visit(PlacementAllocatePtr v) {
   handleBufReuse(buf, buf_to_reuse);
 }
 
-void LLVMCodeGenImpl::visit(FreePtr v) {
+void LLVMCodeGenImpl::visit(const FreePtr& v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
 
   llvm::Value* ptr = bufsExtToFreeVal_.count(v->buffer_var())
@@ -2616,14 +2759,14 @@ void LLVMCodeGenImpl::visit(FreePtr v) {
 
   if (!llvm::isa<llvm::AllocaInst>(ptr)) {
 #if LLVM_VERSION_MAJOR > 17
-    irb_.Insert(irb_.CreateFree(ptr));
+    irb_.CreateFree(ptr);
 #else
     irb_.Insert(llvm::CallInst::CreateFree(ptr, irb_.GetInsertBlock()));
 #endif
   }
 }
 
-void LLVMCodeGenImpl::visit(FreeExtPtr v) {
+void LLVMCodeGenImpl::visit(const FreeExtPtr& v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
   const auto& bufs = v->bufs();
   const auto bufs_num = bufs.size();
@@ -2684,17 +2827,17 @@ void LLVMCodeGenImpl::visit(FreeExtPtr v) {
   value_ = llvm::ConstantInt::get(IntTy_, 0);
 }
 
-void LLVMCodeGenImpl::visit(LetPtr v) {
+void LLVMCodeGenImpl::visit(const LetPtr& v) {
   v->value()->accept(this);
   if (!varToVal_.count(v->var())) {
     varToVal_.emplace(v->var(), value_);
     scopeToVar_[scope_].push_back(v->var());
   } else {
-    throw std::runtime_error("var should not exist before");
+    TORCH_CHECK(false, "var should not exist before");
   }
 }
 
-void LLVMCodeGenImpl::visit(CondPtr v) {
+void LLVMCodeGenImpl::visit(const CondPtr& v) {
   // Even if true_stmt and false_stmt are nullptr,
   // in case condition is a function call with side effect,
   // we still evaluate it.
@@ -2754,8 +2897,8 @@ void LLVMCodeGenImpl::optimize(llvm::Module& M) {
   // options.
   llvm::PassBuilder PB(&TM);
 
-#if LLVM_VERSION_MAJOR >= 18
-  TM.registerPassBuilderCallbacks(PB, false /* PopulateClassToPassNames */);
+#if LLVM_VERSION_MAJOR >= 18 && LLVM_VERSION_MAJOR < 19
+  TM.registerPassBuilderCallbacks(PB, false);
 #else
   TM.registerPassBuilderCallbacks(PB);
 #endif

@@ -1,13 +1,8 @@
 #include <ATen/native/cuda/fused_adamw_amsgrad_impl.cuh>
 
-#include <ATen/Dispatch.h>
-#include <ATen/native/ForeachUtils.h>
-#include <ATen/native/cuda/MultiTensorApply.cuh>
 #include <ATen/native/cuda/fused_adam_utils.cuh>
-#include <vector>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 void _fused_adamw_amsgrad_cuda_impl_(
     at::TensorList params,
@@ -22,41 +17,24 @@ void _fused_adamw_amsgrad_cuda_impl_(
     const double weight_decay,
     const double eps,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
-  std::vector<std::vector<at::Tensor>> tensor_lists{
-      params.vec(),
-      grads.vec(),
-      exp_avgs.vec(),
-      exp_avg_sqs.vec(),
-      max_exp_avg_sqs.vec()};
-
-  const float* grad_scale_ptr =
-      grad_scale.has_value() ? grad_scale->data_ptr<float>() : nullptr;
-  const float* found_inf_ptr =
-      found_inf.has_value() ? found_inf->data_ptr<float>() : nullptr;
-  const float* lr_ptr = nullptr;
-
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      kHalf,
-      kBFloat16,
-      params[0].scalar_type(),
-      "fused_adamw_kernel_cuda",
-      [&]() {
-        multi_tensor_apply_for_fused_optimizer<5>(
-            tensor_lists,
-            state_steps,
-            FusedAdamMathFunctor<scalar_t, 5, ADAM_MODE::ADAMW, true>(),
-            lr_ptr, // unused
-            lr,
-            beta1,
-            beta2,
-            weight_decay,
-            eps,
-            maximize,
-            grad_scale_ptr,
-            found_inf_ptr);
-      });
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
+  _fused_adam_cuda_impl_common<ADAM_MODE::ADAMW, /*amsgrad=*/true>(
+      params,
+      grads,
+      exp_avgs,
+      exp_avg_sqs,
+      max_exp_avg_sqs,
+      state_steps,
+      /*lr_ptr=*/nullptr,
+      lr,
+      beta1,
+      beta2,
+      weight_decay,
+      eps,
+      maximize,
+      grad_scale,
+      found_inf);
 }
 
 // The following overload simply has a Tensor lr
@@ -73,42 +51,24 @@ void _fused_adamw_amsgrad_cuda_impl_(
     const double weight_decay,
     const double eps,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
-  std::vector<std::vector<at::Tensor>> tensor_lists{
-      params.vec(),
-      grads.vec(),
-      exp_avgs.vec(),
-      exp_avg_sqs.vec(),
-      max_exp_avg_sqs.vec()};
-
-  const float* grad_scale_ptr =
-      grad_scale.has_value() ? grad_scale->data_ptr<float>() : nullptr;
-  const float* found_inf_ptr =
-      found_inf.has_value() ? found_inf->data_ptr<float>() : nullptr;
-  const float* lr_ptr = lr.const_data_ptr<float>();
-
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      kHalf,
-      kBFloat16,
-      params[0].scalar_type(),
-      "fused_adamw_kernel_cuda",
-      [&]() {
-        multi_tensor_apply_for_fused_optimizer<5>(
-            tensor_lists,
-            state_steps,
-            FusedAdamMathFunctor<scalar_t, 5, ADAM_MODE::ADAMW, true>(),
-            lr_ptr,
-            1.0, // unused
-            beta1,
-            beta2,
-            weight_decay,
-            eps,
-            maximize,
-            grad_scale_ptr,
-            found_inf_ptr);
-      });
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
+  _fused_adam_cuda_impl_common<ADAM_MODE::ADAMW, /*amsgrad=*/true>(
+      params,
+      grads,
+      exp_avgs,
+      exp_avg_sqs,
+      max_exp_avg_sqs,
+      state_steps,
+      /*lr_ptr=*/lr.const_data_ptr<float>(),
+      /*lr=*/1.0,
+      beta1,
+      beta2,
+      weight_decay,
+      eps,
+      maximize,
+      grad_scale,
+      found_inf);
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

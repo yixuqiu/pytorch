@@ -1,22 +1,27 @@
 #include <sstream>
 
+#ifndef ROCM_ON_WINDOWS
+#if CUDART_VERSION >= 13000 || defined(TORCH_CUDA_USE_NVTX3)
+#include <nvtx3/nvtx3.hpp>
+#else
 #include <nvToolsExt.h>
-
+#endif
+#else // ROCM_ON_WINDOWS
+#include <c10/util/Exception.h>
+#endif // ROCM_ON_WINDOWS
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/ApproximateClock.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/profiler/stubs/base.h>
 #include <torch/csrc/profiler/util.h>
 
-namespace torch {
-namespace profiler {
-namespace impl {
+namespace torch::profiler::impl {
 namespace {
 
-static inline void cudaCheck(cudaError_t result, const char* file, int line) {
+static void cudaCheck(cudaError_t result, const char* file, int line) {
   if (result != cudaSuccess) {
     std::stringstream ss;
-    ss << file << ":" << line << ": ";
+    ss << file << ':' << line << ": ";
     if (result == cudaErrorInitializationError) {
       // It is common for users to use DataLoader with multiple workers
       // and the autograd profiler. Throw a nice error message here.
@@ -31,7 +36,7 @@ static inline void cudaCheck(cudaError_t result, const char* file, int line) {
     } else {
       ss << cudaGetErrorString(result);
     }
-    throw std::runtime_error(ss.str());
+    TORCH_CHECK(false, std::move(ss).str());
   }
 }
 #define TORCH_CUDA_CHECK(result) cudaCheck(result, __FILE__, __LINE__);
@@ -59,8 +64,8 @@ struct CUDAMethods : public ProfilerStubs {
   float elapsed(
       const ProfilerVoidEventStub* event_,
       const ProfilerVoidEventStub* event2_) const override {
-    auto event = (const ProfilerEventStub*)(event_);
-    auto event2 = (const ProfilerEventStub*)(event2_);
+    auto event = (const ProfilerEventStub*)event_;
+    auto event2 = (const ProfilerEventStub*)event2_;
     TORCH_CUDA_CHECK(cudaEventSynchronize(event->get()));
     TORCH_CUDA_CHECK(cudaEventSynchronize(event2->get()));
     float ms = 0;
@@ -69,6 +74,7 @@ struct CUDAMethods : public ProfilerStubs {
     return ms * 1000.0;
   }
 
+#ifndef ROCM_ON_WINDOWS
   void mark(const char* name) const override {
     ::nvtxMark(name);
   }
@@ -80,6 +86,20 @@ struct CUDAMethods : public ProfilerStubs {
   void rangePop() const override {
     ::nvtxRangePop();
   }
+#else // ROCM_ON_WINDOWS
+  static void printUnavailableWarning() {
+    TORCH_WARN_ONCE("Warning: roctracer isn't available on Windows");
+  }
+  void mark(const char* name) const override {
+    printUnavailableWarning();
+  }
+  void rangePush(const char* name) const override {
+    printUnavailableWarning();
+  }
+  void rangePop() const override {
+    printUnavailableWarning();
+  }
+#endif
 
   void onEachDevice(std::function<void(int)> op) const override {
     at::cuda::OptionalCUDAGuard device_guard;
@@ -107,6 +127,4 @@ struct RegisterCUDAMethods {
 RegisterCUDAMethods reg;
 
 } // namespace
-} // namespace impl
-} // namespace profiler
-} // namespace torch
+} // namespace torch::profiler::impl

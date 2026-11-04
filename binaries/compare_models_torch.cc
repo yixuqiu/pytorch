@@ -26,6 +26,7 @@
 #include <torch/script.h>
 
 #include <c10/mobile/CPUCachingAllocator.h>
+#include <c10/util/irange.h>
 
 C10_DEFINE_string(
     refmodel,
@@ -244,7 +245,7 @@ void run_check(float tolerance) {
   std::cout << "Running check on thread " << this_id << "." << std::endl;
 
   int passed = 0;
-  for (int i = 0; i < FLAGS_iter; ++i) {
+  for (const auto i : c10::irange(FLAGS_iter)) {
     std::vector<c10::IValue> refinputs;
     std::vector<c10::IValue> inputs;
     create_inputs(
@@ -305,14 +306,14 @@ int main(int argc, char** argv) {
   torch::jit::GraphOptimizerEnabledGuard no_optimizer_guard(false);
 
   c10::CPUCachingAllocator caching_allocator;
-  c10::optional<c10::WithCPUCachingAllocatorGuard> caching_allocator_guard;
+  std::optional<c10::WithCPUCachingAllocatorGuard> caching_allocator_guard;
   if (FLAGS_use_caching_allocator) {
     caching_allocator_guard.emplace(&caching_allocator);
   }
 
   std::vector<std::thread> check_threads;
   check_threads.reserve(FLAGS_nthreads);
-  for (int i = 0; i < FLAGS_nthreads; ++i) {
+  for ([[maybe_unused]] const auto _ : c10::irange(FLAGS_nthreads)) {
     check_threads.emplace_back(std::thread(run_check, tolerance));
   }
 

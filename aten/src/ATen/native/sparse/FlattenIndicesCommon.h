@@ -6,6 +6,7 @@
 #include <ATen/native/sparse/Macros.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/native/SparseTensorUtils.h>
+#include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -48,10 +49,9 @@ Tensor _flatten_indices_impl(const Tensor& indices, IntArrayRef size) {
   const auto hash_coeffs = std::get<0>(*hash_coeffs_storage);
 
   const auto hash_indices = [&]() -> Tensor {
-    // non-const because of gcc-5/clang-5 issues
-    auto sparse_dim = indices.size(0);
-    auto indices_dim_stride = indices.stride(0);
-    auto indices_nnz_stride = indices.stride(1);
+    const auto sparse_dim = indices.size(0);
+    const auto indices_dim_stride = indices.stride(0);
+    const auto indices_nnz_stride = indices.stride(1);
 
     auto hash = at::arange(indices.size(1), indices.options().dtype(kLong));
 
@@ -69,7 +69,7 @@ Tensor _flatten_indices_impl(const Tensor& indices, IntArrayRef size) {
           [=] FUNCAPI (int64_t nnz_idx) -> int64_t {
           const auto* RESTRICT ptr_indices_dim = ptr_indices + nnz_idx * indices_nnz_stride;
           auto hash = static_cast<int64_t>(0);
-          for (int64_t dim = 0; dim < sparse_dim; ++dim) {
+          for (const auto dim : c10::irange(sparse_dim)) {
             const auto dim_hash_coeff = hash_coeffs[dim];
             const auto dim_index = ptr_indices_dim[dim * indices_dim_stride];
             hash += dim_index * dim_hash_coeff;

@@ -35,8 +35,7 @@ constexpr bool kKinetoAvailable{true};
 constexpr bool kKinetoAvailable{false};
 #endif
 
-namespace impl {
-namespace kineto {
+namespace impl::kineto {
 
 // ----------------------------------------------------------------------------
 // -- Interface (Does not require Kineto) -------------------------------------
@@ -63,14 +62,12 @@ struct activity_t;
 void addMetadata(
     activity_t* activity,
     const std::string& key,
-    const std::string& value);
+    const std::string& value,
+    bool quote = false);
 
 // Wraps: libkineto::CpuTraceBuffer
 struct TraceWrapper {
   TraceWrapper(const int64_t start_time, const std::string& name);
-  TraceWrapper(TraceWrapper&&) = default;
-  TraceWrapper(const TraceWrapper&) = delete;
-  ~TraceWrapper();
 
   // The caller is expected to hold a mutex when calling `addCPUActivity`.
   activity_t* addCPUActivity(
@@ -97,8 +94,6 @@ struct TraceWrapper {
 struct ActivityTraceWrapper {
   explicit ActivityTraceWrapper(std::unique_ptr<interface_trace_t>&& trace);
   ActivityTraceWrapper() = default;
-  ActivityTraceWrapper(ActivityTraceWrapper&&) = default;
-  ActivityTraceWrapper(const ActivityTraceWrapper&) = delete;
   explicit operator bool() const;
   void save(const std::string& path);
 
@@ -114,10 +109,19 @@ struct ActivityTraceWrapper {
 };
 
 using ActivitySet = std::set<torch::autograd::profiler::ActivityType>;
-void prepareTrace(
+using ActivityFilter = std::unordered_map<
+    torch::autograd::profiler::ActivityType,
+    std::unordered_set<std::string>>;
+using ProfilerExtensionMap = std::unordered_map<std::string, std::string>;
+TORCH_API void prepareTrace(
     const bool cpuOnly,
     const ActivitySet& activities,
-    const torch::profiler::impl::ExperimentalConfig& config);
+    const torch::profiler::impl::ExperimentalConfig& config,
+    const std::string& trace_id = "",
+    const ActivityFilter& activity_filter = {},
+    const ProfilerExtensionMap& profiler_extensions = {});
+
+void toggleCollectionDynamic(const bool enable);
 void startTrace();
 ActivityTraceWrapper stopTrace();
 void pushCorrelationId(uint64_t correlation_id);
@@ -133,12 +137,11 @@ void logInvariantViolation(
     const std::string& profile_id,
     const std::string& group_profile_id);
 
-} // namespace kineto
-} // namespace impl
+} // namespace impl::kineto
+
 } // namespace profiler
 
-namespace autograd {
-namespace profiler {
+namespace autograd::profiler {
 c10::DeviceType deviceTypeFromActivity(libkineto::ActivityType activity_type);
 
 TORCH_API void addMetadataJson(
@@ -147,6 +150,8 @@ TORCH_API void addMetadataJson(
 
 TORCH_API void profilerStep();
 
-} // namespace profiler
-} // namespace autograd
+TORCH_API bool isKinetoStopped();
+
+} // namespace autograd::profiler
+
 } // namespace torch

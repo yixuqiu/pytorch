@@ -1,19 +1,35 @@
+#pragma once
 #include <ATen/core/Tensor.h>
 #include <ATen/Config.h>
 #include <cstdint>
 
 #ifdef USE_FBGEMM
 #include <fbgemm/FbgemmEmbedding.h>
+#include <fbgemm/Types.h>
 #endif
 
 namespace at::native {
+
+enum class EmbeddingBagMode {
+  SUM = 0,
+  MEAN = 1,
+  MAX = 2,
+};
+
+[[maybe_unused]] static bool operator==(int64_t op1, EmbeddingBagMode op2) {
+  return op1 == static_cast<int64_t>(op2);
+}
+
+[[maybe_unused]] static bool operator!=(int64_t op1, EmbeddingBagMode op2) {
+  return !(op1 == op2);
+}
 
 void check_arguments(
     const Tensor& weight,
     const Tensor& indices,
     const Tensor& offsets,
     const int64_t mode,
-    const c10::optional<Tensor>& per_sample_weights,
+    const std::optional<Tensor>& per_sample_weights,
     bool include_last_offset);
 
 void make_bag_size_out(
@@ -40,12 +56,12 @@ void make_offset2bag_out(
     const Tensor& indices,
     const Tensor& offsets,
     const int64_t mode,
-    const c10::optional<Tensor>& per_sample_weights,
+    const std::optional<Tensor>& per_sample_weights,
     const int64_t padding_idx = -1);
 
 #ifdef USE_FBGEMM
 
-template<bool has_weight, typename TIndex, typename TData>
+template<bool has_weight, typename TIndex, typename TData, bool is_bf16>
 struct _CallbackAndBlockSize {
     using TCallback = typename fbgemm::EmbeddingSpMDMKernelSignature<TData, TIndex, TIndex, TData>::Type;
 
@@ -53,18 +69,32 @@ struct _CallbackAndBlockSize {
     TCallback callback = nullptr;
 
     static TCallback generateCallback(int64_t block_size) {
-        return fbgemm::GenerateEmbeddingSpMDM<TData, TIndex, TIndex, TData>(
+        // The pinned FBGEMM API aliases both half types to uint16_t, so the
+        // format flag remains necessary until its typed API is available.
+        if constexpr (std::is_same_v<TData, uint16_t>) {
+            return fbgemm::GenerateEmbeddingSpMDM<TData, TIndex, TIndex, TData>(
+                block_size,
+                has_weight,
+                /* normalize_by_lengths */false,
+                /* prefetch */16,
+                /* is_weight_positional */false,
+                /* use_offsets */true,
+                /* is_bf16_out */is_bf16,
+                /* is_bf16_in */is_bf16);
+        } else {
+            return fbgemm::GenerateEmbeddingSpMDM<TData, TIndex, TIndex, TData>(
                 block_size,
                 has_weight,
                 /* normalize_by_lengths */false,
                 /* prefetch */16,
                 /* is_weight_positional */false,
                 /* use_offsets */true);
+        }
     }
 
     _CallbackAndBlockSize() = default;
 
-    explicit _CallbackAndBlockSize(c10::optional<int64_t> maybe_block_size)
+    explicit _CallbackAndBlockSize(std::optional<int64_t> maybe_block_size)
       : blockSize(maybe_block_size.value_or(-1))
       , callback(maybe_block_size.has_value() ? generateCallback(maybe_block_size.value()) : nullptr)
     {}
@@ -75,39 +105,42 @@ struct _EmbeddingBagKernelCacheImpl : private StorageMixins... {
 
     _EmbeddingBagKernelCacheImpl() = default;
     // use each of the mixins to store corresponding kernel and block size
-    explicit _EmbeddingBagKernelCacheImpl(c10::optional<int64_t> maybe_block_size)
+    explicit _EmbeddingBagKernelCacheImpl(std::optional<int64_t> maybe_block_size)
       : StorageMixins(maybe_block_size)...
     {}
 
     // this method is thread safe (call sites may call from different threads)
-    template<bool has_weight, typename TIndex, typename TData>
-    typename _CallbackAndBlockSize<has_weight, TIndex, TData>::TCallback
+    template<bool has_weight, typename TIndex, typename TData, bool is_bf16>
+    typename _CallbackAndBlockSize<has_weight, TIndex, TData, is_bf16>::TCallback
     getCallback(int64_t block_size) const {
         // if the cache doesn't store the kernel for the incoming block size
         // (so it is different from the one stored in corresponding mixin)
         // regenerate the kernel (not writing it into the cache so we avoid locks)
-        if (block_size != _CallbackAndBlockSize<has_weight, TIndex, TData>::blockSize) {
-            return _CallbackAndBlockSize<has_weight, TIndex, TData>::generateCallback(block_size);
+        if (block_size != _CallbackAndBlockSize<has_weight, TIndex, TData, is_bf16>::blockSize) {
+            return _CallbackAndBlockSize<has_weight, TIndex, TData, is_bf16>::generateCallback(block_size);
         }
         // else retrieve the cached kernel from the corresponding mixin
-        return _CallbackAndBlockSize<has_weight, TIndex, TData>::callback;
+        return _CallbackAndBlockSize<has_weight, TIndex, TData, is_bf16>::callback;
     }
 };
 
-// instantiate the cache with the list of storage mixins
-// for each of the 8 _EmbeddingBagKernelCache* usages in the EmbeddingBag.cpp impl file
+// Instantiate the cache with the storage mixins used in EmbeddingBag.cpp.
 using _EmbeddingBagKernelCache = _EmbeddingBagKernelCacheImpl<
-    _CallbackAndBlockSize<true, int32_t, float>,
-    _CallbackAndBlockSize<false, int32_t, float>,
-    _CallbackAndBlockSize<true, int64_t, float>,
-    _CallbackAndBlockSize<false, int64_t, float>,
-    _CallbackAndBlockSize<true, int32_t, unsigned short>,
-    _CallbackAndBlockSize<false, int32_t, unsigned short>,
-    _CallbackAndBlockSize<true, int64_t, unsigned short>,
-    _CallbackAndBlockSize<false, int64_t, unsigned short>>;
+    _CallbackAndBlockSize<true, int32_t, float, false>,
+    _CallbackAndBlockSize<false, int32_t, float, false>,
+    _CallbackAndBlockSize<true, int64_t, float, false>,
+    _CallbackAndBlockSize<false, int64_t, float, false>,
+    _CallbackAndBlockSize<true, int32_t, fbgemm::float16, false>,
+    _CallbackAndBlockSize<false, int32_t, fbgemm::float16, false>,
+    _CallbackAndBlockSize<true, int64_t, fbgemm::float16, false>,
+    _CallbackAndBlockSize<false, int64_t, fbgemm::float16, false>,
+    _CallbackAndBlockSize<true, int32_t, fbgemm::bfloat16, true>,
+    _CallbackAndBlockSize<false, int32_t, fbgemm::bfloat16, true>,
+    _CallbackAndBlockSize<true, int64_t, fbgemm::bfloat16, true>,
+    _CallbackAndBlockSize<false, int64_t, fbgemm::bfloat16, true>>;
 #else
 struct _EmbeddingBagKernelCache {
-    explicit _EmbeddingBagKernelCache(c10::optional<int64_t> /* maybe_block_size */) {}
+    explicit _EmbeddingBagKernelCache(std::optional<int64_t> /* maybe_block_size */) {}
 };
 #endif
 
@@ -115,7 +148,7 @@ void _embedding_bag_cpu_impl_out(Tensor& output, Tensor& offset2bag,
     Tensor& bag_size, Tensor* max_indices,
     const Tensor &weight, const Tensor &indices,
     const Tensor &offsets, const int64_t mode = 0,
-    const c10::optional<Tensor>& per_sample_weights = c10::nullopt,
+    const std::optional<Tensor>& per_sample_weights = std::nullopt,
     bool include_last_offset = false,
     int64_t padding_idx = -1,
     _EmbeddingBagKernelCache* fbgemm_kernel_cache = nullptr);
@@ -131,9 +164,9 @@ void _embedding_bag_cpu_out(
     const bool scale_grad_by_freq,
     const int64_t mode,
     const bool sparse,
-    const c10::optional<at::Tensor>& per_sample_weights,
+    const std::optional<at::Tensor>& per_sample_weights,
     const bool include_last_offset,
-    const c10::optional<int64_t>& padding_idx,
+    const std::optional<int64_t>& padding_idx,
     _EmbeddingBagKernelCache* fbgemm_kernel_cache = nullptr);
 
 } // namespace at::native

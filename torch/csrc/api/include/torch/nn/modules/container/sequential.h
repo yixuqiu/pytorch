@@ -9,6 +9,7 @@
 #include <torch/types.h>
 
 #include <c10/util/Exception.h>
+#include <c10/util/irange.h>
 
 #include <cstdint>
 #include <memory>
@@ -18,8 +19,7 @@
 #include <utility>
 #include <vector>
 
-namespace torch {
-namespace nn {
+namespace torch::nn {
 
 /// A list of `Module`s that acts as a `Module` itself.
 ///
@@ -125,10 +125,14 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
   /// Special cloning function for `Sequential` because it does not use
   /// `reset()`.
   std::shared_ptr<Module> clone(
-      const optional<Device>& device = nullopt) const override {
+      const std::optional<Device>& device = std::nullopt) const override {
     auto clone = std::make_shared<SequentialImpl>();
-    for (const auto& module : modules_) {
-      clone->push_back(module.clone(device));
+    // Submodule names live in the registered children, not in `modules_`.
+    // Pushing the clones back unnamed would renumber them 0..N-1 and silently
+    // rewrite the state_dict keys of any `Sequential` built with names.
+    std::vector<std::string> names = named_children().keys();
+    for (const auto i : c10::irange(modules_.size())) {
+      clone->push_back(std::move(names[i]), modules_[i].clone(device));
     }
     return clone;
   }
@@ -185,7 +189,8 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
     if (auto* return_value = input.template try_get<ReturnType>()) {
       return std::move(*return_value);
     }
-    AT_ERROR(
+    TORCH_CHECK(
+        false,
         "The type of the return value is ",
         c10::demangle(input.type_info().name()),
         ", but you asked for type ",
@@ -195,7 +200,7 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
   /// Adds a new (boxed) `Module` to the `Sequential` container.
   template <typename ModuleType>
   void push_back(std::shared_ptr<ModuleType> module_ptr) {
-    push_back(c10::to_string(modules_.size()), std::move(module_ptr));
+    push_back(std::to_string(modules_.size()), std::move(module_ptr));
   }
 
   /// Adds a new named (boxed) `Module` to the `Sequential` container.
@@ -211,7 +216,7 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
   /// `Sequential(std::make_shared<Module>(3, 4))`.
   template <typename M, typename = torch::detail::enable_if_module_t<M>>
   void push_back(M&& module) {
-    push_back(c10::to_string(modules_.size()), std::forward<M>(module));
+    push_back(std::to_string(modules_.size()), std::forward<M>(module));
   }
 
   /// Adds a new named `Module` to the `Sequential` container, moving or copying
@@ -219,7 +224,7 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
   /// and letting the container deal with the boxing.
   template <typename M, typename = torch::detail::enable_if_module_t<M>>
   void push_back(std::string name, M&& module) {
-    using Type = typename std::remove_reference<M>::type;
+    using Type = typename std::remove_reference_t<M>;
     push_back(std::move(name), std::make_shared<Type>(std::forward<M>(module)));
   }
 
@@ -227,7 +232,7 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
   /// `Sequential`.
   template <typename M>
   void push_back(const ModuleHolder<M>& module_holder) {
-    push_back(c10::to_string(modules_.size()), module_holder);
+    push_back(std::to_string(modules_.size()), module_holder);
   }
 
   /// Unwraps the contained named module of a `ModuleHolder` and adds it to the
@@ -247,7 +252,7 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
 
   /// Adds a type-erased `AnyModule` to the `Sequential`.
   void push_back(AnyModule any_module) {
-    push_back(c10::to_string(modules_.size()), std::move(any_module));
+    push_back(std::to_string(modules_.size()), std::move(any_module));
   }
 
   void push_back(std::string name, AnyModule any_module) {
@@ -348,12 +353,10 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
       typename First,
       typename Second,
       typename... Rest,
-      typename = torch::disable_if_t<
-          std::is_same<First, std::string>::value ||
+      typename = std::enable_if_t<
+          !std::is_same_v<First, std::string> &&
           // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
-          std::is_same<
-              typename std::decay<First>::type,
-              std::decay<const char (&)[]>::type>::value>>
+          !std::is_same_v<std::decay_t<First>, std::decay_t<const char (&)[]>>>>
   void push_back(First&& first, Second&& second, Rest&&... rest) {
     push_back(std::forward<First>(first));
     // Recursively calls this method, until the parameter pack only thas this
@@ -378,7 +381,7 @@ class Sequential : public torch::nn::ModuleHolder<SequentialImpl> {
  public:
   using torch::nn::ModuleHolder<SequentialImpl>::ModuleHolder;
 
-  Sequential() : ModuleHolder() {}
+  Sequential() = default;
 
   /// Constructs the `Sequential` from a braced-init-list of named `AnyModule`s.
   /// It enables the following use case:
@@ -386,5 +389,4 @@ class Sequential : public torch::nn::ModuleHolder<SequentialImpl> {
   Sequential(std::initializer_list<NamedAnyModule> named_modules)
       : ModuleHolder(std::make_shared<SequentialImpl>(named_modules)) {}
 };
-} // namespace nn
-} // namespace torch
+} // namespace torch::nn

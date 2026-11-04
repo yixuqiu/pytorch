@@ -1,11 +1,12 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/Context.h>
-#include <ATen/NamedTensorUtils.h>
+#include <ATen/WrapDimUtils.h>
 #include <ATen/native/quantized/cpu/init_qnnpack.h>
 #include <ATen/native/quantized/cpu/QuantizedOps.h>
 #include <ATen/native/quantized/cpu/QnnpackUtils.h>
 #include <caffe2/utils/threadpool/pthreadpool-cpp.h>
+#include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -20,14 +21,13 @@
 #include <ATen/ops/zeros_like_ops.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 DEFINE_DISPATCH(qmean_inner_dim_stub);
 DEFINE_DISPATCH(qstd_inner_dim_stub);
 
 // If mean/std is taken in the innermost dims, the fast path can be used.
-inline bool is_innnermost_dim(
+static inline bool is_innnermost_dim(
     const Tensor& self,
     OptionalIntArrayRef opt_dim) {
   if (!opt_dim.has_value()) {
@@ -38,16 +38,16 @@ inline bool is_innnermost_dim(
   maybe_wrap_dims(dims, ndim);
   std::sort(dims.begin(), dims.end(), std::greater<int64_t>());
   bool is_innermost = dims.empty() || dims[0] == ndim - 1;
-  for (size_t i = 1; i < dims.size(); ++i) {
+  for (const auto i : c10::irange(1, dims.size())) {
     is_innermost = is_innermost && (dims[i] == dims[i-1] - 1);
   }
   return is_innermost;
 }
 
-inline bool is_mean_inner_dim_fast_path(
+static inline bool is_mean_inner_dim_fast_path(
     const Tensor& self,
     OptionalIntArrayRef opt_dim,
-    c10::optional<ScalarType> opt_dtype) {
+    std::optional<ScalarType> opt_dtype) {
   bool is_fast_path =
       is_innnermost_dim(self, opt_dim) &&
       (!opt_dtype.has_value() || opt_dtype.value() == self.scalar_type());
@@ -111,9 +111,9 @@ static Tensor qnnpack_mean(const Tensor& input, IntArrayRef dim, bool keepdim) {
           qnnpack_operator,
           batch_size,
           inH * inW,
-          (uint8_t*)input_contig.data_ptr<c10::quint8>() /* input data */,
+          reinterpret_cast<const uint8_t*>(input_contig.const_data_ptr<c10::quint8>()) /* input data */,
           inC,
-          (uint8_t*)output.data_ptr<c10::quint8>() /* output data */,
+          reinterpret_cast<uint8_t*>(output.mutable_data_ptr<c10::quint8>()) /* output data */,
           outC);
   CAFFE_ENFORCE(
       setupStatus == pytorch_qnnp_status_success,
@@ -131,7 +131,7 @@ Tensor& mean_out_quantized_cpu(
     const Tensor& self,
     OptionalIntArrayRef opt_dim,
     bool keepdim,
-    c10::optional<ScalarType> opt_dtype,
+    std::optional<ScalarType> opt_dtype,
     Tensor& result) {
 #ifdef USE_PYTORCH_QNNPACK
   if (at::globalContext().qEngine() == at::QEngine::QNNPACK &&
@@ -166,27 +166,17 @@ Tensor mean_quantized_cpu(
     const Tensor& self,
     OptionalIntArrayRef opt_dim,
     bool keepdim,
-    optional<ScalarType> dtype) {
+    std::optional<ScalarType> dtype) {
   Tensor result;
   mean_out_quantized_cpu(self, opt_dim, keepdim, dtype, result);
   return result;
 }
 
-static Tensor& mean_out_quantized_cpu(
-    Tensor& result,
-    const Tensor& self,
-    DimnameList dim,
-    bool keepdim,
-    c10::optional<ScalarType> opt_dtype) {
-  return mean_out_quantized_cpu(
-      self, dimnames_to_positions(self, dim), keepdim, opt_dtype, result);
-}
-
 // qstd
-inline bool is_std_inner_dim_fast_path(
+static inline bool is_std_inner_dim_fast_path(
     const Tensor& self,
     OptionalIntArrayRef dim,
-    const c10::optional<Scalar>& correction) {
+    const std::optional<Scalar>& correction) {
   // Do not enter fast path if there are too few elements
   IntArrayRef dims = dim.has_value() ? dim.value() : IntArrayRef();
   auto all_dims = std::vector<int64_t>(self.dim());
@@ -206,7 +196,7 @@ inline bool is_std_inner_dim_fast_path(
 Tensor& std_out_quantized_cpu(
     const Tensor& self,
     OptionalIntArrayRef dim,
-    const c10::optional<Scalar>& correction,
+    const std::optional<Scalar>& correction,
     bool keepdim,
     Tensor& result) {
   // Fast path
@@ -230,31 +220,11 @@ Tensor& std_out_quantized_cpu(
 Tensor std_quantized_cpu(
     const Tensor& self,
     OptionalIntArrayRef dim,
-    const c10::optional<Scalar>& correction,
+    const std::optional<Scalar>& correction,
     bool keepdim) {
   Tensor result;
   std_out_quantized_cpu(self, dim, correction, keepdim, result);
   return result;
 }
 
-static Tensor std_quantized_cpu(
-    const Tensor& self,
-    DimnameList dim,
-    const c10::optional<Scalar>& correction,
-    bool keepdim) {
-  return std_quantized_cpu(
-      self, dimnames_to_positions(self, dim), correction, keepdim);
-}
-
-static Tensor& std_out_quantized_cpu(
-    Tensor& result,
-    const Tensor& self,
-    DimnameList dim,
-    const c10::optional<Scalar>& correction,
-    bool keepdim) {
-  return std_out_quantized_cpu(
-      self, dimnames_to_positions(self, dim), correction, keepdim, result);
-}
-
-} // namespace native
-} // namespace at
+} // namespace at::native

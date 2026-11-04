@@ -60,16 +60,14 @@ const std::array<at::Tag, 1> kJitOnlyOperatorTags = {
 // the concrete operator nature.
 struct TORCH_API Operator {
  private:
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   struct C10Operator final {
     c10::OperatorHandle handle_;
     Operation op_;
   };
   struct UnparsedFunctionSchema final {
     std::string schema_string_;
-    mutable c10::optional<c10::AliasAnalysisKind> alias_analysis_;
+    mutable std::optional<c10::AliasAnalysisKind> alias_analysis_;
   };
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   struct JitOnlyOperator final {
     // The only valid transition for schema_ is from right->left, i.e.
     // when the schema gets parsed.
@@ -115,7 +113,7 @@ struct TORCH_API Operator {
             op_creator}) {}
 
   // Helper constructor to register `op` to run
-  // run for _every_ IR Node where n.kind() == name, regardless of arguments.
+  // for _every_ IR Node where n.kind() == name, regardless of arguments.
   // This is accomplished by marking the schema varargs and having no required
   // arguments.
   Operator(
@@ -269,8 +267,8 @@ TORCH_API const std::vector<std::shared_ptr<Operator>>& getAllOperatorsFor(
 TORCH_API std::vector<std::shared_ptr<Operator>> getAllSortedOperatorsFor(
     Symbol name);
 
-// given a operator with an overload name, find the specific operator related to
-// it, may return nullptr if no operator exists.
+// given an operator with an overload name, find the specific operator related
+// to it, may return nullptr if no operator exists.
 TORCH_API std::shared_ptr<Operator> findOperatorFor(
     const c10::OperatorName& full_name);
 
@@ -298,16 +296,16 @@ TORCH_API bool aliasAnalysisHasSpecialCaseFor(c10::Symbol sym);
 // compile-time function for the selective op registration based on schema
 // string.
 template <typename Func>
-c10::optional<Operator> OperatorGenerator(
+std::optional<Operator> OperatorGenerator(
     const char* schema_str,
     Func&& op,
     AliasAnalysisKind alias_analysis) {
-  return c10::optional<Operator>(Operator(
+  return std::optional<Operator>(Operator(
       std::string(schema_str), std::forward<Func>(op), alias_analysis));
 }
 
 template <typename Func>
-c10::optional<Operator> OperatorGenerator(
+std::optional<Operator> OperatorGenerator(
     torch::detail::SelectiveStr<true> schema_str,
     Func&& op,
     AliasAnalysisKind alias_analysis) {
@@ -318,22 +316,22 @@ c10::optional<Operator> OperatorGenerator(
 }
 
 template <typename Func>
-c10::optional<Operator> OperatorGenerator(
+std::optional<Operator> OperatorGenerator(
     torch::detail::SelectiveStr<false> schema_str,
     Func&& op,
     AliasAnalysisKind alias_analysis) {
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 template <typename Func>
-c10::optional<Operator> OperatorGenerator(
+std::optional<Operator> OperatorGenerator(
     const std::string name,
     const std::string overload_name,
     const std::vector<c10::Argument> arguments,
     const std::vector<c10::Argument> returns,
     Func&& op,
     AliasAnalysisKind alias_analysis) {
-  return c10::optional<Operator>(Operator(
+  return std::optional<Operator>(Operator(
       name,
       overload_name,
       arguments,

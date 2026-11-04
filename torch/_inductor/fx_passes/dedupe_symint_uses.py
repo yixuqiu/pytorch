@@ -1,8 +1,11 @@
+# mypy: allow-untyped-defs
 from dataclasses import dataclass
-from typing import Union
+from typing import Any
 
 import torch
-from torch.fx.experimental.proxy_tensor import py_sym_types, SymBool, SymFloat, SymInt
+from torch import SymBool, SymFloat, SymInt
+from torch.types import py_sym_types
+from torch.utils._ordered_set import OrderedSet
 
 
 @dataclass
@@ -11,7 +14,7 @@ class _SymExprHash:
     Hash for a py_sym_types that will use the underlying sympy expression
     """
 
-    sym_obj: Union[SymInt, SymFloat, SymBool]
+    sym_obj: SymInt | SymFloat | SymBool
 
     def __hash__(self) -> int:
         return hash((type(self.sym_obj), self.sym_obj.node.expr))
@@ -60,7 +63,7 @@ def dedupe_symints(graph: torch.fx.Graph):
     """
 
     sym_dict = _SymHashingDict()
-    resolvable_from_input_symints = set()
+    resolvable_from_input_symints = OrderedSet[Any]()
 
     for node in graph.nodes:
         val = node.meta.get("val", None)

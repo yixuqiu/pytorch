@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 r"""
 Module ``torch.distributed.launch``.
 
@@ -102,7 +103,7 @@ or
 
 .. versionchanged:: 2.0.0
 
-    The launcher will passes the ``--local-rank=<rank>`` argument to your script.
+    The launcher will pass the ``--local-rank=<rank>`` argument to your script.
     From PyTorch 2.0.0 onwards, the dashed ``--local-rank`` is preferred over the
     previously used underscored ``--local_rank``.
 
@@ -159,7 +160,7 @@ will not pass ``--local-rank`` when you specify this flag.
 
 """
 
-import warnings
+from typing_extensions import deprecated as _deprecated
 
 from torch.distributed.run import get_args_parser, run
 
@@ -182,23 +183,22 @@ def parse_args(args):
 def launch(args):
     if args.no_python and not args.use_env:
         raise ValueError(
-            "When using the '--no-python' flag,"
-            " you must also set the '--use-env' flag."
+            "When using the '--no-python' flag, you must also set the '--use-env' flag."
         )
     run(args)
 
 
+@_deprecated(
+    "The module torch.distributed.launch is deprecated\n"
+    "and will be removed in future. Use torchrun.\n"
+    "Note that --use-env is set by default in torchrun.\n"
+    "If your script expects `--local-rank` argument to be set, please\n"
+    "change it to read from `os.environ['LOCAL_RANK']` instead. See \n"
+    "https://pytorch.org/docs/stable/distributed.html#launch-utility for \n"
+    "further instructions\n",
+    category=FutureWarning,
+)
 def main(args=None):
-    warnings.warn(
-        "The module torch.distributed.launch is deprecated\n"
-        "and will be removed in future. Use torchrun.\n"
-        "Note that --use-env is set by default in torchrun.\n"
-        "If your script expects `--local-rank` argument to be set, please\n"
-        "change it to read from `os.environ['LOCAL_RANK']` instead. See \n"
-        "https://pytorch.org/docs/stable/distributed.html#launch-utility for \n"
-        "further instructions\n",
-        FutureWarning,
-    )
     args = parse_args(args)
     launch(args)
 

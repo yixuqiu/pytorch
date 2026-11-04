@@ -8,7 +8,9 @@
 #include <ATen/cuda/CUDAUtils.h>
 #include <ATen/Dispatch.h>
 
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
+#include <utility>
+
+#if defined(USE_ROCM) || defined(_MSC_VER)
 #else
 #include <ATen/native/sparse/cuda/ComputeSparseTile.h>
 #include <ATen/native/sparse/cuda/SparseSemiStructuredPack.h>
@@ -17,7 +19,7 @@
 
 namespace at::native {
 
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
+#if defined(USE_ROCM) || defined(_MSC_VER)
 #else
 struct MetadataCuSparseLt {
   // Format used by cuSparseLt
@@ -59,7 +61,7 @@ struct MetadataCuSparseLt {
     // TODO: Cast metadata to Short
     static_assert(kBytesPerScalar == 2, "or modify the last dim below");
     metadata = metadata.view({rows / 128, cols / 32, 256});
-    return std::make_tuple(storage, packed, metadata);
+    return std::make_tuple(std::move(storage), std::move(packed), std::move(metadata));
   }
 
   MetadataCuSparseLt(at::Tensor metaN, at::Tensor metaT, int rows, int cols) {
@@ -140,7 +142,9 @@ struct MetadataCutlass {
                                  like.options().dtype(at::ScalarType::Short))
                                  .view({roundedy / 32, roundedx, 2})
                                  .permute({1, 2, 0});
-    return std::make_tuple(packed, packed, packed_meta);
+    auto packed_copy = packed;
+    return std::make_tuple(
+        std::move(packed), std::move(packed_copy), std::move(packed_meta));
   }
   MetadataCutlass(at::Tensor metaN, at::Tensor metaT, int rows, int cols) {
     _meta = (ElementInputE*)metaN.data_ptr();
@@ -207,7 +211,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> sparse_semi_structured_tile_t
         std::string algorithm)
 {
   using KT = KernelTypes<Element>;
-  c10::optional<at::cuda::CUDAGuard> device_guard;
+  std::optional<at::cuda::CUDAGuard> device_guard;
   if (!input.is_meta()) {
     device_guard.emplace(input.device());
   }
@@ -277,11 +281,11 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> sparse_semi_structured_tile_t
 // <packed, packed_meta_reordered, packed_trans, packed_trans_meta_reorderd, threads_masks>
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _sparse_semi_structured_tile(
   const Tensor& input,
-  c10::string_view algorithm,
+  std::string_view algorithm,
   bool use_cutlass)
 {
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
-  AT_ERROR("_sparse_semi_structured_tile: not supported");
+#if defined(USE_ROCM) || defined(_MSC_VER)
+  TORCH_CHECK(false, "_sparse_semi_structured_tile: not supported");
   return std::make_tuple(Tensor{}, Tensor{}, Tensor{}, Tensor{}, Tensor{});
 #else
   std::string algo(algorithm.data(), algorithm.size());

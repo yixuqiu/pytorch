@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 # Owner(s): ["module: unknown"]
 
 import threading
@@ -23,6 +24,7 @@ class TestFuture(TestCase):
 
         f = Future[T]()  # type: ignore[valid-type]
         # Set exception
+        # pyrefly: ignore [bad-argument-type]
         f.set_exception(value_error)
         # Exception should throw on wait
         with self.assertRaisesRegex(ValueError, "Intentional"):
@@ -30,6 +32,7 @@ class TestFuture(TestCase):
 
         # Exception should also throw on value
         f = Future[T]()  # type: ignore[valid-type]
+        # pyrefly: ignore [bad-argument-type]
         f.set_exception(value_error)
         with self.assertRaisesRegex(ValueError, "Intentional"):
             f.value()
@@ -38,6 +41,7 @@ class TestFuture(TestCase):
             fut.value()
 
         f = Future[T]()  # type: ignore[valid-type]
+        # pyrefly: ignore [bad-argument-type]
         f.set_exception(value_error)
 
         with self.assertRaisesRegex(RuntimeError, "Got the following error"):
@@ -57,6 +61,7 @@ class TestFuture(TestCase):
         f = Future[T]()  # type: ignore[valid-type]
         t = threading.Thread(target=wait_future, args=(f, ))
         t.start()
+        # pyrefly: ignore [bad-argument-type]
         f.set_exception(value_error)
         t.join()
 
@@ -71,6 +76,7 @@ class TestFuture(TestCase):
         f = Future[T]()  # type: ignore[valid-type]
         t = threading.Thread(target=then_future, args=(f, ))
         t.start()
+        # pyrefly: ignore [bad-argument-type]
         f.set_exception(value_error)
         t.join()
 

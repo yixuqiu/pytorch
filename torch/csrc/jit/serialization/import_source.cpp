@@ -53,7 +53,7 @@ struct TORCH_API ClassNamespaceValue : public SugaredValue {
 };
 
 // This value maps attributes CONSTANTS.c0 CONSTANTS.c1 to entries
-// in the 'constants' vector. This table is will be stored in a container format
+// in the 'constants' vector. This table will be stored in a container format
 // and given to the import_method when restoring the code.
 struct ConstantTableValue : public SugaredValue {
   explicit ConstantTableValue(const std::vector<at::IValue>* constants)
@@ -67,24 +67,23 @@ struct ConstantTableValue : public SugaredValue {
       GraphFunction& m,
       const std::string& field) override {
     const char* field_s = field.c_str();
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    char* end;
+    char* end = nullptr;
     int64_t offset = strtoll(field_s + 1, &end, 10);
     if (field.size() < 2 || *end != 0)
-      throw ErrorReport(loc) << "invalid constant specifier: " << field;
+      throw(ErrorReport(loc) << "invalid constant specifier: " << field);
     if (offset < 0 || size_t(offset) >= constants_->size()) {
-      throw ErrorReport(loc) << "constant index " << offset
-                             << " is out of bounds (constant table has "
-                             << constants_->size() << " entries)";
+      throw(
+          ErrorReport(loc) << "constant index " << offset
+                           << " is out of bounds (constant table has "
+                           << constants_->size() << " entries)");
     }
     auto ivalue = constants_->at(offset);
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    Value* value;
+    Value* value = nullptr;
 
     // see [Constant Object Weak CompilationUnit Reference]
     if (ivalue.isObject() && !ivalue.toObject()->is_weak_compilation_ref()) {
       auto obj = ivalue.toObject();
-      if (!non_holding_object_cache.count(obj)) {
+      if (!non_holding_object_cache.contains(obj)) {
         non_holding_object_cache[obj] = obj->copy_to_weak_compilation_ref();
       }
       value = m.graph()->insertConstant(non_holding_object_cache[obj], loc);
@@ -155,7 +154,7 @@ Function* SourceImporterImpl::findFunction(const QualifiedName& name) {
 
 void SourceImporterImpl::parseSourceIfNeeded(const std::string& qualifier) {
   // qualifier may be blank, for instance checking if __torch__ is a class.
-  if (qualifier.empty() || loaded_sources_.count(qualifier)) {
+  if (qualifier.empty() || loaded_sources_.contains(qualifier)) {
     return;
   }
   loaded_sources_.insert(qualifier);
@@ -189,8 +188,9 @@ void SourceImporterImpl::parseSourceIfNeeded(const std::string& qualifier) {
             parsed_treeref;
       } break;
       default:
-        throw ErrorReport(L.cur().range)
-            << "Unexpected token in code import: " << kindToString(kind);
+        throw(
+            ErrorReport(L.cur().range)
+            << "Unexpected token in code import: " << kindToString(kind));
     }
   }
 }
@@ -299,12 +299,13 @@ void SourceImporterImpl::importNamedType(
   } else if (superclass_name == "Enum") {
     importEnum(qualified_name, class_def);
   } else {
-    throw ErrorReport(class_def.range())
-        << "Torchscript does not support class inheritance.";
+    throw(
+        ErrorReport(class_def.range())
+        << "Torchscript does not support class inheritance.");
   }
 }
 
-c10::optional<Assign> SourceImporterImpl::
+std::optional<Assign> SourceImporterImpl::
     attributeAssignmentSpecialHandlingHack(
         const QualifiedName& qualified_classname,
         const Assign& assign) {
@@ -369,10 +370,10 @@ c10::optional<Assign> SourceImporterImpl::
   static std::regex mangle_re("\\.___torch_mangle_\\d+");
   auto demangled_classname =
       std::regex_replace(qualified_classname.qualifiedName(), mangle_re, "");
-  if (replacements.count(demangled_classname)) {
+  if (replacements.contains(demangled_classname)) {
     auto lhs = Var(assign.lhs());
     if (!assign.type().present() || assign.type().get().kind() != TK_VAR) {
-      return c10::nullopt;
+      return std::nullopt;
     }
     auto type = Var(assign.type().get());
 
@@ -389,7 +390,7 @@ c10::optional<Assign> SourceImporterImpl::
           assign.range(), assign.lhs_list(), assign.rhs(), maybe_typename);
     }
   }
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 void SourceImporterImpl::importClass(
@@ -532,10 +533,10 @@ void SourceImporterImpl::importClass(
       case TK_DEF: {
         Def def = Def(statement);
         const auto def_name = def.name().name();
-        if (pre_hook_names.find(def_name) != pre_hook_names.end()) {
+        if (pre_hook_names.contains(def_name)) {
           pre_hook_def_map.emplace(def_name, def);
           pre_hook_resolver_map.emplace(def_name, shared_from_this());
-        } else if (hook_names.find(def_name) != hook_names.end()) {
+        } else if (hook_names.contains(def_name)) {
           hook_def_map.emplace(def_name, def);
           hook_resolver_map.emplace(def_name, shared_from_this());
         } else {
@@ -555,6 +556,7 @@ void SourceImporterImpl::importClass(
   // Populate class attributes
   ScriptTypeParser type_parser(shared_from_this());
   for (const auto& assign : attributes) {
+    // NOLINTNEXTLINE(bugprone-switch-missing-default-case)
     switch (assign.lhs().kind()) {
       case TK_VAR: {
         const auto name = Var(assign.lhs()).name().name();
@@ -562,8 +564,8 @@ void SourceImporterImpl::importClass(
         const auto type = assign.type().present()
             ? type_parser.parseTypeFromExpr(assign.type().get())
             : type_parser.parseTypeFromExpr(assign.rhs().get());
-        const bool is_parameter = parameter_names.count(name);
-        const bool is_buffer = buffer_names.count(name);
+        const bool is_parameter = parameter_names.contains(name);
+        const bool is_buffer = buffer_names.contains(name);
         class_type->addAttribute(name, type, is_parameter, is_buffer);
       } break;
       case TK_SUBSCRIPT: {
@@ -572,8 +574,8 @@ void SourceImporterImpl::importClass(
         const auto type = assign.type().present()
             ? type_parser.parseTypeFromExpr(assign.type().get())
             : type_parser.parseTypeFromExpr(assign.rhs().get());
-        const bool is_parameter = parameter_names.count(name);
-        const bool is_buffer = buffer_names.count(name);
+        const bool is_parameter = parameter_names.contains(name);
+        const bool is_buffer = buffer_names.contains(name);
         class_type->addAttribute(name, type, is_parameter, is_buffer);
       }
     }
@@ -630,21 +632,23 @@ void SourceImporterImpl::importEnum(
   std::vector<at::EnumNameValue> names_values;
 
   TypePtr value_type = nullptr;
-  auto set_or_check_type = [&value_type](
-                               const TypePtr& t, const SourceRange& loc) {
-    if (!value_type) {
-      value_type = t;
-    } else if (value_type != t) {
-      throw ErrorReport(loc)
-          << "Enum class with varying value types are not supported.";
-    }
-  };
+  auto set_or_check_type =
+      [&value_type](const TypePtr& t, const SourceRange& loc) {
+        if (!value_type) {
+          value_type = t;
+        } else if (value_type != t) {
+          throw(
+              ErrorReport(loc)
+              << "Enum class with varying value types are not supported.");
+        }
+      };
 
   for (const auto& statement : enum_def.body()) {
     if (statement.kind() != TK_ASSIGN) {
-      throw ErrorReport(statement.range())
+      throw(
+          ErrorReport(statement.range())
           << "Unexpected statement in Enum class body: "
-             "only enum attribute definitions are currently supported.";
+             "only enum attribute definitions are currently supported.");
     }
 
     const auto assign = Assign(statement);
@@ -669,17 +673,19 @@ void SourceImporterImpl::importEnum(
         break;
       }
       default:
-        throw ErrorReport(rhs.range())
+        throw(
+            ErrorReport(rhs.range())
             << "Unsupported enum value type: " << rhs.kind()
-            << ". Only Integers, Floats and Strings are supported.";
+            << ". Only Integers, Floats and Strings are supported.");
     }
 
     names_values.emplace_back(name, ivalue);
   }
 
   if (!value_type) {
-    throw ErrorReport(enum_def.range())
-        << "No enum values defined for " << qualified_name.qualifiedName();
+    throw(
+        ErrorReport(enum_def.range())
+        << "No enum values defined for " << qualified_name.qualifiedName());
   }
 
   auto enum_type = EnumType::create(
@@ -696,14 +702,16 @@ void SourceImporterImpl::importNamedTuple(
   std::vector<IValue> field_defaults;
   for (const auto& statement : named_tuple_def.body()) {
     if (statement.kind() != TK_ASSIGN) {
-      throw ErrorReport(statement.range())
+      throw(
+          ErrorReport(statement.range())
           << "Unexpected statement in NamedTuple body: "
-             "only attribute annotations are currently supported.";
+             "only attribute annotations are currently supported.");
     }
     const auto assign = Assign(statement);
+    TORCH_INTERNAL_ASSERT(assign.type().present());
 
     auto name = Var(Assign(statement).lhs()).name().name();
-    c10::optional<IValue> default_val;
+    std::optional<IValue> default_val;
     if (assign.rhs().present()) {
       std::vector<IValue> parsed = type_parser.evaluateDefaults(
           assign.rhs().range(), {assign.rhs().get()}, {assign.type().get()});
@@ -735,7 +743,7 @@ void SourceImporterImpl::parsePossibleVersionNumber(Lexer& L) {
     auto range = L.cur().range;
     L.next();
     L.expect('=');
-    std::string version_text = L.expect(TK_NUMBER).text();
+    L.expect(TK_NUMBER);
     L.expect(TK_NEWLINE);
   }
 }

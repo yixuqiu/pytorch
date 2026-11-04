@@ -1,30 +1,29 @@
+#include <c10/util/error.h>
+#include <c10/util/thread_name.h>
 #include <torch/csrc/Exceptions.h>
+#include <torch/csrc/multiprocessing/init.h>
 #include <torch/csrc/python_headers.h>
 #include <torch/csrc/utils/object_ptr.h>
 #include <torch/csrc/utils/pybind.h>
+#include <torch/csrc/utils/python_strings.h>
 
-#include <stdexcept>
+#include <initializer_list>
 
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif
 
-#define SYSASSERT(rv, ...)                                                 \
-  if ((rv) < 0) {                                                          \
-    throw std::system_error(errno, std::system_category(), ##__VA_ARGS__); \
-  }
+#define SYSASSERT(rv, ...) \
+  TORCH_CHECK((rv) >= 0, ##__VA_ARGS__, ": ", c10::utils::str_error(errno))
 
-namespace torch {
-namespace multiprocessing {
+namespace torch::multiprocessing {
 
 namespace {
 
-PyObject* multiprocessing_init(PyObject* _unused, PyObject* noargs) {
+PyObject* multiprocessing_init(PyObject* /*_unused*/, PyObject* /*noargs*/) {
   auto multiprocessing_module =
       THPObjectPtr(PyImport_ImportModule("torch.multiprocessing"));
-  if (!multiprocessing_module) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(multiprocessing_module);
 
   auto module = py::handle(multiprocessing_module).cast<py::module>();
 
@@ -38,23 +37,47 @@ PyObject* multiprocessing_init(PyObject* _unused, PyObject* noargs) {
   Py_RETURN_TRUE;
 }
 
+PyObject* set_thread_name(PyObject* /*_unused*/, PyObject* arg) {
+  TORCH_CHECK(THPUtils_checkString(arg), "invalid argument to setDevice");
+
+  auto name = THPUtils_unpackString(arg);
+  c10::setThreadName(name);
+
+  Py_RETURN_TRUE;
+}
+
+PyObject* get_thread_name(PyObject* /*_unused*/, PyObject* /*noargs*/) {
+  return THPUtils_packString(c10::getThreadName());
+}
+
 } // namespace
 
 // multiprocessing methods on torch._C
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables)
-static PyMethodDef methods[] = {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+static std::initializer_list<PyMethodDef> methods = {
     {
         "_multiprocessing_init",
         multiprocessing_init,
         METH_NOARGS,
         nullptr,
     },
+    {
+        "_set_thread_name",
+        set_thread_name,
+        METH_O,
+        nullptr,
+    },
+    {
+        "_get_thread_name",
+        get_thread_name,
+        METH_NOARGS,
+        nullptr,
+    },
     {nullptr, nullptr, 0, nullptr},
 };
 
-PyMethodDef* python_functions() {
-  return methods;
+const PyMethodDef* python_functions() {
+  return std::data(methods);
 }
 
-} // namespace multiprocessing
-} // namespace torch
+} // namespace torch::multiprocessing

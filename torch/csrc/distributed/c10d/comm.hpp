@@ -26,7 +26,7 @@ class TORCH_API GradBucket {
       std::vector<size_t> lengths,
       std::vector<c10::IntArrayRef> sizes_vec,
       std::vector<at::Tensor> parameters,
-      c10::optional<at::Tensor> sparse_grad_indices)
+      std::optional<at::Tensor> sparse_grad_indices)
       : index_(index),
         bucket_count_(bucket_count),
         buffer_(std::move(tensor)),
@@ -67,12 +67,13 @@ class TORCH_API GradBucket {
     return parameters_;
   }
 
-  // Returns whther this bucket is the last bucket to allreduce in an iteration.
+  // Returns whether this bucket is the last bucket to allreduce in an
+  // iteration.
   bool isLast() const {
     return index_ == bucket_count_ - 1;
   }
 
-  c10::optional<at::Tensor>& getSparseGradIndices() {
+  std::optional<at::Tensor>& getSparseGradIndices() {
     return sparse_grad_indices_;
   }
 
@@ -87,11 +88,12 @@ class TORCH_API GradBucket {
   std::vector<c10::IntArrayRef> sizes_vec_;
 
   // Model parameters for this bucket.
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const std::vector<at::Tensor> parameters_;
 
   // Predefined sparse indices for this bucket (only used for sparse tensors).
   // The gradients will be updated to have indices with these tensor values
-  c10::optional<at::Tensor> sparse_grad_indices_;
+  std::optional<at::Tensor> sparse_grad_indices_;
 };
 
 // Base class of both `PythonCommHook` and `CppCommHook`.

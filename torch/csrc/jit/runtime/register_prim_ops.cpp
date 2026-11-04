@@ -1,6 +1,6 @@
 #include <ATen/autocast_mode.h>
 #include <ATen/core/Generator.h>
-#include <c10/util/Optional.h>
+#include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/mobile/promoted_prim_ops.h>
 #include <torch/csrc/jit/runtime/custom_operator.h>
@@ -8,23 +8,18 @@
 #include <torch/csrc/jit/runtime/register_ops_utils.h>
 #include <torch/csrc/jit/runtime/slice_indices_adjust.h>
 #include <torch/library.h>
+#include <optional>
 
 #include <algorithm>
 #include <bitset>
 #include <cctype>
 #include <cmath>
-#include <exception>
-#include <fstream>
 #include <iostream>
-#include <limits>
 #include <memory>
-#include <mutex>
 #include <ostream>
 #include <stdexcept>
 #include <string>
-#include <typeinfo>
-#include <unordered_map>
-#include <unordered_set>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -34,8 +29,8 @@ namespace {
 
 std::string stringSlice(
     std::string string,
-    c10::optional<int64_t> start,
-    c10::optional<int64_t> end,
+    std::optional<int64_t> start,
+    std::optional<int64_t> end,
     int64_t step) {
   int64_t start_val = start.has_value() ? start.value() : INT64_MAX;
   int64_t end_val = end.has_value() ? end.value() : INT64_MAX;
@@ -44,9 +39,8 @@ std::string stringSlice(
       slice_indices_adjust(string.size(), &start_val, &end_val, step);
 
   int64_t i = start_val;
-  std::string result = "";
-  for (const auto j : c10::irange(num_vals)) {
-    (void)j; // Suppress unused variable warning
+  std::string result;
+  for ([[maybe_unused]] const auto j : c10::irange(num_vals)) {
     result += string[i];
     i += step;
   }
@@ -107,7 +101,7 @@ bool isSortableTupleType(
         why_not << "Contained elements in " << *tuple_type
                 << " are not sortable. Only Int, Bool, Float, String, Tensor, "
                 << "a User Defined Class with __lt__ method defined or Tuples "
-                << "of aforementionted types can be sorted.";
+                << "of aforementioned types can be sorted.";
         return false;
     }
   }
@@ -123,8 +117,8 @@ bool isSortableListOfObjectsOrTuples(
   }
 
   auto type = ivalues.get(0).type();
-  // We assume lists have homogenous types, use first element to determine
-  // best sorting methods. If in the future we need to support heterogenous
+  // We assume lists have homogeneous types, use first element to determine
+  // best sorting methods. If in the future we need to support heterogeneous
   // types inside list, then sorting needs to have runtime sortable checks.
   const size_t n = ivalues.size();
   for (const auto i : c10::irange(n)) {
@@ -152,7 +146,7 @@ bool isSortableListOfObjectsOrTuples(
   why_not << "Only list of Tensors, ints, floats, bools, strs, "
           << "a User Defined Class that defines the __lt__ compare method "
           << "or Tuples of aforementioned types can be sorted, got list of "
-          << type->repr_str() << "\n";
+          << type->repr_str() << '\n';
   return false;
 }
 
@@ -167,9 +161,9 @@ void sort_op(Stack& stack) {
 
   if (!g_list.empty()) {
     std::stringstream error_str;
-    if (!isSortableListOfObjectsOrTuples(g_list, error_str)) {
-      throw std::runtime_error(error_str.str());
-    }
+    TORCH_CHECK(
+        isSortableListOfObjectsOrTuples(g_list, error_str),
+        std::move(error_str).str());
 
     c10::IValueComparator comparator;
     if (reverse) {
@@ -177,7 +171,7 @@ void sort_op(Stack& stack) {
     } else {
       comparator = c10::getLessThanComparator(g_list.get(0));
     }
-    std::sort(g_list.begin(), g_list.end(), comparator);
+    std::ranges::sort(g_list, comparator);
   }
 
   if (copy_return_list) {
@@ -198,7 +192,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         [](Stack& stack) {
           std::stringstream ss;
           ss << pop(stack);
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -259,13 +253,9 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         TORCH_SELECTIVE_SCHEMA(
             "aten::__range_length(int lo, int hi, int step) -> int"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t lo, hi, step;
-          pop(stack, lo, hi, step);
+          auto [lo, hi, step] = pop<int64_t, int64_t, int64_t>(stack);
           // error handling when step_val = 0 during runtime
-          if (step == 0) {
-            throw std::runtime_error("range() arg 3 must not be zero");
-          }
+          TORCH_CHECK(step != 0, "range() arg 3 must not be zero");
           if (step > 0 && lo < hi) {
             push(stack, 1 + (hi - 1 - lo) / step);
           } else if (step < 0 && lo > hi) {
@@ -279,9 +269,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         TORCH_SELECTIVE_SCHEMA(
             "aten::__derive_index(int index, int start, int step) -> int"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t index, start, step;
-          pop(stack, index, start, step);
+          auto [index, start, step] = pop<int64_t, int64_t, int64_t>(stack);
           push(stack, start + index * step);
         },
         aliasAnalysisFromSchema()),
@@ -336,8 +324,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::Bool.int(int a) -> bool"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t i;
+          int64_t i = 0;
           pop(stack, i);
           push(stack, (bool)i);
         },
@@ -345,8 +332,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::Bool.float(float a) -> bool"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double d;
+          double d = 0;
           pop(stack, d);
           push(stack, (bool)d);
         },
@@ -362,8 +348,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::Int.bool(bool a) -> int"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          bool b;
+          bool b = false;
           pop(stack, b);
           push(stack, static_cast<int64_t>(b));
         },
@@ -371,8 +356,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::Int.float(float a) -> int"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double d;
+          double d = 0;
           pop(stack, d);
           push(stack, static_cast<int64_t>(d));
         },
@@ -394,17 +378,15 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         TORCH_SELECTIVE_SCHEMA("aten::Int.str(str a) -> int"),
         [](Stack& stack) {
           auto s = pop(stack).toString();
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          std::string::size_type sz;
+          std::string::size_type sz = 0;
           int64_t val = static_cast<int64_t>(std::stoll(s->string(), &sz));
-          if (sz == s->string().size()) {
-            push(stack, val);
-          } else {
-            std::stringstream error_str;
-            error_str << "invalid literal for int() "
-                      << "with base 10: '" << s->string() << "'";
-            throw std::runtime_error(error_str.str());
-          }
+          TORCH_CHECK(
+              sz == s->string().size(),
+              "invalid literal for int() ",
+              "with base 10: '",
+              s->string(),
+              "'");
+          push(stack, val);
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -432,8 +414,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::Float.int(int a) -> float"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t i;
+          int64_t i = 0;
           pop(stack, i);
           push(stack, (float)i);
         },
@@ -441,8 +422,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::Float.bool(bool a) -> float"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          bool b;
+          bool b = false;
           pop(stack, b);
           push(stack, (float)b);
         },
@@ -451,17 +431,15 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         TORCH_SELECTIVE_SCHEMA("aten::Float.str(str a) -> float"),
         [](Stack& stack) {
           auto s = pop(stack).toString();
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          std::string::size_type sz;
+          std::string::size_type sz = 0;
           double b = std::stod(s->string(), &sz);
-          if (sz == s->string().size()) {
-            push(stack, b);
-          } else {
-            std::stringstream error_str;
-            error_str << "could not convert string "
-                      << "to float: '" << s->string() << "'";
-            throw std::runtime_error(error_str.str());
-          }
+          TORCH_CHECK(
+              sz == s->string().size(),
+              "could not convert string ",
+              "to float: '",
+              s->string(),
+              "'");
+          push(stack, b);
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -482,8 +460,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         TORCH_SELECTIVE_SCHEMA(
             "aten::Complex.Tensor_Tensor(Tensor a, Tensor b) -> complex"),
         [](Stack& stack) {
-          at::Tensor a, b;
-          pop(stack, a, b);
+          auto [a, b] = pop<at::Tensor, at::Tensor>(stack);
           push(stack, c10::complex<double>(a.item<double>(), b.item<double>()));
         },
         aliasAnalysisFromSchema()),
@@ -603,56 +580,6 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         [](Stack& stack) {
           at::Tensor arg = pop(stack).toTensor();
           push(stack, arg.element_size());
-        },
-        aliasAnalysisFromSchema()),
-    OperatorGeneratorArgs(
-        TORCH_SELECTIVE_SCHEMA("aten::numel(Tensor self) -> int"),
-        [](Stack& stack) {
-          at::Tensor arg = pop(stack).toTensor();
-          push(stack, arg.numel());
-        },
-        aliasAnalysisFromSchema()),
-    OperatorGeneratorArgs(
-        TORCH_SELECTIVE_SCHEMA("aten::dim(Tensor self) -> int"),
-        dim,
-        aliasAnalysisFromSchema()),
-    OperatorGeneratorArgs(
-        TORCH_SELECTIVE_SCHEMA("aten::get_device(Tensor self) -> int"),
-        [](Stack& stack) {
-          RECORD_FUNCTION("get_device", c10::ArrayRef<const c10::IValue>{});
-          auto result =
-              at::get_device((std::move(peek(stack, 0, 1))).toTensor());
-          drop(stack, 1);
-          pack(stack, result);
-        },
-        aliasAnalysisFromSchema()),
-    OperatorGeneratorArgs(
-        TORCH_SELECTIVE_SCHEMA("aten::storage_offset(Tensor self) -> int"),
-        [](Stack& stack) {
-          RECORD_FUNCTION("storage_offset", c10::ArrayRef<const c10::IValue>{});
-          auto result =
-              ((std::move(peek(stack, 0, 1))).toTensor()).storage_offset();
-          drop(stack, 1);
-          pack(stack, result);
-        },
-        aliasAnalysisFromSchema()),
-    OperatorGeneratorArgs(
-        TORCH_SELECTIVE_SCHEMA("aten::is_contiguous(Tensor self) -> bool"),
-        [](Stack& stack) {
-          RECORD_FUNCTION("is_contiguous", c10::ArrayRef<const c10::IValue>{});
-          auto result =
-              ((std::move(peek(stack, 0, 1))).toTensor()).is_contiguous();
-          drop(stack, 1);
-          pack(stack, result);
-        },
-        aliasAnalysisFromSchema()),
-    OperatorGeneratorArgs(
-        TORCH_SELECTIVE_SCHEMA(
-            "aten::is_contiguous.memory_format(Tensor self, MemoryFormat memory_format) -> bool"),
-        [](Stack& stack) {
-          auto memory_format = pop(stack).toMemoryFormat();
-          auto t = pop(stack).toTensor();
-          push(stack, t.is_contiguous(memory_format));
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -816,6 +743,21 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         },
         aliasAnalysisConservative()),
     OperatorGeneratorArgs(
+        TORCH_SELECTIVE_SCHEMA(
+            "aten::get_autocast_dtype(str device_type) -> ScalarType"),
+        [](Stack& stack) {
+#if defined BUILD_LITE_INTERPRETER || defined C10_MOBILE
+          // autocast is not supported.
+          at::ScalarType dtype = at::ScalarType::Undefined;
+#else
+          at::DeviceType device_type =
+              at::Device(pop(stack).toStringRef()).type();
+          at::ScalarType dtype = at::autocast::get_autocast_dtype(device_type);
+#endif
+          push(stack, dtype);
+        },
+        aliasAnalysisConservative()),
+    OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("prim::Uninitialized() -> Any"),
         unInitialized,
         aliasAnalysisSpecialCase()),
@@ -827,15 +769,15 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
           bool first = true;
           for (const IValue& i : last(stack, num_inputs)) {
             if (!first)
-              ss << " ";
+              ss << ' ';
             first = false;
             ss << i;
           }
           drop(stack, num_inputs);
-          ss << std::endl;
+          ss << '\n';
           auto* handler = getPrintHandler();
           TORCH_INTERNAL_ASSERT(handler);
-          handler(ss.str());
+          handler(std::move(ss).str());
         },
         aliasAnalysisSpecialCase()),
     // This is an alternative to aten::cat op that takes variable number of
@@ -1021,9 +963,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::pow.int_to_int(int a, int b) -> int"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t a, b;
-          pop(stack, a, b);
+          auto [a, b] = pop<int64_t, int64_t>(stack);
           push(stack, powWrapper(a, b));
         },
         aliasAnalysisFromSchema()),
@@ -1045,7 +985,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         [](Stack& stack) {
           at::Tensor t = pop(stack).toTensor();
           if (t.dim() == 0) {
-            AT_ERROR("len() of a 0-d tensor");
+            TORCH_CHECK(false, "len() of a 0-d tensor");
           }
           push(stack, t.sizes()[0]);
         },
@@ -1070,7 +1010,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
           for (char c : string) {
             ss << static_cast<char>(::tolower(c));
           }
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -1115,9 +1055,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
                              "(Tensor(a!) self, " #other_type            \
                              " other) -> Tensor(a!)"),                   \
       [](Stack& stack) {                                                 \
-        at::Tensor t;                                                    \
-        c_type other;                                                    \
-        pop(stack, t, other);                                            \
+        auto [t, other] = pop<at::Tensor, c_type>(stack);                \
         std::move(t) = other; /* NOLINT(bugprone-use-after-move) */      \
         push(stack, std::move(t)); /* NOLINT(bugprone-use-after-move) */ \
       },                                                                 \
@@ -1145,14 +1083,14 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     //
     // create a clone of these declarations with a _hacked_twin overload name
     // and nullability scrubbed from TensorList arg types
-    // TOOD find out why this exists and how to do it without the hack
+    // TODO find out why this exists and how to do it without the hack
     //
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA(
             "aten::index.Tensor_hacked_twin(Tensor self, Tensor[] indices) -> Tensor"),
         [](Stack& stack) {
           auto indices = pop(stack).to<c10::List<at::Tensor>>();
-          c10::List<c10::optional<at::Tensor>> opt_list_indices;
+          c10::List<std::optional<at::Tensor>> opt_list_indices;
           opt_list_indices.reserve(indices.size());
           for (const auto& ten : indices) {
             opt_list_indices.push_back(ten);
@@ -1167,7 +1105,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
             "aten::_unsafe_index.Tensor_hacked_twin(Tensor self, Tensor[] indices) -> Tensor"),
         [](Stack& stack) {
           auto indices = pop(stack).to<c10::List<at::Tensor>>();
-          c10::List<c10::optional<at::Tensor>> opt_list_indices;
+          c10::List<std::optional<at::Tensor>> opt_list_indices;
           opt_list_indices.reserve(indices.size());
           for (const auto& ten : indices) {
             opt_list_indices.push_back(ten);
@@ -1185,7 +1123,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
           auto accumulate = pop(stack).toBool();
           auto values = pop(stack).toTensor();
           auto indices = pop(stack).to<c10::List<at::Tensor>>();
-          c10::List<c10::optional<at::Tensor>> opt_list_indices;
+          c10::List<std::optional<at::Tensor>> opt_list_indices;
           opt_list_indices.reserve(indices.size());
           for (const auto& ten : indices) {
             opt_list_indices.push_back(ten);
@@ -1203,7 +1141,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
           auto accumulate = pop(stack).toBool();
           auto values = pop(stack).toTensor();
           auto indices = pop(stack).to<c10::List<at::Tensor>>();
-          c10::List<c10::optional<at::Tensor>> opt_list_indices;
+          c10::List<std::optional<at::Tensor>> opt_list_indices;
           opt_list_indices.reserve(indices.size());
           for (const auto& ten : indices) {
             opt_list_indices.push_back(ten);
@@ -1221,7 +1159,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
           auto accumulate = pop(stack).toBool();
           auto values = pop(stack).toTensor();
           auto indices = pop(stack).to<c10::List<at::Tensor>>();
-          c10::List<c10::optional<at::Tensor>> opt_list_indices;
+          c10::List<std::optional<at::Tensor>> opt_list_indices;
           opt_list_indices.reserve(indices.size());
           for (const auto& ten : indices) {
             opt_list_indices.push_back(ten);
@@ -1239,7 +1177,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
           auto accumulate = pop(stack).toBool();
           auto values = pop(stack).toTensor();
           auto indices = pop(stack).to<c10::List<at::Tensor>>();
-          c10::List<c10::optional<at::Tensor>> opt_list_indices;
+          c10::List<std::optional<at::Tensor>> opt_list_indices;
           opt_list_indices.reserve(indices.size());
           for (const auto& ten : indices) {
             opt_list_indices.push_back(ten);
@@ -1255,14 +1193,10 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         TORCH_SELECTIVE_SCHEMA(
             "aten::to.prim_Device(Tensor(a) self, Device? device, int? dtype=None, bool non_blocking=False, bool copy=False) -> Tensor(a|b)"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          bool non_blocking;
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          bool copy;
-          pop(stack, non_blocking, copy);
-          c10::optional<at::ScalarType> scalarType =
+          auto [non_blocking, copy] = pop<bool, bool>(stack);
+          std::optional<at::ScalarType> scalarType =
               pop(stack).toOptional<at::ScalarType>();
-          c10::optional<c10::Device> device =
+          std::optional<c10::Device> device =
               pop(stack).toOptional<c10::Device>();
           at::Tensor self = pop(stack).toTensor();
           push(
@@ -1315,7 +1249,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         [](Stack& stack) {
           at::Tensor a;
           pop(stack, a);
-          push(stack, autograd::Variable(a).variable_data());
+          push(stack, a.variable_data());
         },
         aliasAnalysisFromSchema()),
 // these ops are not defined for Tensor
@@ -1353,7 +1287,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         auto string = pop(stack).toStringRef();                        \
         push(                                                          \
             stack,                                                     \
-            string.size() != 0 &&                                      \
+            !string.empty() &&                                         \
                 std::all_of(string.begin(), string.end(), [](char c) { \
                   return char_op(c);                                   \
                 }));                                                   \
@@ -1376,7 +1310,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         for (char c : string) {                             \
           ss << static_cast<char>(char_op(c));              \
         }                                                   \
-        push(stack, ss.str());                              \
+        push(stack, std::move(ss).str());                   \
       },                                                    \
       aliasAnalysisFromSchema())
 
@@ -1389,9 +1323,9 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
                                 }
                               }))};
 
-static std::vector<c10::optional<Operator>> createOperators(
+static std::vector<std::optional<Operator>> createOperators(
     const std::vector<OperatorGeneratorArgs>& args) {
-  std::vector<c10::optional<Operator>> result;
+  std::vector<std::optional<Operator>> result;
   result.reserve(args.size());
   for (const auto& arg : args) {
     if (arg.schema_str) {
@@ -1494,7 +1428,7 @@ void dictPop(Stack& stack) {
     if (has_default) {
       push(stack, default_value);
     } else {
-      AT_ERROR("KeyError: ", key);
+      TORCH_CHECK(false, "KeyError: ", key);
     }
   } else {
     // note: before erase
@@ -1514,7 +1448,7 @@ void dictDelete(Stack& stack) {
 void dictPopItem(Stack& stack) {
   auto dict = pop(stack).toGenericDict();
   if (dict.empty()) {
-    AT_ERROR("popitem(): dictionary is empty");
+    TORCH_CHECK(false, "popitem(): dictionary is empty");
   }
   auto head_item = dict.begin();
 
@@ -1694,14 +1628,12 @@ static const std::vector<OperatorGeneratorArgs> dict_ops{
 };
 RegisterOperators reg_dict_ops(createOperators(dict_ops));
 
-// NOLINTNEXTLINE(clang-diagnostic-unused-function)
 constexpr c10::AliasAnalysisKind aliasAnalysisFromSchema() {
   return c10::AliasAnalysisKind::FROM_SCHEMA;
 }
 
-// Convert an python index (which may be negative) into an index usable for a
+// Convert a python index (which may be negative) into an index usable for a
 // C++ container
-// NOLINTNEXTLINE(clang-diagnostic-unused-function)
 int64_t normalizeIndex(int64_t idx, int64_t list_size) {
   if (idx < 0) {
     // Handle negative indexing
@@ -1718,7 +1650,7 @@ int64_t stringFindImpl(
     bool reverse = false) {
   int64_t size = string.size();
   if (start < 0) {
-    start = std::max(int64_t(0), int64_t(size + start));
+    start = std::max(int64_t(0), size + start);
   }
   if (end < 0) {
     end = std::max(int64_t(0), int64_t(size + end + 1));
@@ -1754,8 +1686,8 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
             "aten::slice.str(str string, int? start=None, int? end=None, int step=1) -> str"),
         [](Stack& stack) {
           int64_t step = pop(stack).toInt();
-          c10::optional<int64_t> end = pop(stack).toOptional<int64_t>();
-          c10::optional<int64_t> start = pop(stack).toOptional<int64_t>();
+          std::optional<int64_t> end = pop(stack).toOptional<int64_t>();
+          std::optional<int64_t> start = pop(stack).toOptional<int64_t>();
           std::string string = pop(stack).toStringRef();
           push(stack, stringSlice(string, start, end, step));
         },
@@ -1764,7 +1696,8 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
         TORCH_SELECTIVE_SCHEMA(
             "aten::strip(str self, str chars=' \\n\\t\\f\\v') -> str"),
         [](Stack& stack) {
-          std::string chars = pop(stack).toStringRef();
+          auto charsIValue = pop(stack);
+          std::string_view chars = charsIValue.toStringRef();
           std::string string = pop(stack).toStringRef();
           auto rindex = string.find_last_not_of(chars);
           if (rindex != std::string::npos) {
@@ -1778,7 +1711,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           } else {
             string = "";
           }
-          push(stack, string);
+          push(stack, std::move(string));
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -1792,7 +1725,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string::size_type prev_pos = 0;
           std::string::size_type pos = 0;
           c10::List<std::string> splits;
-          if (ivalue == c10::nullopt) {
+          if (ivalue == std::nullopt) {
             // if separator is not specified,
             // a different splitting algorithm is applied as Python
             splits = splitNoneSeparator(string);
@@ -1801,10 +1734,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           }
 
           const std::string& separator = ivalue.toStringRef();
-
-          if (separator.empty()) {
-            throw std::runtime_error("ValueError: empty separator");
-          }
+          TORCH_CHECK(!separator.empty(), "ValueError: empty separator");
 
           auto count = 0;
 
@@ -1896,7 +1826,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
               ss << static_cast<char>(::tolower(c));
             }
           }
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -1917,7 +1847,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
               prev_is_nonalpha = true;
             }
           }
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -1927,11 +1857,9 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string fillchar = pop(stack).toStringRef();
           int64_t width = pop(stack).toInt();
           std::string string = pop(stack).toStringRef();
-          if (fillchar.size() != 1) {
-            // TODO: this should be a TypeError
-            throw std::runtime_error(
-                "TypeError: The fill character must be exactly one character long");
-          }
+          TORCH_CHECK(
+              fillchar.size() == 1,
+              "TypeError: The fill character must be exactly one character long");
           if (string.size() > static_cast<std::string::size_type>(width)) {
             push(stack, string);
             return;
@@ -1952,7 +1880,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           for (std::string::size_type i = 0; i < r_pad; ++i) {
             ss << fillchar;
           }
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
 
@@ -1972,7 +1900,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
             return;
           }
           if (start < 0) {
-            start = std::max(int64_t(0), int64_t(size + start));
+            start = std::max(int64_t(0), size + start);
           }
           if (end < 0) {
             end = std::max(int64_t(0), int64_t(size + end + 1));
@@ -2001,7 +1929,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string string = pop(stack).toStringRef();
           int64_t size = string.size();
           if (start < 0) {
-            start = std::max(int64_t(0), int64_t(size + start));
+            start = std::max(int64_t(0), (size + start));
           }
           if (end < 0) {
             end = std::max(int64_t(0), int64_t(size + end + 1));
@@ -2027,7 +1955,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string string = pop(stack).toStringRef();
           int64_t size = string.size();
           if (start < 0) {
-            start = std::max(int64_t(0), int64_t(size + start));
+            start = std::max(int64_t(0), (size + start));
           }
           if (end < 0) {
             end = std::max(int64_t(0), int64_t(size + end + 1));
@@ -2064,7 +1992,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
               } while (index % tabsize);
             }
           }
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -2100,9 +2028,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string substr = pop(stack).toStringRef();
           std::string string = pop(stack).toStringRef();
           auto result = stringFindImpl(string, substr, start, end);
-          if (result < 0) {
-            throw std::runtime_error("ValueError: substring not found");
-          }
+          TORCH_CHECK(result >= 0, "ValueError: substring not found");
           push(stack, result);
         },
         aliasAnalysisFromSchema()),
@@ -2115,9 +2041,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string substr = pop(stack).toStringRef();
           std::string string = pop(stack).toStringRef();
           auto result = stringFindImpl(string, substr, start, end, true);
-          if (result < 0) {
-            throw std::runtime_error("ValueError: substring not found");
-          }
+          TORCH_CHECK(result >= 0, "ValueError: substring not found");
           push(stack, result);
         },
         aliasAnalysisFromSchema()),
@@ -2191,11 +2115,9 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string fillchar = pop(stack).toStringRef();
           int64_t width = pop(stack).toInt();
           std::string string = pop(stack).toStringRef();
-          if (fillchar.size() != 1) {
-            // TODO: this should be a TypeError
-            throw std::runtime_error(
-                "TypeError: The fill character must be exactly one character long");
-          }
+          TORCH_CHECK(
+              fillchar.size() == 1,
+              "TypeError: The fill character must be exactly one character long");
           auto to_append =
               std::max(int64_t(0), width - static_cast<int64_t>(string.size()));
 
@@ -2205,7 +2127,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
             (void)i; // Suppress unused variable warning
             ss << fillchar;
           }
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -2215,11 +2137,9 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           std::string fillchar = pop(stack).toStringRef();
           int64_t width = pop(stack).toInt();
           std::string string = pop(stack).toStringRef();
-          if (fillchar.size() != 1) {
-            // TODO: this should be a TypeError
-            throw std::runtime_error(
-                "TypeError: The fill character must be exactly one character long");
-          }
+          TORCH_CHECK(
+              fillchar.size() == 1,
+              "TypeError: The fill character must be exactly one character long");
           auto to_append =
               std::max(int64_t(0), width - static_cast<int64_t>(string.size()));
 
@@ -2229,7 +2149,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
             ss << fillchar;
           }
           ss << string;
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -2246,7 +2166,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
             ss << '0';
           }
           ss << string;
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
@@ -2382,7 +2302,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
           for (const auto& v : ivalues) {
             values.emplace_back(v.toStringRef());
           }
-          c10::optional<std::string> opt_string =
+          std::optional<std::string> opt_string =
               pop(stack).toOptional<std::string>();
           const std::string& string = opt_string.value_or("");
           std::stringstream ss;
@@ -2392,7 +2312,7 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
               ss << string;
             }
           }
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
 };
@@ -2403,8 +2323,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs1{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("prim::rangelist(int n) -> int[]"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t n;
+          int64_t n = 0;
           pop(stack, n);
           c10::List<int64_t> elems;
           elems.reserve(n);
@@ -2442,14 +2361,9 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs1{
         TORCH_SELECTIVE_SCHEMA(
             "aten::to.prim_other(Tensor(a) self, bool non_blocking=False, bool copy=False) -> Tensor(a|b)"),
         [](Stack& stack) {
-          at::Tensor self;
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          bool non_blocking;
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          bool copy;
-          pop(stack, self, non_blocking, copy);
-          c10::optional<c10::Device> device = c10::nullopt;
-          c10::optional<at::ScalarType> scalarType = c10::nullopt;
+          auto [self, non_blocking, copy] = pop<at::Tensor, bool, bool>(stack);
+          std::optional<c10::Device> device = std::nullopt;
+          std::optional<at::ScalarType> scalarType = std::nullopt;
           push(
               stack, to_dispatch(self, device, scalarType, non_blocking, copy));
         },
@@ -2661,7 +2575,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs1{
           } else {
             int64_t index = 0;
             auto iter = size.begin();
-            std::sort(axes.begin(), axes.end());
+            std::ranges::sort(axes);
             for (const auto& axis : axes) {
               // move iter to the next axis
               iter += axis - index;
@@ -2702,8 +2616,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs1{
         TORCH_SELECTIVE_SCHEMA(
             "onnx::Reshape(Tensor input, Tensor shape) -> Tensor"),
         [](Stack& stack) {
-          at::Tensor input, shape;
-          pop(stack, input, shape);
+          auto [input, shape] = pop<at::Tensor, at::Tensor>(stack);
           shape = shape.contiguous();
           AT_ASSERT(shape.ndimension() == 1);
           at::IntArrayRef shape_list(
@@ -2821,8 +2734,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs1{
         TORCH_SELECTIVE_SCHEMA(
             "aten::_size_if_not_equal(int[] self_size, int[] other_size) -> int[]?"),
         [](Stack& stack) {
-          IValue self_size, other_size;
-          pop(stack, self_size, other_size);
+          auto [self_size, other_size] = pop<IValue, IValue>(stack);
           auto s = self_size.toDimVector();
           auto o = other_size.toDimVector();
           if (s == o) {
@@ -2850,7 +2762,7 @@ void hashValue(Stack& stack) {
 }
 
 static const std::vector<OperatorGeneratorArgs> opGenArgs2{
-    // registered as Any[] so that heterogenous tuples can be called with len()
+    // registered as Any[] so that heterogeneous tuples can be called with len()
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::len.any(Any[] a) -> int"),
         listLen,
@@ -2999,11 +2911,11 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
         auto i = pop(stack).toInt();                     \
         std::stringstream ss;                            \
         if (i < 0) {                                     \
-          ss << "-";                                     \
+          ss << '-';                                     \
           i = -i;                                        \
         }                                                \
-        ss << "0" << prefix << char_op << i;             \
-        push(stack, ss.str());                           \
+        ss << '0' << prefix << char_op << i;             \
+        push(stack, std::move(ss).str());                \
       },                                                 \
       aliasAnalysisFromSchema())
 
@@ -3019,13 +2931,13 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
             push(stack, "0b0");
           } else {
             if (i < 0) {
-              ss << "-";
+              ss << '-';
               i = -i;
             }
             std::string str = std::bitset<8 * sizeof(i)>(i).to_string();
             str.erase(0, std::min(str.find_first_not_of('0'), str.size() - 1));
             ss << "0b" << str;
-            push(stack, ss.str());
+            push(stack, std::move(ss).str());
           }
         },
         aliasAnalysisFromSchema()),
@@ -3052,7 +2964,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
               i);
           char c = i;
           ss << c;
-          push(stack, ss.str());
+          push(stack, std::move(ss).str());
         },
         aliasAnalysisFromSchema()),
 
@@ -3062,25 +2974,20 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::modf(float a) -> (float, float)"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double a;
+          double a = 0;
           pop(stack, a);
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double b, c;
-          b = modf(a, &c);
+          double c = 0;
+          double b = modf(a, &c);
           push(stack, b, c);
         },
         aliasAnalysisFromSchema()),
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::frexp(float a) -> (float, int)"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double a;
+          double a = 0;
           pop(stack, a);
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double m;
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int e;
+          double m = 0;
+          int e = 0;
           m = std::frexp(a, &e);
           push(stack, m, e);
         },
@@ -3088,11 +2995,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::ldexp(float x, int i) -> float"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double a;
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t b;
-          pop(stack, a, b);
+          auto [a, b] = pop<double, int64_t>(stack);
           push(stack, std::ldexp(a, b));
         },
         aliasAnalysisFromSchema()),
@@ -3373,14 +3276,10 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::divmod.int(int x, int y) -> (int, int)"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          int64_t a, b;
           lldiv_t divresult = {};
-          pop(stack, a, b);
-          if (b == 0) {
-            throw std::runtime_error(
-                "ZeroDivisionError: integer division or modulo by zero");
-          }
+          auto [a, b] = pop<int64_t, int64_t>(stack);
+          TORCH_CHECK(
+              b != 0, "ZeroDivisionError: integer division or modulo by zero");
           divresult = lldiv(a, b);
           if (divresult.rem && (a < 0) != (b < 0)) {
             divresult.quot -= 1;
@@ -3396,12 +3295,8 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
         TORCH_SELECTIVE_SCHEMA(
             "aten::divmod.float(float x, float y) -> (float, float)"),
         [](Stack& stack) {
-          // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-          double a, b;
-          pop(stack, a, b);
-          if (b == 0) {
-            throw std::runtime_error("ZeroDivisionError: float divmod()");
-          }
+          auto [a, b] = pop<double, double>(stack);
+          TORCH_CHECK(b != 0, "ZeroDivisionError: float divmod()");
           double rem = fmod(a, b);
           // NOLINTNEXTLINE(cppcoreguidelines-narrowing-conversions,bugprone-narrowing-conversions)
           if (rem && (a < 0) != (b < 0)) {
@@ -3434,7 +3329,9 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
           std::stringstream ss;
           ss << ind.toInt();
           push(
-              stack, torch::jit::Object(module_dict.toObject()).attr(ss.str()));
+              stack,
+              torch::jit::Object(module_dict.toObject())
+                  .attr(std::move(ss).str()));
         },
         aliasAnalysisFromSchema()),
 
@@ -3443,12 +3340,8 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
       TORCH_SELECTIVE_SCHEMA("aten::divmod." #type_a "_" #type_b "(" #type_a \
                              " x," #type_b " y) -> (float, float)"),         \
       [](Stack& stack) {                                                     \
-        type_a a;                                                            \
-        type_b b;                                                            \
-        pop(stack, a, b);                                                    \
-        if (b == 0) {                                                        \
-          throw std::runtime_error("ZeroDivisionError: float divmod()");     \
-        }                                                                    \
+        auto [a, b] = pop<type_a, type_b>(stack);                            \
+        TORCH_CHECK(b != 0, "ZeroDivisionError: float divmod()");            \
         double quot = floor(a / b);                                          \
         double rem = a - (quot * b);                                         \
         push(stack, quot, rem);                                              \
@@ -3469,9 +3362,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
       TORCH_SELECTIVE_SCHEMA("aten::Complex." #type_a "_" #type_b "(" #type_a \
                              " x," #type_b " y) -> complex"),                 \
       [](Stack& stack) {                                                      \
-        actual_type_a a;                                                      \
-        actual_type_b b;                                                      \
-        pop(stack, a, b);                                                     \
+        auto [a, b] = pop<actual_type_a, actual_type_b>(stack);               \
         auto comp = c10::complex<double>(a, b);                               \
         push(stack, comp);                                                    \
       },                                                                      \
@@ -3483,9 +3374,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
       TORCH_SELECTIVE_SCHEMA("aten::Complex." #type_a "_" #type_b "(" #type_a \
                              " x," #type_b " y) -> complex"),                 \
       [](Stack& stack) {                                                      \
-        actual_type_a a;                                                      \
-        actual_type_b b;                                                      \
-        pop(stack, a, b);                                                     \
+        auto [a, b] = pop<actual_type_a, actual_type_b>(stack);               \
         auto comp = c10::complex<double>(a.item<double>(), b);                \
         push(stack, comp);                                                    \
       },                                                                      \
@@ -3494,9 +3383,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs2{
           TORCH_SELECTIVE_SCHEMA("aten::Complex." #type_b "_" #type_a         \
                                  "(" #type_b " x," #type_a " y) -> complex"), \
           [](Stack& stack) {                                                  \
-            actual_type_b a;                                                  \
-            actual_type_a b;                                                  \
-            pop(stack, a, b);                                                 \
+            auto [a, b] = pop<actual_type_b, actual_type_a>(stack);           \
             auto comp = c10::complex<double>(a, b.item<double>());            \
             push(stack, comp);                                                \
           },                                                                  \

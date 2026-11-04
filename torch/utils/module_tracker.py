@@ -1,6 +1,7 @@
+# mypy: allow-untyped-defs
+import logging
 import weakref
-
-from typing import Set
+from typing import TYPE_CHECKING
 
 import torch
 from torch.autograd.graph import register_multi_grad_hook
@@ -9,6 +10,16 @@ from torch.nn.modules.module import (
     register_module_forward_pre_hook,
 )
 from torch.utils._pytree import tree_flatten
+
+
+if TYPE_CHECKING:
+    from torch.utils.hooks import RemovableHandle
+
+
+logger = logging.getLogger(__name__)
+
+
+__all__ = ["ModuleTracker"]
 
 
 class ModuleTracker:
@@ -38,28 +49,43 @@ class ModuleTracker:
             def my_linear(m1, m2, bias):
                 print(f"Current modules: {tracker.parents}")
                 return torch.mm(m1, m2.t()) + bias
+
             torch.nn.functional.linear = my_linear
 
             mod(torch.rand(2, 2))
 
     """
 
-    parents: Set[str]
+    parents: set[str]
     """
     A Set containing the fqn for each module currently running their forward
     """
 
-    is_bw: bool
-    """
-    A boolean marking if this is currently running during the backward pass or not
-    """
-
-    def __init__(self):
+    def __init__(self) -> None:
         self.parents = {"Global"}
-        # This is used to reset parents at the end of the backward
-        self.is_bw = False
         self._known_modules: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-        self._seen_modules = set()
+        self._seen_modules: weakref.WeakSet = weakref.WeakSet()
+        self._has_callback = False
+        self._hooks: list[RemovableHandle] = []
+
+    def _maybe_set_engine_callback(self) -> None:
+        # This assumes no concurrent calls to backward
+        if self._has_callback:
+            return
+
+        def callback() -> None:
+            self.parents = {"Global"}
+            self._has_callback = False
+
+        torch.autograd.Variable._execution_engine.queue_callback(callback)
+        self._has_callback = True
+
+    @property
+    def is_bw(self):
+        """
+        A boolean marking if this is currently running during the backward pass or not
+        """
+        return torch._C._current_graph_task_id() != -1
 
     def _get_mod_name(self, mod):
         if mod not in self._known_modules:
@@ -68,52 +94,58 @@ class ModuleTracker:
         if mod not in self._seen_modules:
             for name, submod in mod.named_children():
                 self._known_modules[submod] = f"{mod_name}.{name}"
+                self._get_mod_name(submod)
+            self._seen_modules.add(mod)
         return mod_name
 
     def _get_append_fn(self, name, is_bw):
-        def fn(*args):
-            if self.is_bw != is_bw:
-                self.parents = {"Global"}
-                self.is_bw = is_bw
+        def fn(*args) -> None:
+            if is_bw:
+                self._maybe_set_engine_callback()
             if name in self.parents:
-                print(
-                    "The module hierarchy tracking seems to be messed up."
-                    "Please file a bug to PyTorch."
+                logger.info(
+                    "The module hierarchy tracking seems to be broken as this Module was already entered. %s during %s",
+                    name,
+                    "backward" if is_bw else "forward",
                 )
             self.parents.add(name)
 
         return fn
 
     def _get_pop_fn(self, name, is_bw):
-        def fn(*args):
+        def fn(*args) -> None:
             if name in self.parents:
                 self.parents.remove(name)
-            elif not is_bw:
-                # Due to some input/output not requiring gradients, we cannot enforce
-                # proper nesting in backward
-                raise RuntimeError(
-                    "The Module hierarchy tracking is wrong. Report a bug to PyTorch"
+            else:
+                logger.info(
+                    "The Module hierarchy tracking is confused as we're exiting a Module that was never entered. %s during %s",
+                    name,
+                    "backward" if is_bw else "forward",
                 )
 
         return fn
 
-    def _fw_pre_hook(self, mod, input):
+    def _fw_pre_hook(self, mod, input) -> None:
         name = self._get_mod_name(mod)
         self._get_append_fn(name, False)()
 
         args, _ = tree_flatten(input)
         tensors = [a for a in args if isinstance(a, torch.Tensor) and a.requires_grad]
         if tensors:
-            register_multi_grad_hook(tensors, self._get_pop_fn(name, True))
+            self._hooks.append(
+                register_multi_grad_hook(tensors, self._get_pop_fn(name, True))
+            )
 
-    def _fw_post_hook(self, mod, input, output):
+    def _fw_post_hook(self, mod, input, output) -> None:
         name = self._get_mod_name(mod)
         self._get_pop_fn(name, False)()
 
         args, _ = tree_flatten(output)
         tensors = [a for a in args if isinstance(a, torch.Tensor) and a.requires_grad]
         if tensors:
-            register_multi_grad_hook(tensors, self._get_append_fn(name, True))
+            self._hooks.append(
+                register_multi_grad_hook(tensors, self._get_append_fn(name, True))
+            )
 
     def __enter__(self):
         self._fw_pre_handle = register_module_forward_pre_hook(self._fw_pre_hook)
@@ -123,3 +155,6 @@ class ModuleTracker:
     def __exit__(self, *args):
         self._fw_pre_handle.remove()
         self._fw_post_handle.remove()
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()

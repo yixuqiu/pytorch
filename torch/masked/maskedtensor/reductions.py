@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 import warnings
@@ -6,6 +7,7 @@ import torch
 
 from .core import is_masked_tensor
 from .creation import as_masked_tensor, masked_tensor
+
 
 __all__ = []  # type: ignore[var-annotated]
 
@@ -88,7 +90,7 @@ def _torch_reduce_dim(fn):
                 "In the case that the semantics for the operator are not trivial, it would be appreciated "
                 "to also include a proposal for the semantics."
             )
-            warnings.warn(msg)
+            warnings.warn(msg, stacklevel=2)
             return NotImplemented
         if not is_masked_tensor(self):
             raise TypeError("Input to reduce_dim must be a MaskedTensor")
@@ -158,6 +160,7 @@ TENSOR_REDUCE_MAP = {
 NATIVE_REDUCE_FNS = list(NATIVE_REDUCE_MAP.keys())
 TORCH_REDUCE_FNS = list(TORCH_REDUCE_MAP.keys())
 TENSOR_REDUCE_FNS = list(TENSOR_REDUCE_MAP.keys())
+
 
 def _is_reduction(fn):
     return fn in NATIVE_REDUCE_MAP or fn in TORCH_REDUCE_MAP or fn in TENSOR_REDUCE_MAP

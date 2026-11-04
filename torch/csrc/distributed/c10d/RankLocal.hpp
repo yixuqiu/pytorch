@@ -54,8 +54,24 @@ class RankLocal {
     return it->second;
   }
 
+  // Apply a function to all thread-local instances and return the first
+  // non-empty result. This is useful for cross-thread lookups when we need
+  // to find data that may have been registered on a different thread.
+  // The function should have signature: std::optional<R>(T&)
+  template <typename F>
+  static auto find_across_all(F&& func) -> decltype(func(std::declval<T&>())) {
+    std::shared_lock read_lock(lock_);
+    for (auto& [thread_id, instance] : thread_id_to_rank_local_) {
+      auto result = func(instance);
+      if (result) {
+        return result;
+      }
+    }
+    return decltype(func(std::declval<T&>()))();
+  }
+
  private:
-  RankLocal(){};
+  RankLocal() = default;
   thread_local static T* cached_;
   static std::unordered_map<uint64_t, T> thread_id_to_rank_local_;
   static std::shared_mutex lock_;

@@ -1,5 +1,5 @@
 # @lint-ignore-every FBCODEBZLADDLOADS
-load("//tools/build_defs:glob_defs.bzl", "subdir_glob")
+load("@fbsource//tools/build_defs:glob_defs.bzl", "subdir_glob")
 
 # shared by internal and OSS BUCK
 def define_tools_targets(
@@ -26,7 +26,6 @@ def define_tools_targets(
 
     python_library(
         name = "jit",
-        # @lint-ignore BUCKRESTRICTEDSYNTAX
         srcs = glob([
             "jit/*.py",
             "jit/templates/*",
@@ -110,10 +109,7 @@ def define_tools_targets(
 
     python_library(
         name = "autograd",
-        # @lint-ignore BUCKRESTRICTEDSYNTAX
-        srcs = glob(
-            ["autograd/*.py"],
-        ),
+        srcs = glob(["autograd/*.py"]),
         base_module = "tools",
         resources = [
             "autograd/deprecated.yaml",
@@ -165,27 +161,8 @@ def define_tools_targets(
     python_binary(
         name = "generate_code_bin",
         main_module = "tools.setup_helpers.generate_code",
-        # Windows does not support inplace:
-        # https://github.com/facebook/buck/issues/2161.
-        #
-        # Note that //arvr/mode/embedded/win/clang-aarch64-release sets
-        # its target platform to
-        # ovr_config//platform/embedded:clang-aarch64-linux-release, hence
-        # that is why we are selecting that OS to trigger this behavior.
-        package_style = select({
-            "DEFAULT": "inplace",
-            "ovr_config//os:linux-arm64": "standalone",
-        }),
+        package_style = "inplace",
         visibility = ["PUBLIC"],
-        # Because Windows does not support inplace packaging, we need to
-        # ensure it is unzipped before executing it, otherwise it will not
-        # be able to find any resources using path manipulation.
-        #
-        # See note above about why the OS is Linux here and not Windows.
-        zip_safe = select({
-            "DEFAULT": True,
-            "ovr_config//os:linux-arm64": False,
-        }),
         deps = [
             ":generate_code",
         ],
@@ -289,20 +266,5 @@ def define_tools_targets(
         deps = [
             torchgen_deps,
             ":autograd",
-        ],
-    )
-
-    python_test(
-        name = "test_torchgen_executorch",
-        srcs = [
-            "test/test_executorch_gen.py",
-            "test/test_executorch_signatures.py",
-            "test/test_executorch_types.py",
-            "test/test_executorch_unboxing.py",
-        ],
-        contacts = contacts,
-        visibility = ["PUBLIC"],
-        deps = [
-            torchgen_deps,
         ],
     )

@@ -17,27 +17,27 @@ GIT_TOP_DIR=$(git rev-parse --show-toplevel)
 RELEASE_VERSION=${RELEASE_VERSION:-$(cut -d'.' -f1-2 "${GIT_TOP_DIR}/version.txt")}
 DRY_RUN=${DRY_RUN:-enabled}
 
-# Change all GitHub Actions to reference the test-infra release branch
-# as opposed to main.
 echo "Applying to workflows"
 for i in .github/workflows/*.yml; do
     sed -i -e s#@main#@"release/${RELEASE_VERSION}"# $i;
 done
 
-# Change all checkout step in templates to not add ref to checkout
 echo "Applying to templates"
 for i in .github/templates/*.yml.j2; do
-    sed -i 's#common.checkout(\(.*\))#common.checkout(\1, checkout_pr_head=False)#' $i;
+    sed -i '/checkout_pr_head/!s#common.checkout(\([^)]*\))#common.checkout(\1, checkout_pr_head=False)#' $i;
+    sed -i -e s#main#"release/${RELEASE_VERSION}"# $i;
 done
+
+echo "Applying to changes to linux binary builds"
+for i in  ".github/workflows/_binary-build-linux.yml" ".github/workflows/_binary-test-linux.yml"; do
+    sed -i "/github.event_name == 'pull_request'/d" $i;
+done
+
+sed -i "s#^        \.github/scripts/generate_ci_workflows.py#        RELEASE_VERSION_TAG=${RELEASE_VERSION} .github/scripts/generate_ci_workflows.py#" .github/workflows/lint.yml
 
 # Triton wheel
 echo "Triton Changes"
 sed -i -e s#-\ main#"-\ release\/${RELEASE_VERSION}"# .github/workflows/build-triton-wheel.yml
-
-# XLA related changes
-echo "XLA Changes"
-sed -i -e s#--quiet#-b\ r"${RELEASE_VERSION}"# .ci/pytorch/common_utils.sh
-sed -i -e s#.*#r"${RELEASE_VERSION}"# .github/ci_commit_pins/xla.txt
 
 # Regenerate templates
 export RELEASE_VERSION_TAG=${RELEASE_VERSION}
@@ -50,9 +50,7 @@ SLOW_VER=$(aws s3api list-object-versions --bucket ossci-metrics --prefix slow-t
 DISABLED_TESTS_VER=$(aws s3api list-object-versions --bucket ossci-metrics --prefix disabled-tests-condensed.json --query 'Versions[?IsLatest].[VersionId]' --output text)
 sed -i -e s#unstable-jobs.json#"unstable-jobs.json?versionId=${UNSTABLE_VER}"# .github/scripts/filter_test_configs.py
 sed -i -e s#disabled-jobs.json#"disabled-jobs.json?versionId=${DISABLED_VER}"# .github/scripts/filter_test_configs.py
-# please note we want to match slow-tests.json not .pytorch-slow-tests.json hence "/" is needed here
-sed -i -e s#/slow-tests.json#"/slow-tests.json?versionId=${SLOW_VER}"#  tools/stats/import_test_stats.py
 sed -i -e s#disabled-tests-condensed.json#"disabled-tests-condensed.json?versionId=${DISABLED_TESTS_VER}"# tools/stats/import_test_stats.py
 # Optional
-git commit -m "[RELEASE-ONLY CHANGES] Branch Cut for Release {RELEASE_VERSION}"
-git push origin "${RELEASE_BRANCH}"
+# git commit -m "[RELEASE-ONLY CHANGES] Branch Cut for Release ${RELEASE_VERSION}"
+# git push origin "release/${RELEASE_VERSION}"

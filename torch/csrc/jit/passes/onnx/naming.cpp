@@ -3,20 +3,18 @@
 
 #include <utility>
 
-namespace torch {
-namespace jit {
-namespace onnx {
+namespace torch::jit::onnx {
 
 namespace ONNXScopeName {
 
-using NameFunc = std::string (*)(torch::jit::ScopePtr scope);
+using NameFunc = std::string (*)(const torch::jit::ScopePtr& scope);
 
 const std::string name_separator = "::";
 
 namespace {
 
 std::string nameFromRoot(
-    torch::jit::ScopePtr scope,
+    const torch::jit::ScopePtr& scope,
     const std::string& layer_separator,
     NameFunc name_func) {
   std::string out = (*name_func)(scope);
@@ -32,7 +30,7 @@ std::string nameFromRoot(
 }
 
 std::pair<std::string, std::string> parseNameFromScope(
-    torch::jit::ScopePtr scope) {
+    const torch::jit::ScopePtr& scope) {
   std::string full_name = scope->name().toUnqualString();
   auto pos = full_name.find(name_separator);
   TORCH_CHECK(
@@ -50,27 +48,27 @@ std::string createFullScopeName(
   return std::string(class_name).append(name_separator).append(variable_name);
 }
 
-std::string variableName(torch::jit::ScopePtr scope) {
+std::string variableName(const torch::jit::ScopePtr& scope) {
   return parseNameFromScope(scope).second;
 }
 
 std::string variableNameFromRoot(
-    torch::jit::ScopePtr scope,
+    const torch::jit::ScopePtr& scope,
     const std::string& layer_separator) {
   return nameFromRoot(scope, layer_separator, &variableName);
 }
 
-std::string className(torch::jit::ScopePtr scope) {
+std::string className(const torch::jit::ScopePtr& scope) {
   return parseNameFromScope(scope).first;
 }
 
 std::string classNameFromRoot(
-    torch::jit::ScopePtr scope,
+    const torch::jit::ScopePtr& scope,
     const std::string& layer_separator) {
   return nameFromRoot(scope, layer_separator, &className);
 }
 
-bool isCompatibleScope(torch::jit::ScopePtr scope) {
+bool isCompatibleScope(const torch::jit::ScopePtr& scope) {
   return !scope->isRoot() && !scope->isBlank() &&
       (std::string(scope->name().toUnqualString()).find(name_separator) !=
        std::string::npos);
@@ -81,15 +79,15 @@ namespace {
 
 class NodeNameGenerator {
  public:
-  NodeNameGenerator(std::shared_ptr<Graph> g) : graph_(std::move(g)){};
+  NodeNameGenerator(std::shared_ptr<Graph> g) : graph_(std::move(g)) {}
   virtual ~NodeNameGenerator() = 0;
   void PopulateNodeNames();
 
  protected:
   virtual void CreateNodeName(Node* n) = 0;
-  void PopulateNodeNames(Block*);
+  void PopulateNodeNames(Block* /*b*/);
   void UpdateOutputsNames(Node* n);
-  bool IsGraphOutput(const Value* v, const std::shared_ptr<Graph> graph) const;
+  bool IsGraphOutput(const Value* v, const std::shared_ptr<Graph>& graph) const;
 
  protected:
   std::string CreateUniqueName(
@@ -99,19 +97,21 @@ class NodeNameGenerator {
   std::unordered_map<const Node*, std::string> node_names_;
   std::unordered_map<std::string, size_t> base_node_name_counts_;
   std::shared_ptr<Graph> graph_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const std::string layer_separator_ = "/";
 };
 NodeNameGenerator::~NodeNameGenerator() = default;
 
 class ScopedNodeNameGenerator : public NodeNameGenerator {
  public:
-  ScopedNodeNameGenerator(std::shared_ptr<Graph> g) : NodeNameGenerator(g){};
+  ScopedNodeNameGenerator(std::shared_ptr<Graph> g)
+      : NodeNameGenerator(std::move(g)) {}
 
  protected:
   void CreateNodeName(Node* n) override;
 
  private:
-  std::string GetFullScopeName(ScopePtr scope);
+  std::string GetFullScopeName(const ScopePtr& scope);
   std::unordered_map<ScopePtr, std::string> full_scope_names_;
   std::unordered_map<std::string, size_t> base_scope_name_counts_;
 };
@@ -119,11 +119,11 @@ class ScopedNodeNameGenerator : public NodeNameGenerator {
 std::string NodeNameGenerator::CreateUniqueName(
     std::unordered_map<std::string, size_t>& base_name_count,
     std::string base_name) {
-  if (base_name_count.find(base_name) == base_name_count.end()) {
+  if (!base_name_count.contains(base_name)) {
     base_name_count[base_name] = 0;
   } else {
     auto count = ++base_name_count[base_name];
-    base_name += "_";
+    base_name += '_';
     base_name += std::to_string(count);
   }
   return base_name;
@@ -131,7 +131,7 @@ std::string NodeNameGenerator::CreateUniqueName(
 
 bool NodeNameGenerator::IsGraphOutput(
     const Value* v,
-    const std::shared_ptr<Graph> graph) const {
+    const std::shared_ptr<Graph>& graph) const {
   for (const auto* graph_output : graph->outputs()) {
     if (v == graph_output) {
       return true;
@@ -141,7 +141,7 @@ bool NodeNameGenerator::IsGraphOutput(
 }
 
 void NodeNameGenerator::UpdateOutputsNames(Node* n) {
-  if (node_names_.find(n) != node_names_.end()) {
+  if (node_names_.contains(n)) {
     auto node_name = node_names_[n];
     for (auto i : c10::irange(n->outputs().size())) {
       auto output = n->output(i);
@@ -169,7 +169,7 @@ void NodeNameGenerator::PopulateNodeNames(Block* b) {
 }
 
 void ScopedNodeNameGenerator::CreateNodeName(Node* n) {
-  if (node_names_.find(n) == node_names_.end()) {
+  if (!node_names_.contains(n)) {
     if (!ONNXScopeName::isCompatibleScope(n->scope())) {
       return;
     }
@@ -185,8 +185,8 @@ void ScopedNodeNameGenerator::CreateNodeName(Node* n) {
   n->s_(Symbol::attr(::torch::onnx::kOnnxNodeNameAttribute), node_names_[n]);
 }
 
-std::string ScopedNodeNameGenerator::GetFullScopeName(ScopePtr scope) {
-  if (full_scope_names_.find(scope) == full_scope_names_.end()) {
+std::string ScopedNodeNameGenerator::GetFullScopeName(const ScopePtr& scope) {
+  if (!full_scope_names_.contains(scope)) {
     auto full_scope_name =
         ONNXScopeName::variableNameFromRoot(scope, layer_separator_);
     full_scope_names_[scope] =
@@ -202,6 +202,4 @@ void AssignScopedNamesForNodeAndValue(std::shared_ptr<Graph>& graph) {
   node_name_generator->PopulateNodeNames();
 }
 
-} // namespace onnx
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::onnx

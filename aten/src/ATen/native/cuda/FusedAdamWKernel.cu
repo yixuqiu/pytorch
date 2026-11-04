@@ -5,8 +5,7 @@
 #include <ATen/native/cuda/fused_adamw_amsgrad_impl.cuh>
 #include <ATen/native/cuda/fused_adamw_impl.cuh>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 // note(crcrpar): To observe the CI rules, i.e. 20 minutes per file to compile,
 // defensively split instantiations into _impl files. this is only for CUDA 11.3
@@ -28,12 +27,17 @@ void _fused_adamw_kernel_cuda_(
     const double eps,
     const bool amsgrad,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
+  const bool is_mixed_precision =
+      params[0].scalar_type() != exp_avgs[0].scalar_type();
   if (amsgrad) {
     TORCH_CHECK(
         at::native::check_fast_path_restrictions(
-            {params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs}),
+            {params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs},
+            /*scalarList=*/{},
+            /*does_op_promote_integer_inputs_to_float=*/false,
+            /*skip_cross_list_dtype_check=*/is_mixed_precision),
         "params, grads, exp_avgs, exp_avg_sqs, and max_exp_avg_sqs must have same dtype, device, and layout");
     _fused_adamw_amsgrad_cuda_impl_(
         params,
@@ -53,7 +57,10 @@ void _fused_adamw_kernel_cuda_(
   } else {
     TORCH_CHECK(
         at::native::check_fast_path_restrictions(
-            {params, grads, exp_avgs, exp_avg_sqs}),
+            {params, grads, exp_avgs, exp_avg_sqs},
+            /*scalarList=*/{},
+            /*does_op_promote_integer_inputs_to_float=*/false,
+            /*skip_cross_list_dtype_check=*/is_mixed_precision),
         "params, grads, exp_avgs, and exp_avg_sqs must have same dtype, device, and layout");
     _fused_adamw_cuda_impl_(
         params,
@@ -87,8 +94,8 @@ void _fused_adamw_kernel_cuda_(
     const double eps,
     const bool amsgrad,
     const bool maximize,
-    const c10::optional<at::Tensor>& grad_scale,
-    const c10::optional<at::Tensor>& found_inf) {
+    const std::optional<at::Tensor>& grad_scale,
+    const std::optional<at::Tensor>& found_inf) {
   if (lr.is_cpu()) {
     _fused_adamw_kernel_cuda_(
         params,
@@ -112,12 +119,12 @@ void _fused_adamw_kernel_cuda_(
   // Manually check devices since we specify no device check in
   // native_functions.yaml
   Device param_device = params[0].device();
-  if (grad_scale != c10::nullopt) {
+  if (grad_scale.has_value()) {
     TORCH_CHECK(
         grad_scale->device() == param_device,
         "grad_scale must be on the same GPU device as the params");
   }
-  if (found_inf != c10::nullopt) {
+  if (found_inf.has_value()) {
     TORCH_CHECK(
         found_inf->device() == param_device,
         "found_inf must be on the same GPU device as the params");
@@ -126,10 +133,15 @@ void _fused_adamw_kernel_cuda_(
       lr.device() == param_device,
       "lr must be on the same GPU device as the params");
 
+  const bool is_mixed_precision =
+      params[0].scalar_type() != exp_avgs[0].scalar_type();
   if (amsgrad) {
     TORCH_CHECK(
         at::native::check_fast_path_restrictions(
-            {params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs}),
+            {params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs},
+            /*scalarList=*/{},
+            /*does_op_promote_integer_inputs_to_float=*/false,
+            /*skip_cross_list_dtype_check=*/is_mixed_precision),
         "params, grads, exp_avgs, exp_avg_sqs, and max_exp_avg_sqs must have same dtype, device, and layout");
     _fused_adamw_amsgrad_cuda_impl_(
         params,
@@ -149,7 +161,10 @@ void _fused_adamw_kernel_cuda_(
   } else {
     TORCH_CHECK(
         at::native::check_fast_path_restrictions(
-            {params, grads, exp_avgs, exp_avg_sqs}),
+            {params, grads, exp_avgs, exp_avg_sqs},
+            /*scalarList=*/{},
+            /*does_op_promote_integer_inputs_to_float=*/false,
+            /*skip_cross_list_dtype_check=*/is_mixed_precision),
         "params, grads, exp_avgs, and exp_avg_sqs must have same dtype, device, and layout");
     _fused_adamw_cuda_impl_(
         params,
@@ -168,5 +183,4 @@ void _fused_adamw_kernel_cuda_(
   }
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

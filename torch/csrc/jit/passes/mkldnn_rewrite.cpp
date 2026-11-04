@@ -4,12 +4,10 @@
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/constant_propagation.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/graph_rewrite_helper.h>
 #include <torch/csrc/jit/passes/mkldnn_rewrite.h>
 #include <torch/csrc/jit/tensorexpr/kernel.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 #if AT_MKLDNN_ENABLED()
 
@@ -110,16 +108,6 @@ static void insertMkldnnPrePackedConv2dOp(std::shared_ptr<Graph>& graph) {
 
 static void insertMkldnnPrePackedOps(std::shared_ptr<Graph>& graph) {
   insertMkldnnPrePackedConv2dOp(graph);
-}
-
-static void insertMkldnnPrePackedOps(script::Module& module) {
-  for (auto& method : module.get_methods()) {
-    auto graph = method.graph();
-    insertMkldnnPrePackedOps(graph);
-  }
-  for (script::Module m : module.children()) {
-    insertMkldnnPrePackedOps(m);
-  }
 }
 
 static void FuseReluWithPackedOps(std::shared_ptr<Graph>& graph) {
@@ -227,5 +215,4 @@ void FuseConvWithEltwise(std::shared_ptr<Graph>& graph) {
 
 #endif // AT_MKLDNN_ENABLED()
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

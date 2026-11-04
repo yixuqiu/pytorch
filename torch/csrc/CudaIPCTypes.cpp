@@ -23,7 +23,7 @@ struct CudaIPCGlobalEntities {
   // This class is used as a singleton (see cuda_ipc_global_entities)
   // This variable is used to track its lifetime to avoid accessing it
   // after it was destroyed which would lead to segmentation faults
-  // Note that a trvial type is used which doesn't suffer from construction
+  // Note that a trivial type is used which doesn't suffer from construction
   // and destruction order issues
   static bool alive;
 
@@ -36,13 +36,17 @@ struct CudaIPCGlobalEntities {
   CudaIPCGlobalEntities() {
     alive = true;
   }
+  CudaIPCGlobalEntities(const CudaIPCGlobalEntities&) = delete;
+  CudaIPCGlobalEntities(CudaIPCGlobalEntities&&) = delete;
+  CudaIPCGlobalEntities& operator=(const CudaIPCGlobalEntities&) = delete;
+  CudaIPCGlobalEntities& operator=(CudaIPCGlobalEntities&&) = delete;
   ~CudaIPCGlobalEntities() {
+    alive = false;
     CudaIPCSentDataLimbo_.collect();
     safe_clean_current_file();
     if (next_available_ref_counters_file_) {
       warnProducerTerminatedBeforeSharedTensorsReleased();
     }
-    alive = false;
   }
   void safe_clean_current_file() {
     std::lock_guard<std::mutex> lock(ref_counters_mutex_);
@@ -146,7 +150,6 @@ CudaIPCSentData::CudaIPCSentData(
     : handle_(std::move(handle)),
       offset_(offset),
       counter_ptr_(counter_ptr),
-      original_ptr_(),
       device_(device) {
 #if !defined(USE_ROCM)
   // CUDA have the unofficial limit on the number of recorded blocking
@@ -191,6 +194,9 @@ CudaIPCSentData::CudaIPCSentData(
 }
 
 CudaIPCSentData::~CudaIPCSentData() {
+  if (!CudaIPCGlobalEntities::alive) {
+    original_ptr_.release_context();
+  }
   ReturnRefCounter(handle_, offset_);
 #if !defined(USE_ROCM)
   try {
@@ -202,6 +208,7 @@ CudaIPCSentData::~CudaIPCSentData() {
       }
       cuda_ipc_global_entities.sync_events_used_--;
     }
+    // NOLINTNEXTLINE(bugprone-empty-catch)
   } catch (...) { /* No throw */
   }
 #endif
@@ -212,11 +219,14 @@ uint64_t CudaIPCSentData::counter_value() {
 }
 
 at::DataPtr GetNewRefCountedSentData(void* data, at::Device device) {
+  std::string ref_counter_handle;
+  uint64_t ref_counter_offset;
+  uint64_t* ref_counter_ptr;
   {
     std::lock_guard<std::mutex> lock(
         cuda_ipc_global_entities.ref_counters_mutex_);
     if (!cuda_ipc_global_entities.next_available_ref_counters_file_) {
-      std::string ref_counter_handle = at::NewProcessWideShmHandle();
+      ref_counter_handle = at::NewProcessWideShmHandle();
 
       int flags =
           at::ALLOCATOR_MAPPED_SHAREDMEM | at::ALLOCATOR_MAPPED_EXCLUSIVE;
@@ -230,20 +240,27 @@ at::DataPtr GetNewRefCountedSentData(void* data, at::Device device) {
       cuda_ipc_global_entities.ref_counters_files_[ref_counter_handle] = rc;
       cuda_ipc_global_entities.next_available_ref_counters_file_ = rc;
     }
+    auto& ref_counter_file =
+        cuda_ipc_global_entities.next_available_ref_counters_file_;
+    ref_counter_handle = ref_counter_file->handle();
+    ref_counter_offset = ref_counter_file->get_offset();
+    ref_counter_ptr = ref_counter_file->counter_ptr();
+    // Reserve the slot before CudaIPCSentData can trigger IPC collection.
+    ref_counter_file->set_counter(1);
+    ref_counter_file->rotate_offset();
+    if (!ref_counter_file->have_offsets()) {
+      ref_counter_file.reset();
+    }
   }
-  cuda_ipc_global_entities.next_available_ref_counters_file_->set_counter(1);
-  auto sent_data = new CudaIPCSentData(
-      cuda_ipc_global_entities.next_available_ref_counters_file_->handle(),
-      cuda_ipc_global_entities.next_available_ref_counters_file_->get_offset(),
-      cuda_ipc_global_entities.next_available_ref_counters_file_->counter_ptr(),
-      device);
-
-  cuda_ipc_global_entities.next_available_ref_counters_file_->rotate_offset();
-  if (!cuda_ipc_global_entities.next_available_ref_counters_file_
-           ->have_offsets()) {
-    cuda_ipc_global_entities.next_available_ref_counters_file_.reset();
+  try {
+    auto sent_data = std::make_unique<CudaIPCSentData>(
+        ref_counter_handle, ref_counter_offset, ref_counter_ptr, device);
+    return at::DataPtr(
+        data, sent_data.release(), CudaIPCSentDataDelete, device);
+  } catch (...) {
+    ReturnRefCounter(ref_counter_handle, ref_counter_offset);
+    throw;
   }
-  return at::DataPtr(data, sent_data, CudaIPCSentDataDelete, device);
 }
 
 bool CudaIPCCollect() {
@@ -261,6 +278,6 @@ bool CudaIPCCollect() {
 
 namespace c10 {
 namespace {
-REGISTER_FREE_MEMORY_CALLBACK("cuda_ipc_collect", CudaIPCCollectCallback);
+REGISTER_FREE_MEMORY_CALLBACK("cuda_ipc_collect", CudaIPCCollectCallback)
 }
 } // namespace c10

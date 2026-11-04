@@ -32,7 +32,7 @@ def main():
         va = str(ja.get(key, "-"))
         vb = str(jb.get(key, "-"))
         print(f"{key + ':':20s} {va:>20s}  vs  {vb:>20s}")
-    print("")
+    print()
 
     ba = ja["benchmark_results"]
     bb = jb["benchmark_results"]
@@ -48,13 +48,11 @@ def main():
         print(f"Benchmark: {name}")
 
         # Print header
-        print("")
-        print(f"{'':>10s}", end="")  # noqa: E999
+        print()
+        print(f"{'':>10s}", end="")
         for _ in [75, 95]:
-            print(
-                f"{'sec/iter':>16s}{'ex/sec':>10s}{'diff':>10s}", end=""
-            )  # noqa: E999
-        print("")
+            print(f"{'sec/iter':>16s}{'ex/sec':>10s}{'diff':>10s}", end="")
+        print()
 
         # Print measurements
         for i, (xa, xb) in enumerate(zip(ra["result"], rb["result"])):
@@ -68,7 +66,7 @@ def main():
             ngpus = len(xa["ranks"])
             ma = sorted(xa["measurements"])
             mb = sorted(xb["measurements"])
-            print(f"{ngpus:>4d} GPUs:", end="")  # noqa: E999
+            print(f"{ngpus:>4d} GPUs:", end="")
             for p in [75, 95]:
                 va = np.percentile(ma, p)
                 vb = np.percentile(mb, p)
@@ -77,9 +75,9 @@ def main():
                 print(
                     f"  p{p:02d}: {vb:8.3f}s {int(batch_size / vb):7d}/s {delta:+8.1f}%",
                     end="",
-                )  # noqa: E999
-            print("")
-        print("")
+                )
+            print()
+        print()
 
 
 if __name__ == "__main__":

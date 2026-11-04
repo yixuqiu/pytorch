@@ -2,19 +2,11 @@ name,accuracy,graph_breaks
 
 
 
-torchrec_dlrm,fail_to_run,3
-
-
-
 BERT_pytorch,pass,6
 
 
 
 Background_Matting,pass_due_to_skip,0
-
-
-
-DALLE2_pytorch,eager_fail_to_run,0
 
 
 
@@ -30,7 +22,7 @@ alexnet,pass,6
 
 
 
-basic_gnn_edgecnn,pass,22
+basic_gnn_edgecnn,pass,20
 
 
 
@@ -50,7 +42,7 @@ dcgan,pass,6
 
 
 
-demucs,fail_to_run,4
+demucs,pass,10
 
 
 
@@ -66,7 +58,7 @@ dlrm,pass,6
 
 
 
-drq,pass,6
+drq,pass,7
 
 
 
@@ -82,58 +74,6 @@ functorch_maml_omniglot,pass,7
 
 
 
-hf_Albert,pass,6
-
-
-
-hf_Bart,pass,6
-
-
-
-hf_Bert,pass,6
-
-
-
-hf_Bert_large,pass,6
-
-
-
-hf_BigBird,fail_to_run,3
-
-
-
-hf_DistilBert,pass,6
-
-
-
-hf_GPT2,pass,6
-
-
-
-hf_GPT2_large,pass_due_to_skip,0
-
-
-
-hf_Reformer,pass,26
-
-
-
-hf_T5_base,eager_2nd_run_OOM,0
-
-
-
-hf_T5_large,pass_due_to_skip,0
-
-
-
-hf_Whisper,pass,6
-
-
-
-hf_distil_whisper,model_fail_to_load,0
-
-
-
 lennard_jones,pass,7
 
 
@@ -143,6 +83,10 @@ llava,model_fail_to_load,0
 
 
 maml_omniglot,pass,7
+
+
+
+microbench_unbacked_tolist_sum,pass,9
 
 
 
@@ -162,7 +106,7 @@ mobilenet_v3_large,pass,7
 
 
 
-moco,pass,11
+moco,pass,13
 
 
 
@@ -183,10 +127,6 @@ phlippe_densenet,pass,6
 
 
 phlippe_resnet,pass,6
-
-
-
-pytorch_CycleGAN_and_pix2pix,pass,6
 
 
 
@@ -234,43 +174,15 @@ squeezenet1_1,pass,6
 
 
 
-stable_diffusion_text_encoder,pass,5
-
-
-
-stable_diffusion_unet,pass_due_to_skip,0
-
-
-
-timm_efficientnet,pass,7
-
-
-
-timm_regnet,pass,6
-
-
-
-timm_resnest,pass,7
-
-
-
-timm_vision_transformer,pass,6
-
-
-
-timm_vision_transformer_large,pass_due_to_skip,0
-
-
-
-timm_vovnet,pass,6
-
-
-
 torch_multimodal_clip,pass,7
 
 
 
-tts_angular,pass,9
+torchrec_dlrm,pass,6
+
+
+
+tts_angular,pass,12
 
 
 
@@ -278,8 +190,8 @@ vgg16,pass,6
 
 
 
-vision_maskrcnn,pass,34
+vision_maskrcnn,fail_to_run,33
 
 
 
-yolov3,pass,9
+yolov3,pass,8

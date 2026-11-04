@@ -40,14 +40,14 @@ namespace torch::autograd {
 ///     compute param `tensors`.
 //      When inputs are provided and a given input is not a leaf,
 //      the current implementation will call its grad_fn (even though it is not
-//      strictly needed to get this gradients). It is an implementation detail
+//      strictly needed to get these gradients). It is an implementation detail
 //      on which the user should not rely. See
 //      https://github.com/pytorch/pytorch/pull/60521#issuecomment-867061780 for
 //      more details.
 TORCH_API void backward(
     const variable_list& tensors,
     const variable_list& grad_tensors = {},
-    c10::optional<bool> retain_graph = c10::nullopt,
+    std::optional<bool> retain_graph = std::nullopt,
     bool create_graph = false,
     const variable_list& inputs = {});
 
@@ -81,7 +81,7 @@ TORCH_API variable_list grad(
     const variable_list& outputs,
     const variable_list& inputs,
     const variable_list& grad_outputs = {},
-    c10::optional<bool> retain_graph = c10::nullopt,
+    std::optional<bool> retain_graph = std::nullopt,
     bool create_graph = false,
     bool allow_unused = false);
 

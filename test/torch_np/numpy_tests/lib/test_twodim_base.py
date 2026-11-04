@@ -1,10 +1,8 @@
 # Owner(s): ["module: dynamo"]
 
-"""Test functions for matrix module
+"""Test functions for matrix module"""
 
-"""
 import functools
-
 from unittest import expectedFailure as xfail, skipIf as skipif
 
 import pytest
@@ -16,7 +14,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
-    xpassIfTorchDynamo,
+    xpassIfTorchDynamo_np,
 )
 
 
@@ -33,7 +31,7 @@ if TEST_WITH_TORCHDYNAMO:
         flipud,
         histogram2d,
         ones,
-        tri,  # mask_indices,
+        tri,
         tril_indices,
         tril_indices_from,
         triu_indices,
@@ -44,7 +42,7 @@ if TEST_WITH_TORCHDYNAMO:
     from numpy.testing import (
         assert_allclose,
         assert_array_almost_equal,
-        assert_array_equal,  # assert_array_max_ulp,
+        assert_array_equal,
         assert_equal,
     )
 else:
@@ -58,7 +56,7 @@ else:
         flipud,
         histogram2d,
         ones,
-        tri,  # mask_indices,
+        tri,
         tril_indices,
         tril_indices_from,
         triu_indices,
@@ -69,7 +67,7 @@ else:
     from torch._numpy.testing import (
         assert_allclose,
         assert_array_almost_equal,
-        assert_array_equal,  # assert_array_max_ulp,
+        assert_array_equal,
         assert_equal,
     )
 
@@ -133,15 +131,19 @@ class TestEye(TestCase):
     def test_bool(self):
         assert_equal(eye(2, 2, dtype=bool), [[True, False], [False, True]])
 
-    @xpassIfTorchDynamo  # (reason="TODO: implement order=non-default")
+    @xpassIfTorchDynamo_np  # (reason="TODO: implement order=non-default")
     def test_order(self):
         mat_c = eye(4, 3, k=-1)
         mat_f = eye(4, 3, k=-1, order="F")
         assert_equal(mat_c, mat_f)
-        assert mat_c.flags.c_contiguous
-        assert not mat_c.flags.f_contiguous
-        assert not mat_f.flags.c_contiguous
-        assert mat_f.flags.f_contiguous
+        if not mat_c.flags.c_contiguous:
+            raise AssertionError("Expected mat_c.flags.c_contiguous to be True")
+        if mat_c.flags.f_contiguous:
+            raise AssertionError("Expected mat_c.flags.f_contiguous to be False")
+        if mat_f.flags.c_contiguous:
+            raise AssertionError("Expected mat_f.flags.c_contiguous to be False")
+        if not mat_f.flags.f_contiguous:
+            raise AssertionError("Expected mat_f.flags.f_contiguous to be True")
 
 
 class TestDiag(TestCase):
@@ -175,7 +177,7 @@ class TestDiag(TestCase):
             b[k] = vals[k + 2, k]
         assert_equal(diag(vals, -2), b[:3])
 
-    @xpassIfTorchDynamo  # (reason="TODO implement orders")
+    @xpassIfTorchDynamo_np  # (reason="TODO implement orders")
     def test_fortran_order(self):
         vals = array((100 * get_mat(5) + 1), order="F", dtype="l")
         self.check_matrix(vals)
@@ -284,7 +286,7 @@ class TestHistogram2d(TestCase):
         # assert_array_max_ulp(a, np.zeros((4, 4)))
         assert_allclose(a, np.zeros((4, 4)), atol=1e-15)
 
-    @xpassIfTorchDynamo  # (reason="pytorch does not support bins = [int, array]")
+    @xpassIfTorchDynamo_np  # (reason="pytorch does not support bins = [int, array]")
     def test_binparameter_combination(self):
         x = array([0, 0.09207008, 0.64575234, 0.12875982, 0.47390599, 0.59944483, 1])
         y = array([0, 0.14344267, 0.48988575, 0.30558665, 0.44700682, 0.15886423, 1])

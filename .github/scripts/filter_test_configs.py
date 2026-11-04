@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ruff: noqa: LOG015
+from __future__ import annotations
 
 import json
 import logging
@@ -8,33 +10,32 @@ import subprocess
 import sys
 import warnings
 from enum import Enum
-from functools import lru_cache
-from logging import info
-from typing import Any, Callable, Dict, List, Optional, Set
+from functools import cache
+from logging import info, warning
+from typing import Any, TYPE_CHECKING
 from urllib.request import Request, urlopen
 
 import yaml
 
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
 REENABLE_TEST_REGEX = "(?i)(Close(d|s)?|Resolve(d|s)?|Fix(ed|es)?) (#|https://github.com/pytorch/pytorch/issues/)([0-9]+)"
+MAIN_BRANCH = "main"
 
 PREFIX = "test-config/"
 
 logging.basicConfig(level=logging.INFO)
 
 
-def is_cuda_or_rocm_job(job_name: Optional[str]) -> bool:
-    if not job_name:
-        return False
-
-    return "cuda" in job_name or "rocm" in job_name
-
-
 # Supported modes when running periodically. Only applying the mode when
-# its lambda condition returns true
-SUPPORTED_PERIODICAL_MODES: Dict[str, Callable[[Optional[str]], bool]] = {
-    # Memory leak check is only needed for CUDA and ROCm jobs which utilize GPU memory
-    "mem_leak_check": is_cuda_or_rocm_job,
-    "rerun_disabled_tests": lambda job_name: True,
+# its lambda condition returns true. Each callable receives (job_name, config).
+SUPPORTED_PERIODICAL_MODES: dict[
+    str, Callable[[str | None, dict[str, Any] | None], bool]
+] = {
+    "rerun_disabled_tests": lambda job_name, config=None: True,
 }
 
 # The link to the published list of disabled jobs
@@ -49,7 +50,10 @@ TEST_JOB_NAME = "test"
 BUILD_AND_TEST_JOB_NAME = "build-and-test"
 JOB_NAME_CFG_REGEX = re.compile(r"(?P<job>[\w-]+)\s+\((?P<cfg>[\w-]+)\)")
 EXCLUDED_BRANCHES = ["nightly"]
-MEM_LEAK_LABEL = "enable-mem-leak-check"
+
+# LF-fleet allowlist enforcement (ci-infra#1081)
+LF_PREFIX = "lf-"
+META_PREFIX = "mt-"
 
 
 class IssueType(Enum):
@@ -73,12 +77,17 @@ def parse_args() -> Any:
         help="a comma-separated list of test configurations from the test matrix to keep",
     )
     parser.add_argument(
+        "--ignore-test-config-labels",
+        action="store_true",
+        help="ignore test-config/* PR labels when filtering the test matrix",
+    )
+    parser.add_argument(
         "--workflow", type=str, help="the name of the current workflow, i.e. pull"
     )
     parser.add_argument(
         "--job-name",
         type=str,
-        help="the name of the current job, i.e. linux-focal-py3.8-gcc7 / build",
+        help="the name of the current job, i.e. linux-jammy-py3.8-gcc7 / build",
     )
     parser.add_argument("--pr-number", type=str, help="the pull request number")
     parser.add_argument("--tag", type=str, help="the associated tag if it exists")
@@ -95,14 +104,24 @@ def parse_args() -> Any:
     parser.add_argument(
         "--branch",
         type=str,
-        default="main",
+        default=MAIN_BRANCH,
         help="the branch name",
+    )
+    parser.add_argument(
+        "--lf-runners",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated ARC runners allowed on LF, as resolved by "
+            "runner_determinator.py's get_lf_runners_output(). Empty string "
+            "means unrestricted."
+        ),
     )
     return parser.parse_args()
 
 
-@lru_cache(maxsize=None)
-def get_pr_info(pr_number: int) -> Dict[str, Any]:
+@cache
+def get_pr_info(pr_number: int) -> dict[str, Any]:
     """
     Dynamically get PR information
     """
@@ -115,7 +134,7 @@ def get_pr_info(pr_number: int) -> Dict[str, Any]:
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"token {github_token}",
     }
-    json_response: Dict[str, Any] = download_json(
+    json_response: dict[str, Any] = download_json(
         url=f"{pytorch_github_api}/issues/{pr_number}",
         headers=headers,
     )
@@ -127,7 +146,7 @@ def get_pr_info(pr_number: int) -> Dict[str, Any]:
     return json_response
 
 
-def get_labels(pr_number: int) -> Set[str]:
+def get_labels(pr_number: int) -> set[str]:
     """
     Dynamically get the latest list of labels from the pull request
     """
@@ -137,14 +156,18 @@ def get_labels(pr_number: int) -> Set[str]:
     }
 
 
-def filter_labels(labels: Set[str], label_regex: Any) -> Set[str]:
+def filter_labels(labels: set[str], label_regex: Any) -> set[str]:
     """
     Return the list of matching labels
     """
     return {l for l in labels if re.match(label_regex, l)}
 
 
-def filter(test_matrix: Dict[str, List[Any]], labels: Set[str]) -> Dict[str, List[Any]]:
+def filter(
+    test_matrix: dict[str, list[Any]],
+    labels: set[str],
+    ignore_test_config_labels: bool = False,
+) -> dict[str, list[Any]]:
     """
     Select the list of test config to run from the test matrix. The logic works
     as follows:
@@ -156,7 +179,11 @@ def filter(test_matrix: Dict[str, List[Any]], labels: Set[str]) -> Dict[str, Lis
 
     If the PR has none of the test-config label, all tests are run as usual.
     """
-    filtered_test_matrix: Dict[str, List[Any]] = {"include": []}
+    if ignore_test_config_labels:
+        warning("Ignoring test-config/* PR labels by explicit request")
+        return test_matrix
+
+    filtered_test_matrix: dict[str, list[Any]] = {"include": []}
 
     for entry in test_matrix.get("include", []):
         config_name = entry.get("config", "")
@@ -184,8 +211,8 @@ def filter(test_matrix: Dict[str, List[Any]], labels: Set[str]) -> Dict[str, Lis
 
 
 def filter_selected_test_configs(
-    test_matrix: Dict[str, List[Any]], selected_test_configs: Set[str]
-) -> Dict[str, List[Any]]:
+    test_matrix: dict[str, list[Any]], selected_test_configs: set[str]
+) -> dict[str, list[Any]]:
     """
     Keep only the selected configs if the list if not empty. Otherwise, keep all test configs.
     This filter is used when the workflow is dispatched manually.
@@ -193,7 +220,7 @@ def filter_selected_test_configs(
     if not selected_test_configs:
         return test_matrix
 
-    filtered_test_matrix: Dict[str, List[Any]] = {"include": []}
+    filtered_test_matrix: dict[str, list[Any]] = {"include": []}
     for entry in test_matrix.get("include", []):
         config_name = entry.get("config", "")
         if not config_name:
@@ -206,18 +233,18 @@ def filter_selected_test_configs(
 
 
 def set_periodic_modes(
-    test_matrix: Dict[str, List[Any]], job_name: Optional[str]
-) -> Dict[str, List[Any]]:
+    test_matrix: dict[str, list[Any]], job_name: str | None
+) -> dict[str, list[Any]]:
     """
     Apply all periodic modes when running under a schedule
     """
-    scheduled_test_matrix: Dict[str, List[Any]] = {
+    scheduled_test_matrix: dict[str, list[Any]] = {
         "include": [],
     }
 
     for config in test_matrix.get("include", []):
         for mode, cond in SUPPORTED_PERIODICAL_MODES.items():
-            if not cond(job_name):
+            if not cond(job_name, config):
                 continue
 
             cfg = config.copy()
@@ -228,8 +255,8 @@ def set_periodic_modes(
 
 
 def mark_unstable_jobs(
-    workflow: str, job_name: str, test_matrix: Dict[str, List[Any]]
-) -> Dict[str, List[Any]]:
+    workflow: str, job_name: str, test_matrix: dict[str, list[Any]]
+) -> dict[str, list[Any]]:
     """
     Check the list of unstable jobs and mark them accordingly. Note that if a job
     is unstable, all its dependents will also be marked accordingly
@@ -244,8 +271,8 @@ def mark_unstable_jobs(
 
 
 def remove_disabled_jobs(
-    workflow: str, job_name: str, test_matrix: Dict[str, List[Any]]
-) -> Dict[str, List[Any]]:
+    workflow: str, job_name: str, test_matrix: dict[str, list[Any]]
+) -> dict[str, list[Any]]:
     """
     Check the list of disabled jobs, remove the current job and all its dependents
     if it exists in the list
@@ -260,15 +287,15 @@ def remove_disabled_jobs(
 
 
 def _filter_jobs(
-    test_matrix: Dict[str, List[Any]],
+    test_matrix: dict[str, list[Any]],
     issue_type: IssueType,
-    target_cfg: Optional[str] = None,
-) -> Dict[str, List[Any]]:
+    target_cfg: str | None = None,
+) -> dict[str, list[Any]]:
     """
     An utility function used to actually apply the job filter
     """
     # The result will be stored here
-    filtered_test_matrix: Dict[str, List[Any]] = {"include": []}
+    filtered_test_matrix: dict[str, list[Any]] = {"include": []}
 
     # This is an issue to disable a CI job
     if issue_type == IssueType.DISABLED:
@@ -301,10 +328,10 @@ def _filter_jobs(
 def process_jobs(
     workflow: str,
     job_name: str,
-    test_matrix: Dict[str, List[Any]],
+    test_matrix: dict[str, list[Any]],
     issue_type: IssueType,
     url: str,
-) -> Dict[str, List[Any]]:
+) -> dict[str, list[Any]]:
     """
     Both disabled and unstable jobs are in the following format:
 
@@ -331,7 +358,7 @@ def process_jobs(
         # The job name from github is in the PLATFORM / JOB (CONFIG) format, so breaking
         # it into its two components first
         current_platform, _ = (n.strip() for n in job_name.split(JOB_NAME_SEP, 1) if n)
-    except ValueError as error:
+    except ValueError:
         warnings.warn(f"Invalid job name {job_name}, returning")
         return test_matrix
 
@@ -440,7 +467,7 @@ def process_jobs(
     return test_matrix
 
 
-def download_json(url: str, headers: Dict[str, str], num_retries: int = 3) -> Any:
+def download_json(url: str, headers: dict[str, str], num_retries: int = 3) -> Any:
     for _ in range(num_retries):
         try:
             req = Request(url=url, headers=headers)
@@ -454,6 +481,7 @@ def download_json(url: str, headers: Dict[str, str], num_retries: int = 3) -> An
 
 
 def set_output(name: str, val: Any) -> None:
+    print(f"Setting output {name}={val}")
     if os.getenv("GITHUB_OUTPUT"):
         with open(str(os.getenv("GITHUB_OUTPUT")), "a") as env:
             print(f"{name}={val}", file=env)
@@ -461,7 +489,7 @@ def set_output(name: str, val: Any) -> None:
         print(f"::set-output name={name}::{val}")
 
 
-def parse_reenabled_issues(s: Optional[str]) -> List[str]:
+def parse_reenabled_issues(s: str | None) -> list[str]:
     # NB: When the PR body is empty, GitHub API returns a None value, which is
     # passed into this function
     if not s:
@@ -476,11 +504,16 @@ def parse_reenabled_issues(s: Optional[str]) -> List[str]:
     return issue_numbers
 
 
-def get_reenabled_issues(pr_body: str = "") -> List[str]:
+def get_reenabled_issues(pr_body: str = "") -> list[str]:
     default_branch = f"origin/{os.environ.get('GIT_DEFAULT_BRANCH', 'main')}"
     try:
+        # Read commit subjects with git log instead of git cherry. CI checks out
+        # treeless (--filter=tree:0), and git cherry computes patch-ids, which
+        # may require multiple round-trip fetches.
         commit_messages = subprocess.check_output(
-            f"git cherry -v {default_branch}".split(" ")
+            ["git", "log", "--format=%s", f"{default_branch}..HEAD"],
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+            timeout=60,
         ).decode("utf-8")
     except Exception as e:
         warnings.warn(f"failed to get commit messages: {e}")
@@ -488,21 +521,66 @@ def get_reenabled_issues(pr_body: str = "") -> List[str]:
     return parse_reenabled_issues(pr_body) + parse_reenabled_issues(commit_messages)
 
 
-def check_for_setting(labels: Set[str], body: str, setting: str) -> bool:
+def check_for_setting(labels: set[str], body: str, setting: str) -> bool:
     return setting in labels or f"[{setting}]" in body
 
 
+# Number of stacked PRs the current PR can sit on top of before we refuse
+# to run CI on it. Top-of-stack PRs in tall ghstacks rarely need full CI
+# until the lower entries land; the filter step fails so the author has to
+# rebase (or add ciflow/trunk) to get fresh signal before merging.
+GHSTACK_BELOW_SKIP_THRESHOLD = 10
+# Matches a single ghstack stack-list entry, e.g. "* #12345" or
+# "* __->__ #12345" (the marker for the current PR).
+GHSTACK_STACK_ENTRY_REGEX = re.compile(r"^\* (?:__->__ )?#\d+\s*$", re.MULTILINE)
+# Marks the current PR's line in the stack list.
+GHSTACK_CURRENT_MARKER = "__->__"
+
+
+def get_ghstack_below_count(pr_body: str) -> int:
+    """
+    Return the number of PRs the current PR sits on top of in its ghstack.
+
+    The ghstack PR body lists the stack newest-first (oldest at bottom) with
+    the current PR marked by "__->__". Entries appearing after the current
+    marker are the PRs the current one depends on (its parents in the stack).
+    Returns 0 if the body doesn't look like a ghstack description.
+    """
+    if not pr_body or GHSTACK_CURRENT_MARKER not in pr_body:
+        return 0
+    entries = list(GHSTACK_STACK_ENTRY_REGEX.finditer(pr_body))
+    for i, m in enumerate(entries):
+        if GHSTACK_CURRENT_MARKER in m.group(0):
+            return len(entries) - i - 1
+    return 0
+
+
 def perform_misc_tasks(
-    labels: Set[str], test_matrix: Dict[str, List[Any]], job_name: str, pr_body: str
+    labels: set[str],
+    test_matrix: dict[str, list[Any]],
+    job_name: str,
+    pr_body: str,
+    branch: str | None = None,
+    tag: str | None = None,
 ) -> None:
     """
     In addition to apply the filter logic, the script also does the following
     misc tasks to set keep-going and is-unstable variables
     """
-    set_output("keep-going", check_for_setting(labels, pr_body, "keep-going"))
+    set_output(
+        "keep-going",
+        branch == MAIN_BRANCH
+        or bool(tag and re.match(r"^trunk/[a-f0-9]{40}$", tag))
+        # Pattern for tags created via manual run on HUD
+        or bool(tag and re.match(r"^ciflow/[^/]+/[a-f0-9]{40}$", tag))
+        or check_for_setting(labels, pr_body, "keep-going"),
+    )
     set_output(
         "ci-verbose-test-logs",
         check_for_setting(labels, pr_body, "ci-verbose-test-logs"),
+    )
+    set_output(
+        "ci-test-showlocals", check_for_setting(labels, pr_body, "ci-test-showlocals")
     )
     set_output(
         "ci-no-test-timeout", check_for_setting(labels, pr_body, "ci-no-test-timeout")
@@ -533,11 +611,51 @@ def perform_misc_tasks(
 
     set_output("reenabled-issues", ",".join(get_reenabled_issues(pr_body=pr_body)))
 
-    if MEM_LEAK_LABEL in labels:
-        # Enable mem leak check if label is added
-        for config in test_matrix.get("include", []):
-            if is_cuda_or_rocm_job(job_name):
-                config["mem_leak_check"] = "mem_leak_check"
+
+def parse_lf_runners(value: str) -> frozenset[str] | None:
+    """Parse --lf-runners. Empty string -> None (unrestricted)."""
+    runners = frozenset(r.strip() for r in value.split(",") if r.strip())
+    return runners or None
+
+
+def enforce_lf_allowlist(
+    test_matrix: dict[str, list[Any]], lf_runners_arg: str
+) -> dict[str, list[Any]]:
+    """Force non-allowlisted 'lf-' matrix entries onto the Meta fleet.
+
+    Every workflow names its literal ARC pod directly in its own
+    test-matrix entries, so this is the single place that checks
+    those entries against the resolved allowlist.
+
+    lf_runners_arg must already be the resolved allowlist string from
+    runner_determinator.py's get_lf_runners_output() -- the only reader of
+    arc.yaml and the only place that honors the restrict_runners
+    kill-switch (test-infra#5132).
+    """
+    entries = test_matrix.get("include", [])
+    if not entries:
+        return test_matrix
+
+    lf_allowlist = parse_lf_runners(lf_runners_arg)
+    if lf_allowlist is not None:
+        info("LF allowlist active (%d runners)", len(lf_allowlist))
+
+    for entry in entries:
+        raw = entry.get("runner", "").strip()
+        # Callers now name their ARC pod directly, so an entry not currently
+        # on 'lf-' (already 'mt-', or some other passthrough label) needs no
+        # enforcement -- checking the entry's own literal prefix, rather than
+        # this job's runner_prefix input, is what correctly leaves alone a
+        # matrix that hardcodes 'mt-' on specific entries (e.g. H100/B200)
+        # while the job itself builds on a dynamically-resolved 'lf-'.
+        if lf_allowlist is None or not raw.startswith(LF_PREFIX):
+            continue
+        clean = raw[len(LF_PREFIX) :]
+        if clean not in lf_allowlist:
+            info("'%s' not in LF allowlist; forcing %s", clean, META_PREFIX)
+            entry["runner"] = META_PREFIX + clean
+
+    return test_matrix
 
 
 def main() -> None:
@@ -558,14 +676,16 @@ def main() -> None:
 
     # If the tag matches, we can get the PR number from it, this is from ciflow
     # workflow dispatcher
-    tag_regex = re.compile(r"^ciflow/\w+/(?P<pr_number>\d+)$")
+    tag_regex = re.compile(r"^ciflow/[\w\-]+/(?P<pr_number>\d+)$")
 
     labels = set()
     if pr_number:
         # If a PR number is set, query all the labels from that PR
         labels = get_labels(int(pr_number))
         # Then filter the test matrix and keep only the selected ones
-        filtered_test_matrix = filter(test_matrix, labels)
+        filtered_test_matrix = filter(
+            test_matrix, labels, args.ignore_test_config_labels
+        )
 
     elif tag:
         m = tag_regex.match(tag)
@@ -576,7 +696,9 @@ def main() -> None:
             # The PR number can also come from the tag in ciflow tag event
             labels = get_labels(int(pr_number))
             # Filter the test matrix and keep only the selected ones
-            filtered_test_matrix = filter(test_matrix, labels)
+            filtered_test_matrix = filter(
+                test_matrix, labels, args.ignore_test_config_labels
+            )
 
         else:
             # There is a tag but it isn't ciflow, so there is nothing left to do
@@ -597,8 +719,8 @@ def main() -> None:
         )
 
     if args.event_name == "schedule" and args.schedule == "29 8 * * *":
-        # we don't want to run the mem leak check or disabled tests on normal
-        # periodically scheduled jobs, only the ones at this time
+        # Only run rerun_disabled_tests on this dedicated periodic schedule,
+        # not on every periodically scheduled job.
         filtered_test_matrix = set_periodic_modes(filtered_test_matrix, args.job_name)
 
     if args.workflow and args.job_name and args.branch not in EXCLUDED_BRANCHES:
@@ -614,12 +736,35 @@ def main() -> None:
 
     pr_body = get_pr_info(int(pr_number)).get("body", "") if pr_number else ""
 
+    # Fail the workflow for PRs sitting on top of a long ghstack: those PRs
+    # will need to be retested once everything underneath lands, so running
+    # full CI now is wasted work. We fail rather than emit an empty matrix so
+    # that the missing signal is visible and pytorchbot won't merge the PR
+    # against stale CI results -- the author must rebase to re-trigger CI.
+    if (
+        pr_number
+        and "ciflow/trunk" not in labels
+        and get_ghstack_below_count(pr_body) >= GHSTACK_BELOW_SKIP_THRESHOLD
+    ):
+        print(
+            f"PR #{pr_number} sits on top of "
+            f">={GHSTACK_BELOW_SKIP_THRESHOLD} ghstack entries; refusing to "
+            "run CI. Rebase once the lower PRs land, or add the ciflow/trunk "
+            "label to force CI on this PR.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     perform_misc_tasks(
         labels=labels,
         test_matrix=filtered_test_matrix,
         job_name=args.job_name,
         pr_body=pr_body if pr_body else "",
+        branch=args.branch,
+        tag=tag,
     )
+
+    filtered_test_matrix = enforce_lf_allowlist(filtered_test_matrix, args.lf_runners)
 
     # Set the filtered test matrix as the output
     set_output("test-matrix", json.dumps(filtered_test_matrix))
@@ -628,6 +773,9 @@ def main() -> None:
     # and also put a flag if the test matrix is empty, so subsequent jobs can
     # quickly check it without the need to parse the JSON string
     set_output("is-test-matrix-empty", filtered_test_matrix_len == 0)
+
+    # Save the labels from the PR, so that we can use it later
+    set_output("labels", json.dumps(list(labels)))
 
 
 if __name__ == "__main__":

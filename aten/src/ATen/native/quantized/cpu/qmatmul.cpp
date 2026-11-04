@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <c10/util/irange.h>
 #include <torch/library.h>
 
 #ifdef USE_RUY_QMATMUL
@@ -7,8 +8,7 @@
 #include <ruy/ruy.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 namespace {
 
@@ -61,7 +61,7 @@ Tensor qmatmul(
 
   std::vector<int64_t> out_size_vec(num_dims);
   size_t num_matmuls = 1;
-  for (int64_t i = 0; i < num_dims - 2; i++) {
+  for (const auto i : c10::irange(num_dims - 2)) {
     const int64_t dim = qa.size(i);
     const int64_t qb_dim = qb.size(i);
 
@@ -84,7 +84,7 @@ Tensor qmatmul(
           .memory_format(qa.suggest_memory_format()),
       output_scale,
       output_zero_point,
-      c10::nullopt);
+      std::nullopt);
 
   const Tensor& qa_contig = qa.contiguous();
   const Tensor& qb_contig = qb.contiguous();
@@ -93,11 +93,11 @@ Tensor qmatmul(
     using underlying_t = typename scalar_t::underlying;
 
     const underlying_t* qa_data = reinterpret_cast<const underlying_t*>(
-        qa_contig.data_ptr<scalar_t>());
+        qa_contig.const_data_ptr<scalar_t>());
     const underlying_t* qb_data = reinterpret_cast<const underlying_t*>(
-        qb_contig.data_ptr<scalar_t>());
+        qb_contig.const_data_ptr<scalar_t>());
     underlying_t* out_data =
-        reinterpret_cast<underlying_t*>(out.data_ptr<scalar_t>());
+        reinterpret_cast<underlying_t*>(out.mutable_data_ptr<scalar_t>());
 
     const size_t qa_stride = m * k;
     const size_t qb_stride = k * n;
@@ -139,7 +139,7 @@ Tensor qmatmul(
       const underlying_t* qb_subtensor = qb_data + begin * qb_stride;
       underlying_t* out_subtensor = out_data + begin * out_stride;
 
-      for (int64_t i = begin; i < end; i++) {
+      for ([[maybe_unused]] const auto _ : c10::irange(begin, end)) {
         qa_matrix.set_data(qa_subtensor);
         qb_matrix.set_data(qb_subtensor);
         out_matrix.set_data(out_subtensor);
@@ -184,5 +184,4 @@ TORCH_LIBRARY_IMPL(quantized, QuantizedCPU, m) {
 
 } // namespace
 
-} // namespace native
-} // namespace at
+} // namespace at::native
